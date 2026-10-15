@@ -1,0 +1,36 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "be1f73e69e86cbfec0a763049e2d9598"
+application_url = "https://order-history-production.up.railway.app"
+embedded = true
+name = "order-history"
+
+[access_scopes]
+scopes = "read_orders,read_customers,read_all_orders"
+
+[app_proxy]
+url = "https://order-history-production.up.railway.app/proxy/purchase-history"
+subpath = "purchase-history"
+prefix = "apps"
+
+
+[webhooks]
+api_version = "2027-01"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+[auth]
+redirect_urls = [
+  "https://order-history-production.up.railway.app/auth/callback",
+  "https://order-history-production.up.railway.app/auth/shopify/callback",
+  "https://order-history-production.up.railway.app/api/auth/callback"
+]
+
+[build]
+automatically_update_urls_on_dev = true
