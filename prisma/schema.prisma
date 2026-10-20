@@ -32,3 +32,791 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+model PreorderLog {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  productId String
+  title     String
+  action    String
+  detail    String
+  release   String?
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+model PreorderState {
+  shop             String    @id
+  lastDailyRun     String?
+  lastDailyAt      DateTime?
+  lastDailySummary String?
+  lastBooksAt      DateTime?
+  lastBooksSummary String?
+}
+
+model ReleaseSuggestion {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  productId   String
+  title       String
+  isbn        String
+  currentDate String?
+  googleDate  String
+  precision   String
+  googleTitle String?
+  googleUrl   String?
+  status      String    @default("pending")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  resolvedAt  DateTime?
+
+  @@index([shop, status])
+  @@index([shop, productId])
+}
+
+// Real-time inventory log: one row per stock change
+model InventoryEvent {
+  id              Int      @id @default(autoincrement())
+  shop            String
+  webhookId       String?  @unique
+  source          String   @default("live")
+  inventoryItemId String
+  locationId      String
+  locationName    String?
+  variantId       String?
+  variantTitle    String?
+  productId       String?
+  productTitle    String?
+  sku             String?
+  available       Int?
+  previous        Int?
+  change          Int?
+  occurredAt      DateTime
+  // Filled in from Shopify's inventory history
+  detailsStatus   String   @default("pending")
+  adjustmentId    String?
+  state           String?
+  reason          String?
+  appName         String?
+  staffName       String?
+  referenceType   String?
+  referenceId     String?
+  referenceUri    String?
+  createdAt       DateTime @default(now())
+
+  @@index([shop, occurredAt])
+  @@index([shop, productId, occurredAt])
+  @@index([shop, inventoryItemId, locationId, occurredAt])
+  @@index([shop, detailsStatus])
+}
+
+// Last known quantity per item and location, for working out each change
+model InventoryLevelSnapshot {
+  shop            String
+  inventoryItemId String
+  locationId      String
+  available       Int
+  updatedAt       DateTime
+
+  @@id([shop, inventoryItemId, locationId])
+}
+
+// Which product/variant each inventory item belongs to
+model InventoryItemInfo {
+  shop            String
+  inventoryItemId String
+  variantId       String?
+  variantTitle    String?
+  productId       String?
+  productTitle    String?
+  sku             String?
+
+  @@id([shop, inventoryItemId])
+}
+
+// Inventory history from Shopify: one row per adjustment (balancing "system" rows are skipped)
+model InventoryAdjustment {
+  id              Int      @id @default(autoincrement())
+  shop            String
+  adjustmentId    String
+  groupId         String?
+  occurredAt      DateTime
+  inventoryItemId String?
+  variantId       String?
+  productId       String?
+  sku             String?
+  locationId      String?
+  locationName    String?
+  state           String
+  change          Int
+  reason          String?
+  appName         String?
+  staffName       String?
+  referenceType   String?
+  referenceId     String?
+  referenceUri    String?
+  createdAt       DateTime @default(now())
+
+  @@unique([shop, adjustmentId])
+  @@index([shop, occurredAt])
+  @@index([shop, productId, occurredAt])
+  @@index([shop, inventoryItemId, occurredAt])
+  @@index([shop, groupId])
+}
+
+// Progress of the history sync, one row per shop
+model InventorySync {
+  shop              String    @id
+  pageSize          Int       @default(5000)
+  nextQueryAt       DateTime?
+  lastQueryAt       DateTime?
+  lastError         String?
+  backfillPlan      String?
+  expectedRows      Int?
+  backfillIndex     Int       @default(0)
+  backfillOffset    Int       @default(0)
+  backfillRows      Int       @default(0)
+  backfillDone      Boolean   @default(false)
+  liveDay           String?
+  liveOffset        Int       @default(0)
+  liveRequestedAt   DateTime?
+  lastLiveSyncAt    DateTime?
+  recheckDay        String?
+  recheckOffset     Int       @default(0)
+  lastRecheckQueued String?
+  paused            Boolean   @default(false)
+  pausedReason      String?
+}
+
+// App permissions: one row per staff member who has used the app
+model StaffMember {
+  id           Int      @id @default(autoincrement())
+  shop         String
+  userId       String
+  name         String?
+  email        String?
+  accountOwner Boolean  @default(false)
+  isAdmin      Boolean  @default(false)
+  access       String   @default("{}")
+  lastSeenAt   DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@unique([shop, userId])
+  @@index([shop, email])
+}
+
+// Access set up by email for people who haven't opened the app yet
+model StaffInvite {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  email     String
+  isAdmin   Boolean  @default(false)
+  access    String   @default("{}")
+  createdAt DateTime @default(now())
+
+  @@unique([shop, email])
+}
+
+// Undos made from the app: a log of who reversed which change, and the result.
+// status: pending (in progress), applied, failed
+model InventoryUndo {
+  id              Int       @id @default(autoincrement())
+  shop            String
+  originalKey     String
+  originalAt      DateTime?
+  originalWho     String?
+  originalReason  String?
+  inventoryItemId String
+  locationId      String
+  productId       String?
+  delta           Int
+  quantityBefore  Int?
+  quantityAfter   Int?
+  userId          String?
+  userName        String?
+  status          String    @default("pending")
+  error           String?
+  shopifyGroupId  String?
+  linkedAt        DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([shop, originalKey])
+  @@index([shop, status, linkedAt])
+}
+
+// Products in the pre-order countdown group: when buying opens and closes.
+// phase: what the app last applied to the product (scheduled, open, closed)
+model PreorderWindow {
+  id               Int       @id @default(autoincrement())
+  shop             String
+  productId        String
+  title            String?
+  handle           String?
+  imageUrl         String?
+  opensAt          DateTime?
+  closesAt         DateTime?
+  originalPolicies String?
+  appliedPhase     String?
+  appliedAt        DateTime?
+  lastError        String?
+  addedBy          String?
+  updatedBy        String?
+  // Sales limit per variant: {"gid://shopify/ProductVariant/1": 50}; null = no limit
+  limits           String?
+  // Stock taken off sale at closing, put back on re-open: {variantId: units}
+  held             String?
+  // Last known available stock per variant at the selling location
+  stock            String?
+  locationId       String?
+  firstOpenedAt    DateTime?
+  closedAt         DateTime?
+  soldOutAt        DateTime?
+  restockedUnits   Int       @default(0)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @default(now()) @updatedAt
+
+  @@unique([shop, productId])
+  @@index([shop, opensAt])
+}
+
+// Shop-wide settings for pre-order countdowns and notification emails
+model PreorderSettings {
+  shop             String   @id
+  restockThreshold Int      @default(5)
+  reminderHours    Int      @default(24)
+  locationId       String?
+  fromName         String?
+  storeUrl         String?
+  updatedAt        DateTime @default(now()) @updatedAt
+}
+
+// Customers who asked to be emailed about a product
+model NotifySubscriber {
+  id             Int       @id @default(autoincrement())
+  shop           String
+  productId      String
+  email          String
+  customerId     String?
+  token          String    @unique
+  createdAt      DateTime  @default(now())
+  unsubscribedAt DateTime?
+  purchasedAt    DateTime?
+  // "wishlist" when added automatically because it's on the customer's wishlist
+  source         String?
+
+  @@unique([shop, productId, email])
+  @@index([shop, email])
+}
+
+// One batch of emails (e.g. "pre-orders open" for one product)
+model EmailCampaign {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  windowId   Int
+  productId  String
+  kind       String
+  dedupeKey  String   @unique
+  title      String?
+  imageUrl   String?
+  productUrl String?
+  closesAt   DateTime?
+  recipients Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([shop, productId])
+}
+
+// One email to one person. status: queued, sent, failed, skipped
+model EmailSend {
+  id           Int       @id @default(autoincrement())
+  shop         String
+  campaignId   Int
+  subscriberId Int
+  productId    String
+  email        String
+  kind         String
+  token        String    @unique
+  status       String    @default("queued")
+  error        String?
+  attempts     Int       @default(0)
+  nextTryAt    DateTime  @default(now())
+  createdAt    DateTime  @default(now())
+  sentAt       DateTime?
+  openedAt     DateTime?
+  opens        Int       @default(0)
+  clickedAt    DateTime?
+  clicks       Int       @default(0)
+
+  @@index([status, nextTryAt])
+  @@index([shop, productId])
+  @@index([sentAt])
+}
+
+// Orders that came from a notification email
+// method: click (came through the email's link) or email (same email address)
+model EmailConversion {
+  id             Int      @id @default(autoincrement())
+  shop           String
+  sendId         Int?
+  subscriberId   Int?
+  productId      String
+  orderId        String
+  orderName      String?
+  orderTotal     Float    @default(0)
+  productRevenue Float    @default(0)
+  currency       String?
+  method         String
+  createdAt      DateTime @default(now())
+
+  @@unique([shop, orderId, productId])
+  @@index([shop, productId])
+}
+
+// Units of a countdown product sold, one row per order (for the dashboard)
+model PreorderSale {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  productId String
+  orderId   String
+  units     Int      @default(0)
+  revenue   Float    @default(0)
+  currency  String?
+  createdAt DateTime @default(now())
+
+  @@unique([shop, orderId, productId])
+  @@index([shop, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Shipping hub
+// ---------------------------------------------------------------------------
+
+// One Shopify fulfillment order = one shipment. Shopify splits orders into
+// these by shipping profile (the GT groups), so each ships separately.
+// state: waiting (not everything in stock / not paid / held elsewhere),
+//        ready, batched, packed, shipped, closed (cancelled or fulfilled outside)
+model Shipment {
+  id                 Int       @id @default(autoincrement())
+  shop               String
+  fulfillmentOrderId String
+  orderId            String
+  orderName          String
+  orderCreatedAt     DateTime
+  customerName       String?
+  shippingMethod     String?
+  country            String?
+  province           String?
+  locationId         String?
+  locationName       String?
+  foStatus           String?
+  financialStatus    String?
+  // [{foLineItemId, lineItemId, variantId, productId, inventoryItemId, tracked, sku, barcode, title, variantTitle, quantity, imageUrl}]
+  lines              String
+  units              Int       @default(0)
+  partIndex          Int       @default(1)
+  partCount          Int       @default(1)
+  state              String    @default("waiting")
+  waitingReason      String?
+  readyAt            DateTime?
+  otherHold          String?
+  appHoldId          String?
+  holdError          String?
+  overrideBy         String?
+  overrideAt         DateTime?
+  overrideReason     String?
+  batchId            Int?
+  // Batch-NNNN tag the app put on the order for this shipment (null = none)
+  batchTag           String?
+  tagError           String?
+  flag               String?
+  // Order note and Shopify's "address may be invalid" warning, which staff must acknowledge
+  orderNote          String?
+  orderUpdatedAt     DateTime?
+  // {level: WARNING | ERROR, address: [lines]} or {level: null, address} when it's fine
+  noticeAddress      String?
+  // Someone chose to keep the flagged address as is: {key, by, at} (key = which address)
+  addressDecision    String?
+  // Changes when the note or address warning changes
+  noticeKey          String?
+  noticeCheckedAt    DateTime?
+  // Packing: {itemKey: units scanned}
+  packed             String?
+  packedAt           DateTime?
+  packedBy           String?
+  // Notice acknowledged at the pack bench (must match noticeKey to pack)
+  packAckKey         String?
+  // Packed without a full scan: "who: reason"
+  packOverride       String?
+  // Package entered at the pack bench (shown at the label step)
+  pkgWeight      Float?
+  pkgWeightUnit  String?
+  pkgBox         String?
+  pkgLength      Float?
+  pkgWidth       Float?
+  pkgHeight      Float?
+  pkgDimUnit     String?
+  pkgAt          DateTime?
+  pkgBy          String?
+  // The order carries the "Packed" tag (for buying labels in bulk)
+  packTagged     Boolean   @default(false)
+  closedAt           DateTime?
+  syncedAt           DateTime  @default(now())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @default(now()) @updatedAt
+
+  @@unique([shop, fulfillmentOrderId])
+  @@index([shop, state])
+  @@index([shop, orderId])
+  @@index([shop, batchId])
+}
+
+model ShippingSettings {
+  shop            String    @id
+  // off: the app never holds; notReady: hold shipments that aren't ready;
+  // untilBatched: hold everything until its batch is at the Ship step
+  holdMode        String    @default("off")
+  lastFullSyncAt  DateTime?
+  lastSyncError   String?
+  lastReadyRunAt  DateTime?
+  // Batch numbers: Batch-0001, Batch-0002, ...
+  batchCounter    Int       @default(0)
+  // Auto-batching, on a button and once a day at autoBatchTime (store time, "HH:MM").
+  // Single items: an item with more than autoSingleMin single-item shipments ready gets its own "<item> singles" batch
+  autoBatchEnabled Boolean  @default(false)
+  autoBatchTime   String    @default("07:00")
+  autoSingleItem  Boolean   @default(true)
+  autoSingleMin   Int       @default(50)
+  // Set when Shopify won't share addresses (customer-data access not turned on)
+  addressCheckError String?
+  lastAutoBatchAt DateTime?
+  updatedAt       DateTime  @default(now()) @updatedAt
+  // Packages: "off" | "ask" (after packing, can skip) | "required" (before the label)
+  packageStep    String    @default("ask")
+  weightUnit     String    @default("lb")
+  dimUnit        String    @default("in")
+  // Saved boxes: [{ id, name, l, w, h }] in dimUnit
+  boxes          String?
+  packedTag      Boolean   @default(true)
+}
+
+// A batch: up to 250 shipments picked together, then packed and shipped.
+// status: open (can still change) → picking → picked → (packing, shipping: later stages)
+//         cancelled (shipments went back to Ready)
+model Batch {
+  id            Int       @id @default(autoincrement())
+  shop          String
+  number        Int
+  tag           String
+  // Shown name, e.g. "Lore Vol. 1 singles" (null = just the number)
+  name          String?
+  source        String    @default("manual") // manual | auto:singleItem
+  status        String    @default("open")
+  note          String?
+  // Who's working it (pickers / packers): [{id, name}] (StaffMember ids)
+  assignees     String?
+  createdBy     String?
+  // {variantKey: units picked}
+  picked        String?
+  pickStartedAt DateTime?
+  pickedAt      DateTime?
+  pickedBy      String?
+  packStartedAt DateTime?
+  packDoneAt    DateTime?
+  cancelledAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+
+  @@unique([shop, number])
+  @@index([shop, status])
+}
+
+// An order someone flagged for the team to look at (the Flag/Review switch).
+// status: open | resolved
+model OrderFlag {
+  id         Int       @id @default(autoincrement())
+  shop       String
+  orderId    String
+  orderName  String
+  reason     String
+  note       String?
+  status     String    @default("open")
+  createdBy  String?
+  createdAt  DateTime  @default(now())
+  resolvedBy String?
+  resolvedAt DateTime?
+  resolution String?
+
+  @@index([shop, status])
+  @@index([shop, orderId])
+}
+
+// Staff members working in sandbox mode on the Shipping page. Sandbox data
+// lives under the shop name + "::sandbox"; nothing is sent to Shopify.
+model SandboxUser {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  staffKey  String
+  enteredAt DateTime @default(now())
+
+  @@unique([shop, staffKey])
+}
+
+// Who has read an order's note / address correction (per version of it)
+model NoticeAck {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  orderId   String
+  noticeKey String
+  staffKey  String
+  staffName String?
+  context   String   @default("view") // view | pack
+  createdAt DateTime @default(now())
+
+  @@unique([shop, orderId, noticeKey, staffKey, context])
+}
+
+// Where a product variant lives on the shelves
+model ProductBin {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  variantId String
+  productId String?
+  sku       String?
+  barcode   String?
+  title     String?
+  bin       String
+  updatedBy String?
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([shop, variantId])
+  @@index([shop, sku])
+  @@index([shop, barcode])
+}
+
+// Who did what, for the audit trail
+model ShippingEvent {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  shipmentId Int?
+  batchId    Int?
+  orderName  String?
+  type       String
+  detail     String?
+  userName   String?
+  createdAt  DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([shop, shipmentId])
+}
+
+// ---------------------------------------------------------------------------
+// Customer wishlists (storefront hearts)
+// ---------------------------------------------------------------------------
+
+model WishlistItem {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  customerId String
+  productId  String
+  createdAt  DateTime @default(now())
+
+  @@unique([shop, customerId, productId])
+  @@index([shop, productId])
+  @@index([shop, createdAt])
+}
+
+model WishlistCustomer {
+  id         Int       @id @default(autoincrement())
+  shop       String
+  customerId String
+  email      String?
+  firstName  String?
+  emailsOn   Boolean   @default(true)
+  // When the customer last turned wishlist emails on or off
+  emailsSetAt DateTime?
+  shareToken String?   @unique
+  shareViews Int       @default(0)
+  checkedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([shop, customerId])
+  @@index([shop, email])
+}
+
+// What the app last saw of each wished product (report + back-in-stock)
+model WishlistProduct {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  productId   String
+  handle      String?
+  title       String?
+  imageUrl    String?
+  status      String?
+  stock       Int?
+  tracked     Boolean   @default(true)
+  inStock     Boolean?
+  preorder    Boolean   @default(false)
+  restockedAt DateTime?
+  refreshedAt DateTime?
+  missing     Boolean   @default(false)
+
+  @@unique([shop, productId])
+  @@index([shop, handle])
+}
+
+model WishlistSettings {
+  shop           String  @id
+  restockEmails  Boolean @default(true)
+  preorderEmails Boolean @default(true)
+  minStock       Int     @default(1)
+  cooldownDays   Int     @default(7)
+}
+
+// Every add/remove, for trends (wishlist rows themselves are deleted on remove)
+model WishlistEvent {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  customerId String
+  productId  String
+  kind       String
+  at         DateTime @default(now())
+
+  @@index([shop, at])
+  @@index([shop, customerId, productId])
+}
+
+// A customer bought something they had saved
+model WishlistConversion {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  customerId String
+  productId  String
+  orderId    String
+  orderName  String?
+  units      Int      @default(0)
+  revenue    Float    @default(0)
+  currency   String?
+  savedAt    DateTime
+  orderedAt  DateTime
+  sendId     Int?
+  viaEmail   Boolean  @default(false)
+
+  @@unique([shop, orderId, productId])
+  @@index([shop, orderedAt])
+  @@index([shop, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Loyalty program (invite-only while it runs next to Smile.io)
+// ---------------------------------------------------------------------------
+
+model LoyaltySettings {
+  shop           String    @id
+  enabled        Boolean   @default(true)
+  programName    String    @default("Rewards")
+  pointsPerDollar Float    @default(5)
+  // What points are called: "Yiggybeans" / "Yiggybean"
+  pointsName     String    @default("Yiggybeans")
+  pointName      String    @default("Yiggybean")
+  // Customer tag per tier, e.g. "VIP Gold", for tier-only sales
+  tierTagPrefix  String    @default("VIP ")
+  // "shipped": pending until the order is fulfilled; "paid": right away once paid
+  earnOn         String    @default("shipped")
+  joinBonus      Int       @default(200)
+  birthdayBonus  Int       @default(250)
+  // [{ id, label, url, points }]
+  socials        String?
+  // [{ id, name, threshold, multiplier, perks }] by spend in the last 12 months
+  tiers          String?
+  // [{ id, name, points, amount, minSubtotal }]
+  rewards        String?
+  codeExpiryDays Int       @default(90)
+  inviteToken    String?   @unique
+  inviteEnabled  Boolean   @default(false)
+  inviteMax      Int?
+  inviteUses     Int       @default(0)
+  currency       String?
+  updatedAt      DateTime  @default(now()) @updatedAt
+}
+
+model LoyaltyMember {
+  id                   Int       @id @default(autoincrement())
+  shop                 String
+  customerId           String
+  email                String?
+  name                 String?
+  firstName            String?
+  status               String    @default("active")
+  via                  String    @default("admin")
+  addedBy              String?
+  joinedAt             DateTime  @default(now())
+  removedAt            DateTime?
+  // "MM-DD"
+  birthday             String?
+  birthdayAwardedYear  Int?
+  tier                 String?
+  tierSpend            Float     @default(0)
+  // The tier tag currently on the customer in Shopify
+  tierTag              String?
+  points               Int       @default(0)
+  pending              Int       @default(0)
+  lifetime             Int       @default(0)
+  updatedAt            DateTime  @default(now()) @updatedAt
+
+  @@unique([shop, customerId])
+  @@index([shop, status])
+}
+
+// Every change to a member's points
+model LoyaltyEntry {
+  id            Int       @id @default(autoincrement())
+  shop          String
+  customerId    String
+  points        Int
+  // order | order_adjust | join | birthday | social | redeem | refund_reward | adjust
+  kind          String
+  // pending | available | void
+  status        String    @default("available")
+  // Stops the same thing being awarded twice ("order:123", "birthday:2026", "social:ig")
+  ref           String?
+  orderId       String?
+  orderName     String?
+  orderSubtotal Float?
+  orderedAt     DateTime?
+  multiplier    Float?
+  note          String?
+  by            String?
+  createdAt     DateTime  @default(now())
+  availableAt   DateTime?
+
+  @@unique([shop, customerId, ref])
+  @@index([shop, customerId, createdAt])
+  @@index([shop, orderId])
+  @@index([shop, createdAt])
+}
+
+model LoyaltyRedemption {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  customerId  String
+  rewardId    String
+  rewardName  String
+  points      Int
+  amount      Float
+  minSubtotal Float?
+  code        String    @unique
+  discountId  String?
+  // issued | used | cancelled | failed
+  status      String    @default("issued")
+  error       String?
+  entryId     Int?
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime?
+  usedAt      DateTime?
+  orderId     String?
+  orderName   String?
+
+  @@index([shop, customerId])
+  @@index([shop, status])
+}

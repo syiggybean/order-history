@@ -1,0 +1,51 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "dcda714219be1c21b98e021939d75479"
+name = "MonkeyBean"
+application_url = "https://order-history-production.up.railway.app"
+embedded = true
+
+[webhooks]
+api_version = "2027-01"
+
+[[webhooks.subscriptions]]
+topics = [ "app/uninstalled" ]
+uri = "/webhooks/app/uninstalled"
+
+[[webhooks.subscriptions]]
+topics = [ "app/scopes_update" ]
+uri = "/webhooks/app/scopes_update"
+
+[[webhooks.subscriptions]]
+topics = [ "inventory_levels/update" ]
+uri = "/webhooks/inventory/update"
+
+[[webhooks.subscriptions]]
+topics = [ "products/create", "products/update" ]
+uri = "/webhooks/products/update"
+
+[[webhooks.subscriptions]]
+topics = [ "orders/create" ]
+uri = "/webhooks/orders/create"
+
+[[webhooks.subscriptions]]
+topics = [ "orders/updated" ]
+uri = "/webhooks/orders/updated"
+
+[access_scopes]
+scopes = "read_orders,write_orders,read_customers,write_customers,read_all_orders,read_products,write_products,read_shipping,write_shipping,read_inventory,write_inventory,read_reports,read_locations,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_discounts,write_discounts"
+
+[app_proxy]
+url = "https://order-history-production.up.railway.app/proxy/purchase-history"
+subpath = "purchase-history"
+prefix = "apps"
+
+[auth]
+redirect_urls = [
+  "https://order-history-production.up.railway.app/auth/callback",
+  "https://order-history-production.up.railway.app/auth/shopify/callback",
+  "https://order-history-production.up.railway.app/api/auth/callback"
+]
+
+[build]
+automatically_update_urls_on_dev = true

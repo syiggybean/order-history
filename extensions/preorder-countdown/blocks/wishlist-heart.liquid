@@ -1,0 +1,20 @@
+{%- comment -%}
+  Optional: puts the product-page heart exactly where this block sits,
+  instead of after the product name. Needs the Wishlist app embed turned on.
+{%- endcomment -%}
+{%- if product -%}
+  <div class="ohwl-slot" data-ohwl-slot data-pid="{{ product.id }}" data-handle="{{ product.handle | escape }}" {{ block.shopify_attributes }}>
+    {%- if block.settings.label != blank -%}<span class="ohwl-slot__label">{{ block.settings.label | escape }}</span>{%- endif -%}
+  </div>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Wishlist heart",
+  "target": "section",
+  "enabled_on": { "templates": ["product"] },
+  "settings": [
+    { "type": "text", "id": "label", "label": "Text before the heart", "placeholder": "Save to wishlist" }
+  ]
+}
+{% endschema %}

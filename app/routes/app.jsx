@@ -1,23 +1,32 @@
 import { Outlet, useLoaderData, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
-import { authenticate } from "../shopify.server";
+import { getStaff, publicUser } from "../permissions.server";
+import { allows } from "../permissions";
 
 export const loader = async ({ request }) => {
-  await authenticate.admin(request);
+  const { user } = await getStaff(request);
 
   // eslint-disable-next-line no-undef
-  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
+  return { apiKey: process.env.SHOPIFY_API_KEY || "", user: publicUser(user) };
 };
 
 export default function App() {
-  const { apiKey } = useLoaderData();
+  const { apiKey, user } = useLoaderData();
 
   return (
     <AppProvider embedded apiKey={apiKey}>
       <s-app-nav>
         <s-link href="/app">Home</s-link>
-        <s-link href="/app/additional">Additional page</s-link>
+        {allows(user, "preorders") && <s-link href="/app/preorders">Pre-orders</s-link>}
+        {allows(user, "preorders") && <s-link href="/app/preorder-countdowns">Pre-order countdowns</s-link>}
+        {allows(user, "releaseReview") && <s-link href="/app/release-review">Release date review</s-link>}
+        {allows(user, "inventory") && <s-link href="/app/inventory">Inventory history</s-link>}
+        {allows(user, "shipping") && <s-link href="/app/shipping">Shipping</s-link>}
+        {allows(user, "wishlist") && <s-link href="/app/wishlist">Wishlists</s-link>}
+        {allows(user, "loyalty") && <s-link href="/app/loyalty">Loyalty</s-link>}
+        {user?.isAdmin && <s-link href="/app/permissions">Permissions</s-link>}
+        {allows(user, "debug") && <s-link href="/app/debug">Debug</s-link>}
       </s-app-nav>
       <Outlet />
     </AppProvider>

@@ -1,0 +1,54 @@
+{%- comment -%}
+  Wishlist (from the order-history app). Turn on under
+  Online Store > Themes > Customize > App embeds.
+
+  Adds a heart after product names (product pages, collection and search
+  grids) and a wishlist icon in the header that opens
+  /apps/purchase-history/wishlist. Only logged-in customers can save;
+  everyone else is asked to log in or create an account.
+{%- endcomment -%}
+{%- liquid
+  if routes.root_url == '/'
+    assign ohwl_base = '/apps/purchase-history'
+  else
+    assign ohwl_base = routes.root_url | append: '/apps/purchase-history'
+  endif
+-%}
+<script type="application/json" id="ohwl-config">
+  {
+    "customer": {% if customer %}true{% else %}false{% endif %},
+    "base": {{ ohwl_base | json }},
+    "login": {{ routes.account_login_url | json }},
+    "register": {{ routes.account_register_url | json }},
+    "product": {% if request.page_type == 'product' and product %}{ "id": {{ product.id | json }}, "handle": {{ product.handle | json }} }{% else %}null{% endif %},
+    "onProduct": {{ block.settings.on_product | json }},
+    "onCards": {{ block.settings.on_cards | json }},
+    "header": {{ block.settings.header_icon | json }},
+    "titleSel": {{ block.settings.title_selector | default: "" | json }},
+    "cardSel": {{ block.settings.card_selector | default: "" | json }},
+    "headerSel": {{ block.settings.header_selector | default: "" | json }}
+  }
+</script>
+<style>
+  :root { --ohwl-color: {{ block.settings.color }}; }
+</style>
+
+{% schema %}
+{
+  "name": "Wishlist",
+  "target": "body",
+  "javascript": "wishlist.js",
+  "stylesheet": "wishlist.css",
+  "settings": [
+    { "type": "color", "id": "color", "label": "Heart color", "default": "#e0245e" },
+    { "type": "checkbox", "id": "on_product", "label": "Heart after the product name on product pages", "default": true },
+    { "type": "checkbox", "id": "on_cards", "label": "Heart after product names in collection and search grids", "default": true },
+    { "type": "checkbox", "id": "header_icon", "label": "Wishlist icon in the header", "default": true },
+    { "type": "header", "content": "If something doesn't show up" },
+    { "type": "paragraph", "content": "The hearts and icon find their spot automatically in most themes. If one doesn't appear, enter a CSS selector for where it should go." },
+    { "type": "text", "id": "title_selector", "label": "Product name (product page)", "placeholder": ".product__title h1" },
+    { "type": "text", "id": "card_selector", "label": "Product name (grid cards)", "placeholder": ".card__heading" },
+    { "type": "text", "id": "header_selector", "label": "Header icons area", "placeholder": ".header__icons" }
+  ]
+}
+{% endschema %}

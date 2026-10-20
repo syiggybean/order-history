@@ -1,0 +1,57 @@
+{%- comment -%}
+  Pre-order closing clock (from the order-history app)
+
+  Place this block just under the buy buttons. While pre-orders are open it
+  shows a flip clock counting down to the closing time. It hides itself
+  before opening, after closing, when sold out, and on products with no
+  closing time.
+{%- endcomment -%}
+{%- assign opens = product.metafields.oh_preorder.opens_at.value -%}
+{%- assign closes = product.metafields.oh_preorder.closes_at.value -%}
+{%- if closes != blank -%}
+  <div
+    class="ohpc ohpc--closing"
+    data-ohpc-closing
+    data-product-id="{{ product.id }}"
+    data-opens="{% if opens != blank %}{{ opens | date: '%s' }}{% endif %}"
+    data-closes="{{ closes | date: '%s' }}"
+    style="--ohpc-bg: {{ block.settings.panel_color }}; --ohpc-card: {{ block.settings.card_color }}; --ohpc-ink: {{ block.settings.digit_color }}; --ohpc-text: {{ block.settings.label_color }};"
+    hidden
+    {{ block.shopify_attributes }}
+  >
+    {%- if block.settings.heading != blank -%}
+      <p class="ohpc__heading">{{ block.settings.heading | escape }}</p>
+    {%- endif -%}
+    <div class="ohpc__clock" aria-hidden="true">
+      <div class="ohpc__unit" data-unit="days"><div class="ohpc__digits"></div><span class="ohpc__label">Days</span></div>
+      <span class="ohpc__sep"></span>
+      <div class="ohpc__unit" data-unit="hours"><div class="ohpc__digits"></div><span class="ohpc__label">Hours</span></div>
+      <span class="ohpc__sep"></span>
+      <div class="ohpc__unit" data-unit="minutes"><div class="ohpc__digits"></div><span class="ohpc__label">Minutes</span></div>
+      <span class="ohpc__sep"></span>
+      <div class="ohpc__unit" data-unit="seconds"><div class="ohpc__digits"></div><span class="ohpc__label">Seconds</span></div>
+    </div>
+    {%- if block.settings.show_date -%}
+      <p class="ohpc__when">Closes {{ closes | date: '%B %-d, %Y at %-I:%M %p %Z' }}</p>
+    {%- endif -%}
+    <p class="ohpc__sr" data-ohpc-sr role="status"></p>
+  </div>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Pre-order closing clock",
+  "target": "section",
+  "enabled_on": { "templates": ["product"] },
+  "javascript": "preorder-closing.js",
+  "stylesheet": "preorder-countdown.css",
+  "settings": [
+    { "type": "text", "id": "heading", "label": "Heading", "default": "Pre-orders close in" },
+    { "type": "checkbox", "id": "show_date", "label": "Show the closing date under the clock", "default": true },
+    { "type": "color", "id": "panel_color", "label": "Background", "default": "#FBACBB" },
+    { "type": "color", "id": "label_color", "label": "Heading and labels", "default": "#FFFFFF" },
+    { "type": "color", "id": "card_color", "label": "Digit cards", "default": "#FFFFFF" },
+    { "type": "color", "id": "digit_color", "label": "Digits", "default": "#FBACBB" }
+  ]
+}
+{% endschema %}

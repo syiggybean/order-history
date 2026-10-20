@@ -1,0 +1,107 @@
+{%- comment -%}
+  Pre-order countdown (from the order-history app)
+
+  Place this block in the product section, just above the buy buttons.
+  Opening/closing times and the sales limit are set on the app's
+  "Pre-order countdowns" page (product.metafields.oh_preorder.*).
+
+  Before opening: pink flip clock + "email me when it opens", buy buttons hidden.
+  Open: the button reads "Pre-Order" (with a limit, "Pre-Orders Closed" at 0 + sign-up).
+  After closing: buttons greyed out, "Pre-Orders Closed" + sign-up.
+{%- endcomment -%}
+{%- assign opens = product.metafields.oh_preorder.opens_at.value -%}
+{%- assign closes = product.metafields.oh_preorder.closes_at.value -%}
+{%- assign limited = product.metafields.oh_preorder.limited.value -%}
+{%- if opens != blank or closes != blank -%}
+  <div
+    class="ohpc-wrap"
+    data-ohpc
+    data-product-id="{{ product.id }}"
+    data-handle="{{ product.handle }}"
+    data-opens="{% if opens != blank %}{{ opens | date: '%s' }}{% endif %}"
+    data-closes="{% if closes != blank %}{{ closes | date: '%s' }}{% endif %}"
+    data-limited="{% if limited %}true{% else %}false{% endif %}"
+    data-open-text="{{ block.settings.open_text | escape }}"
+    data-closed-text="{{ block.settings.closed_text | escape }}"
+    data-sold-out-text="{{ block.settings.sold_out_text | escape }}"
+    data-notify-scheduled="{{ block.settings.notify_scheduled | escape }}"
+    data-notify-sold-out="{{ block.settings.notify_sold_out | escape }}"
+    data-notify-closed="{{ block.settings.notify_closed | escape }}"
+    data-notify-thanks="{{ block.settings.notify_thanks | escape }}"
+    style="--ohpc-bg: {{ block.settings.panel_color }}; --ohpc-card: {{ block.settings.card_color }}; --ohpc-ink: {{ block.settings.digit_color }}; --ohpc-text: {{ block.settings.label_color }};"
+    hidden
+    {{ block.shopify_attributes }}
+  >
+    <div class="ohpc" data-ohpc-panel hidden>
+      {%- if block.settings.heading != blank -%}
+        <p class="ohpc__heading">{{ block.settings.heading | escape }}</p>
+      {%- endif -%}
+      <div class="ohpc__clock" aria-hidden="true">
+        <div class="ohpc__unit" data-unit="days"><div class="ohpc__digits"></div><span class="ohpc__label">Days</span></div>
+        <span class="ohpc__sep"></span>
+        <div class="ohpc__unit" data-unit="hours"><div class="ohpc__digits"></div><span class="ohpc__label">Hours</span></div>
+        <span class="ohpc__sep"></span>
+        <div class="ohpc__unit" data-unit="minutes"><div class="ohpc__digits"></div><span class="ohpc__label">Minutes</span></div>
+        <span class="ohpc__sep"></span>
+        <div class="ohpc__unit" data-unit="seconds"><div class="ohpc__digits"></div><span class="ohpc__label">Seconds</span></div>
+      </div>
+      {%- if block.settings.show_date and opens != blank -%}
+        <p class="ohpc__when">Opens {{ opens | date: '%B %-d, %Y at %-I:%M %p %Z' }}</p>
+      {%- endif -%}
+      <p class="ohpc__sr" data-ohpc-sr role="status"></p>
+    </div>
+
+    {%- if block.settings.show_notify -%}
+      <div class="ohpc-notify" data-ohpc-notify hidden>
+        <p class="ohpc-notify__title" data-ohpc-notify-title></p>
+        <form class="ohpc-notify__form" data-ohpc-form novalidate>
+          <label class="ohpc__sr" for="ohpc-email-{{ block.id }}">Email address</label>
+          <input
+            id="ohpc-email-{{ block.id }}"
+            class="ohpc-notify__input"
+            type="email"
+            name="email"
+            required
+            autocomplete="email"
+            placeholder="Email address"
+            value="{{ customer.email | escape }}"
+          >
+          <input class="ohpc-hp" type="text" name="website" tabindex="-1" autocomplete="off" aria-hidden="true">
+          <button class="ohpc-notify__button" type="submit">{{ block.settings.notify_button | escape }}</button>
+        </form>
+        <p class="ohpc-notify__msg" data-ohpc-msg role="status"></p>
+      </div>
+    {%- endif -%}
+  </div>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Pre-order countdown",
+  "target": "section",
+  "enabled_on": { "templates": ["product"] },
+  "javascript": "preorder-countdown.js",
+  "stylesheet": "preorder-countdown.css",
+  "settings": [
+    { "type": "header", "content": "Countdown" },
+    { "type": "text", "id": "heading", "label": "Heading", "default": "Pre-orders open in" },
+    { "type": "checkbox", "id": "show_date", "label": "Show the opening date under the clock", "default": true },
+    { "type": "header", "content": "Buy button" },
+    { "type": "text", "id": "open_text", "label": "Button text once open", "default": "Pre-Order" },
+    { "type": "text", "id": "sold_out_text", "label": "Button text when the limit is reached", "default": "Pre-Orders Closed" },
+    { "type": "text", "id": "closed_text", "label": "Button text after closing", "default": "Pre-Orders Closed" },
+    { "type": "header", "content": "Email sign-up" },
+    { "type": "checkbox", "id": "show_notify", "label": "Let customers sign up for emails", "default": true },
+    { "type": "text", "id": "notify_scheduled", "label": "Before opening", "default": "Get an email when pre-orders open" },
+    { "type": "text", "id": "notify_sold_out", "label": "When sold out", "default": "Sold out for now. Get an email if more become available." },
+    { "type": "text", "id": "notify_closed", "label": "After closing", "default": "Get an email if pre-orders re-open" },
+    { "type": "text", "id": "notify_button", "label": "Button", "default": "Notify me" },
+    { "type": "text", "id": "notify_thanks", "label": "After signing up", "default": "You're on the list. We'll email you." },
+    { "type": "header", "content": "Colours" },
+    { "type": "color", "id": "panel_color", "label": "Background", "default": "#FBACBB" },
+    { "type": "color", "id": "label_color", "label": "Heading and labels", "default": "#FFFFFF" },
+    { "type": "color", "id": "card_color", "label": "Digit cards", "default": "#FFFFFF" },
+    { "type": "color", "id": "digit_color", "label": "Digits", "default": "#FBACBB" }
+  ]
+}
+{% endschema %}
