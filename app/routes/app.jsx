@@ -25,7 +25,11 @@ export default function App() {
         {allows(user, "shipping") && <s-link href="/app/shipping">Shipping</s-link>}
         {allows(user, "wishlist") && <s-link href="/app/wishlist">Wishlists</s-link>}
         {allows(user, "loyalty") && <s-link href="/app/loyalty">Loyalty</s-link>}
+        {allows(user, "blocklist") && <s-link href="/app/blocked">Blocked customers</s-link>}
+        {allows(user, "purchaseOrders") && <s-link href="/app/purchase-orders">Purchase orders</s-link>}
         {user?.isAdmin && <s-link href="/app/permissions">Permissions</s-link>}
+        {allows(user, "analytics") && <s-link href="/app/analytics">Analytics</s-link>}
+        {allows(user, "reconciliation") && <s-link href="/app/ordoro">Ordoro reconciliation</s-link>}
         {allows(user, "debug") && <s-link href="/app/debug">Debug</s-link>}
       </s-app-nav>
       <Outlet />

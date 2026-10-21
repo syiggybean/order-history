@@ -6,7 +6,7 @@ import db from "../db.server";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { NoAccess } from "../components/NoAccess";
 import { daysUntil, errorMessage, todayInStore } from "../preorders.server";
-import { approveSuggestions, dismissSuggestions, getBooksJob, startBooksCheck } from "../books.server";
+import { approveSuggestions, dismissSuggestions, getBooksJob, prhEnabled, startBooksCheck } from "../books.server";
 
 export const loader = async ({ request }) => {
   const { session, user, noAccess } = await loadWithAccess(request, "releaseReview", "view");
@@ -35,9 +35,11 @@ export const loader = async ({ request }) => {
     googleTitle: s.googleTitle,
     googleUrl: s.googleUrl,
     status: s.status,
+    source: s.source ?? "google",
+    sourceName: s.source === "prh" ? "Penguin Random House" : "Google Books",
     foundAt: s.createdAt.toISOString(),
     resolvedAt: s.resolvedAt?.toISOString() ?? null,
-    // Positive: Google's date is later than ours
+    // Positive: the suggested date is later than ours
     shift: s.precision === "day" && s.currentDate ? daysUntil(s.currentDate, s.googleDate) : null,
     googleDaysAway: s.precision === "day" ? daysUntil(today, s.googleDate) : null,
   });
@@ -52,6 +54,7 @@ export const loader = async ({ request }) => {
     canManage: can(user, "releaseReview", "manage"),
     canEditDates: can(user, "releaseReview", "manage") || can(user, "preorders", "manage"),
     hasApiKey: Boolean(process.env.GOOGLE_BOOKS_API_KEY),
+    hasPrhKey: prhEnabled(),
   };
 };
 
@@ -115,7 +118,7 @@ export default function ReleaseReview() {
 }
 
 function ReleaseReviewPage() {
-  const { pending, history, lastCheck, job: initialJob, hasApiKey, canManage, canEditDates } = useLoaderData();
+  const { pending, history, lastCheck, job: initialJob, hasApiKey, hasPrhKey, canManage, canEditDates } = useLoaderData();
   const checkFetcher = useFetcher();
   const reviewFetcher = useFetcher();
   const revalidator = useRevalidator();
@@ -162,7 +165,7 @@ function ReleaseReviewPage() {
           : { tone: "success", text: `${text} Tags and shipping profiles were updated to match.` },
       );
     } else if (d.intent === "dismiss") {
-      setNotice({ tone: "info", text: `${d.dismissed} dismissed. They won't come back unless Google's date changes again.` });
+      setNotice({ tone: "info", text: `${d.dismissed} dismissed. They won't come back unless the source's date changes again.` });
     }
     setSelected(new Set());
   }, [reviewFetcher.data]);
@@ -207,11 +210,21 @@ function ReleaseReviewPage() {
       )}
 
       {/* Check status */}
-      <s-section heading="Google Books check">
+      <s-section heading="Release date check">
         <s-paragraph>
-          Looks up each upcoming pre-order's ISBN (from its barcode) on Google Books and lists any release date that
-          doesn't match. Runs every morning after the daily pre-order run. Nothing changes until you approve it.
+          Looks up each upcoming pre-order's ISBN (from its barcode) and lists any release date that doesn't match.
+          {hasPrhKey
+            ? " Penguin Random House's own on-sale date is used when PRH publishes or distributes the book; everything else comes from Google Books."
+            : " Dates come from Google Books."}{" "}
+          Runs every morning after the daily pre-order run. Nothing changes until you approve it.
         </s-paragraph>
+        {!hasPrhKey && (
+          <s-paragraph>
+            <span style={muted}>
+              Add PRH_API_KEY in Railway's Variables to use Penguin Random House's dates for the titles it publishes or distributes.
+            </span>
+          </s-paragraph>
+        )}
         <s-paragraph>
           <strong>Last check:</strong>{" "}
           {lastCheck ? `${new Date(lastCheck.at).toLocaleString()} · ${lastCheck.summary}` : "Not run yet"}
@@ -242,10 +255,18 @@ function ReleaseReviewPage() {
             {job.state !== "running" && (
               <s-paragraph>
                 <span style={muted}>
-                  {job.agrees} match · {job.differences} differ · {job.notFound} not on Google Books · {job.noDate}{" "}
-                  with no date on Google · {job.noIsbn.length} without an ISBN
+                  {job.agrees} match · {job.differences} differ
+                  {job.fromPrh ? ` · ${job.fromPrh} dated by Penguin Random House` : ""} · {job.notFound} not found · {job.noDate}{" "}
+                  with no date · {job.noIsbn.length} without an ISBN
                 </span>
               </s-paragraph>
+            )}
+            {job.prhProblem && (
+              <div style={{ marginTop: "8px" }}>
+                <s-banner tone="warning">
+                  <s-paragraph>{job.prhProblem}</s-paragraph>
+                </s-banner>
+              </div>
             )}
             {job.stoppedEarly && (
               <div style={{ marginTop: "8px" }}>
@@ -287,7 +308,7 @@ function ReleaseReviewPage() {
       {/* Review list */}
       <s-section heading={`To review (${pending.length})`}>
         {pending.length === 0 ? (
-          <s-paragraph>Nothing to review. Every checked pre-order matches Google Books.</s-paragraph>
+          <s-paragraph>Nothing to review. Every checked pre-order matches.</s-paragraph>
         ) : (
           <>
             {!canManage && (
@@ -311,7 +332,7 @@ function ReleaseReviewPage() {
               >
                 Dismiss selected{selected.size ? ` (${selected.size})` : ""}
               </s-button>
-              <span style={muted}>Approving sets the product's release date to Google's, then updates its tag and shipping profile.</span>
+              <span style={muted}>Approving sets the product's release date to the suggested one, then updates its tag and shipping profile.</span>
             </div>
             )}
 
@@ -331,7 +352,7 @@ function ReleaseReviewPage() {
                     )}
                     <th style={head}>Product</th>
                     <th style={head}>Current date</th>
-                    <th style={head}>Google Books</th>
+                    <th style={head}>Suggested date</th>
                     <th style={head}>Change</th>
                     {canManage && <th style={head}></th>}
                   </tr>
@@ -364,12 +385,13 @@ function ReleaseReviewPage() {
                           ) : (
                             fmtDate(s.googleDate)
                           )}
+                          <div style={muted}>{s.sourceName}</div>
                           {s.precision !== "day" && <div style={muted}>Google gives {s.precision} only</div>}
                         </td>
                         <td style={{ ...cell, whiteSpace: "nowrap" }}>
                           <Shift s={s} />
                           {s.googleDaysAway !== null && s.googleDaysAway <= 0 && (
-                            <div style={{ ...muted, color: "#b42318" }}>Already released per Google</div>
+                            <div style={{ ...muted, color: "#b42318" }}>Already released per {s.sourceName}</div>
                           )}
                         </td>
                         {canManage && (
@@ -431,6 +453,7 @@ function ReleaseReviewPage() {
                     </td>
                     <td style={cell}>
                       {fmtDate(s.currentDate)} → {fmtDate(s.googleDate)}
+                      <div style={muted}>{s.sourceName}</div>
                     </td>
                   </tr>
                 ))}

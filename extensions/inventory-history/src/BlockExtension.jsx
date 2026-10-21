@@ -149,6 +149,7 @@ function ChangeRow({ c, first, orderOpen, onToggleOrder }) {
                 {signed(p.change)} {p.label}
               </s-text>
             ))}
+            {c.catalog && <s-badge tone={c.catalog.action === "deleted" ? "critical" : "success"}>{c.catalog.label}</s-badge>}
             {c.variant && <s-badge>{c.variant}</s-badge>}
           </s-stack>
           {c.pending ? (

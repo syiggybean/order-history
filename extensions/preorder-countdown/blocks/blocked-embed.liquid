@@ -1,0 +1,62 @@
+{%- comment -%}
+  Blocked customers (MonkeyBean). Turn on under Online Store > Themes > Edit theme > App embeds.
+  For logged-in customers tagged "Blocked from shopping" (set from the customer's
+  More actions > Block customer in Shopify admin): a red banner on every page,
+  no add-to-cart or buy buttons, no cart, and the cart page sends them to an
+  error page. Everyone else: nothing.
+{%- endcomment -%}
+{%- if customer and customer.tags contains 'Blocked from shopping' -%}
+  {%- liquid
+    if routes.root_url == '/'
+      assign ohbl_page = '/apps/purchase-history/blocked'
+    else
+      assign ohbl_page = routes.root_url | append: '/apps/purchase-history/blocked'
+    endif
+    assign ohbl_email = block.settings.email | default: 'help@yiggybean.com'
+  -%}
+  {%- if template.name == 'cart' -%}
+    <script>location.replace({{ ohbl_page | json }});</script>
+    <meta http-equiv="refresh" content="0;url={{ ohbl_page }}">
+  {%- endif -%}
+  <div id="ohbl-banner" role="alert">
+    {{ block.settings.message | default: "Your account has been blocked from shopping." | escape }}
+    If you believe you're seeing this in error, contact <a href="mailto:{{ ohbl_email | escape }}">{{ ohbl_email | escape }}</a>.
+  </div>
+  <style>
+    #ohbl-banner{position:sticky;top:0;z-index:2147483646;background:#c8102e;color:#fff;font:600 15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;text-align:center;padding:12px 16px}
+    #ohbl-banner a{color:#fff;text-decoration:underline}
+    form[action*="/cart/add"],form[action*="/cart"] [type="submit"][name="add"],[name="add"],.product-form__buttons,.product-form__submit,
+    .shopify-payment-button,shopify-buy-it-now-button,shopify-accelerated-checkout,shopify-accelerated-checkout-cart,.additional-checkout-buttons,
+    .quick-add,.quick-add__submit,.card__quick-add,quick-add-modal,product-form,.btn--add-to-cart,.add-to-cart,[data-add-to-cart],.ohwl-add,.ohlp-reward button,
+    a[href$="/cart"],a[href*="/cart?"],a[href*="/checkout"],#cart-icon-bubble,.header__icon--cart,.site-nav__link--cart,.js-drawer-open-cart,
+    cart-drawer,cart-notification,#CartDrawer,#cart-notification,.cart-drawer,.drawer--cart,[data-cart-drawer],.cart-count-bubble{display:none!important}
+  </style>
+  <script>
+    (function(){
+      var b=document.getElementById('ohbl-banner');
+      if(b&&document.body.firstChild!==b)document.body.insertBefore(b,document.body.firstChild);
+      var page={{ ohbl_page | json }};
+      // Empty the cart, and stop anything adding to it or going to checkout
+      try{fetch('/cart/clear.js',{method:'POST',credentials:'same-origin'})}catch(e){}
+      var bad=/\/(cart|checkouts?)(\/|\?|$|\.js)/;
+      var of=window.fetch;
+      if(of)window.fetch=function(u,o){var s=typeof u==='string'?u:(u&&u.url)||'';if(/\/cart\/(add|update|change)/.test(s))return Promise.reject(new Error('blocked'));return of.apply(this,arguments)};
+      var ox=XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open=function(m,u){if(/\/cart\/(add|update|change)/.test(String(u)))throw new Error('blocked');return ox.apply(this,arguments)};
+      document.addEventListener('submit',function(e){var a=(e.target&&e.target.getAttribute('action'))||'';if(bad.test(a)){e.preventDefault();e.stopPropagation();location.href=page}},true);
+      document.addEventListener('click',function(e){var l=e.target.closest&&e.target.closest('a[href]');if(l&&bad.test(l.getAttribute('href'))){e.preventDefault();e.stopPropagation();location.href=page}},true);
+    })();
+  </script>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Blocked customers",
+  "target": "body",
+  "settings": [
+    { "type": "text", "id": "message", "label": "Banner message", "default": "Your account has been blocked from shopping." },
+    { "type": "text", "id": "email", "label": "Contact email", "default": "help@yiggybean.com" },
+    { "type": "paragraph", "content": "Shown only to logged-in customers blocked from their customer page in Shopify admin (More actions > Block customer)." }
+  ]
+}
+{% endschema %}

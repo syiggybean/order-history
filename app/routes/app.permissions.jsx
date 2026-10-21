@@ -53,7 +53,7 @@ function capSummary(feature, caps) {
   const on = all.filter((c) => caps?.includes(c));
   if (on.length === 0) return "Hidden";
   if (on.length === all.length) return "Everything";
-  const short = { view: "View", batches: "Batches", pick: "Pick", pack: "Pack", ship: "Ship", override: "Override", shipOutside: "Outside batch", review: "Flag/Review", assignedOnly: "Assigned only", settings: "Settings" };
+  const short = { view: "View", batches: "Batches", pick: "Pick", pack: "Pack", ship: "Ship", override: "Override", shipOutside: "Outside batch", review: "Flag/Review", assignedOnly: "Assigned only", settings: "Settings", generate: "Generate", email: "Email", export: "Export" };
   return on.map((c) => short[c] ?? c).join(", ");
 }
 

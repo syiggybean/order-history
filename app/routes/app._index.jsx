@@ -93,6 +93,41 @@ const TOOLS = [
     status: "live",
   },
   {
+    title: "Blocked customers",
+    feature: "blocklist",
+    description:
+      "Customers and addresses blocked from shopping (More actions → Block customer on a customer's page). Orders that slip through are held and flagged.",
+    href: "/app/blocked",
+    action: "View block list",
+    status: "live",
+  },
+  {
+    title: "Purchase orders",
+    feature: "purchaseOrders",
+    description:
+      "Build POs from a supplier CSV, email them (always bcc'd to zeni@yiggybean.com) or export a PDF, then receive the stock straight into Shopify.",
+    href: "/app/purchase-orders",
+    action: "Open purchase orders",
+    status: "live",
+  },
+  {
+    title: "Sell-through analytics",
+    feature: "analytics",
+    description:
+      "Sell-through, sales and profit by category, publisher, supplier or item, with suggestions on what to carry more or less of.",
+    href: "/app/analytics",
+    action: "Open analytics",
+    status: "live",
+  },
+  {
+    title: "Ordoro reconciliation",
+    feature: "reconciliation",
+    description: "Orders that don't match between Shopify and Ordoro, with notes and statuses so the team can clean up before offboarding Ordoro.",
+    href: "/app/ordoro",
+    action: "Open reconciliation",
+    status: "live",
+  },
+  {
     title: "Customer notifications",
     feature: "releaseReview",
     description: "Emails customers about approved release date changes on items they've pre-ordered.",

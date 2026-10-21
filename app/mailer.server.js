@@ -115,7 +115,8 @@ async function gmailToken() {
 }
 
 // Turns a message ({ from, to, subject, html, text, headers }) into raw MIME
-const composer = nodemailer.createTransport({ streamTransport: true, buffer: true, newline: "unix" });
+// keepBcc: the Gmail API reads Bcc from the message itself (and doesn't pass it on)
+const composer = nodemailer.createTransport({ streamTransport: true, buffer: true, newline: "unix", keepBcc: true });
 
 const gmailTransport = {
   async sendMail(message) {

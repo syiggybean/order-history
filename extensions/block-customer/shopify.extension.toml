@@ -1,0 +1,16 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "block-customer"
+uid = "8f0f5bdc-86d4-9e41-78d4-c00fbf25030df7adeb40"
+type = "ui_extension"
+
+# "Block customer" in the customer page's More actions menu
+[[extensions.targeting]]
+module = "./src/BlockCustomer.jsx"
+target = "admin.customer-details.action.render"
+
+# Hides the menu item for staff without Blocked customers access
+[extensions.targeting.should_render]
+module = "./src/condition/shouldRender.js"

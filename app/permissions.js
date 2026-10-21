@@ -26,6 +26,21 @@ export const FEATURES = {
     levels: ["hidden", "view", "manage"],
     levelLabels: { hidden: "Hidden", view: "View", manage: "View + manage members and settings" },
   },
+  blocklist: {
+    label: "Blocked customers",
+    levels: ["hidden", "view", "manage"],
+    levelLabels: { hidden: "Hidden", view: "View", manage: "View + block and unblock" },
+  },
+  analytics: {
+    label: "Analytics",
+    levels: ["hidden", "view"],
+    levelLabels: { hidden: "Hidden", view: "View" },
+  },
+  reconciliation: {
+    label: "Ordoro reconciliation",
+    levels: ["hidden", "view", "manage"],
+    levelLabels: { hidden: "Hidden", view: "View", manage: "View + notes, statuses and runs" },
+  },
   debug: {
     label: "Debug",
     levels: ["hidden", "view"],
@@ -49,6 +64,15 @@ export const CAPABILITY_FEATURES = {
       review: "Flag/Review orders",
       assignedOnly: "Only their assigned batches (limits what they see)",
       settings: "Manage bins and shipping settings",
+    },
+  },
+  purchaseOrders: {
+    label: "Purchase orders",
+    caps: {
+      view: "View purchase orders",
+      generate: "Create, edit and receive POs (suppliers and template too)",
+      email: "Email POs to suppliers",
+      export: "Export POs as PDF",
     },
   },
 };

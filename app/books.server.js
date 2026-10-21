@@ -20,6 +20,14 @@ const REQUEST_GAP_MS = 300; // pause between lookups to stay under Google's rate
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Penguin Random House: the publisher's own on-sale dates for every title PRH
+// publishes or distributes (Seven Seas, Kodansha, Dark Horse and more).
+// Checked first; titles PRH doesn't know go on to Google Books.
+const PRH_KEY = process.env.PRH_API_KEY || "";
+const PRH_BASE = "https://api.penguinrandomhouse.com/resources/v2/title/domains/PRH.US/titles";
+const PRH_GAP_MS = 250;
+export const prhEnabled = () => Boolean(PRH_KEY);
+
 // ---------------------------------------------------------------------------
 // ISBNs and dates
 // ---------------------------------------------------------------------------
@@ -40,6 +48,25 @@ export function parseGoogleDate(value) {
   if (m[3]) return { value: `${m[1]}-${m[2]}-${m[3]}`, precision: "day" };
   if (m[2]) return { value: `${m[1]}-${m[2]}`, precision: "month" };
   return { value: m[1], precision: "year" };
+}
+
+// ISBN-10 → ISBN-13 (PRH looks titles up by ISBN-13)
+export function toIsbn13(isbn) {
+  if (!isbn) return null;
+  if (isbn.length === 13) return isbn;
+  const core = `978${isbn.slice(0, 9)}`;
+  const sum = [...core].reduce((t, d, i) => t + Number(d) * (i % 2 ? 3 : 1), 0);
+  return `${core}${(10 - (sum % 10)) % 10}`;
+}
+
+// PRH's onsale: "2027-03-14", "2027-03-14T00:00:00" or "03/14/2027"
+export function parsePrhDate(value) {
+  const s = String(value ?? "").trim();
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return { value: `${m[1]}-${m[2]}-${m[3]}`, precision: "day" };
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return { value: `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`, precision: "day" };
+  return null;
 }
 
 // Does Google's date agree with ours, as far as Google's precision goes?
@@ -102,6 +129,46 @@ async function lookupIsbn(isbn) {
 }
 
 // ---------------------------------------------------------------------------
+// Penguin Random House lookup
+// ---------------------------------------------------------------------------
+
+class PrhKeyError extends Error {}
+
+// { title, url, date, source: "prh" } or null when PRH doesn't have the title
+export async function lookupPrh(isbn) {
+  const isbn13 = toIsbn13(isbn);
+  const url = `${PRH_BASE}/${isbn13}?api_key=${encodeURIComponent(PRH_KEY)}`;
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (res.status === 404) return null;
+    if (res.status === 401 || res.status === 403) {
+      throw new PrhKeyError(
+        "Penguin Random House didn't accept the API key. New keys can take several days to be activated; until then dates come from Google Books.",
+      );
+    }
+    if (res.status === 429 || res.status >= 500) {
+      if (attempt < 3) {
+        await sleep(2000 * 2 ** attempt);
+        continue;
+      }
+      throw new Error(`Penguin Random House returned ${res.status}`);
+    }
+    if (!res.ok) throw new Error(`Penguin Random House returned ${res.status}`);
+    const body = await res.json().catch(() => null);
+    // The title may come bare or wrapped, depending on the API version
+    const t = body?.data?.titles?.[0] ?? body?.titles?.[0] ?? (Array.isArray(body?.data) ? body.data[0] : null) ?? (body?.isbn ? body : null);
+    if (!t) return null;
+    const seo = t.seoFriendlyUrl ? String(t.seoFriendlyUrl) : null;
+    return {
+      title: [t.title, t.subtitle].filter(Boolean).join(": ") || null,
+      url: seo ? (seo.startsWith("http") ? seo : `https://www.penguinrandomhouse.com${seo.startsWith("/") ? "" : "/"}${seo}`) : null,
+      date: parsePrhDate(t.onsale),
+      source: "prh",
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Review list
 // ---------------------------------------------------------------------------
 
@@ -121,6 +188,7 @@ async function recordResult(shop, product, isbn, google) {
     return "agrees";
   }
 
+  const source = google.source ?? "google";
   // Already dismissed this exact date: don't ask again
   if (open.some((s) => s.status === "dismissed" && s.googleDate === google.date.value)) return "dismissed";
 
@@ -139,6 +207,7 @@ async function recordResult(shop, product, isbn, google) {
     currentDate: product.release,
     googleTitle: google.title,
     googleUrl: google.url,
+    source,
   };
 
   if (same) {
@@ -169,7 +238,7 @@ const isRunning = (shop) => jobs.get(shop)?.state === "running";
 
 // options.bulkId: reuse a finished catalog scan (the daily run passes its own)
 export async function runBooksCheck(shop, { bulkId = null, source = "Manual" } = {}) {
-  if (isRunning(shop)) throw new Error("A Google Books check is already running.");
+  if (isRunning(shop)) throw new Error("A release date check is already running.");
 
   const job = {
     source,
@@ -182,6 +251,9 @@ export async function runBooksCheck(shop, { bulkId = null, source = "Manual" } =
     agrees: 0,
     notFound: 0,
     noDate: 0,
+    fromPrh: 0,
+    fromGoogle: 0,
+    prhProblem: null,
     noIsbn: [], // { id, title }
     stoppedEarly: null,
     errors: [],
@@ -205,7 +277,8 @@ export async function runBooksCheck(shop, { bulkId = null, source = "Manual" } =
       .sort((a, b) => a.release.localeCompare(b.release));
 
     job.total = products.length;
-    job.step = "Checking Google Books";
+    let usePrh = prhEnabled();
+    job.step = usePrh ? "Checking Penguin Random House, then Google Books" : "Checking Google Books";
 
     for (const p of products) {
       const isbn = p.variants.map((v) => toIsbn(v.barcode)).find(Boolean);
@@ -216,7 +289,26 @@ export async function runBooksCheck(shop, { bulkId = null, source = "Manual" } =
       }
 
       try {
-        const google = await lookupIsbn(isbn);
+        // The publisher first (if set up), then Google for anything PRH doesn't have
+        let found = null;
+        if (usePrh) {
+          try {
+            found = await lookupPrh(isbn);
+            if (found && !found.date) found = null;
+            await sleep(PRH_GAP_MS);
+          } catch (e) {
+            if (e instanceof PrhKeyError) {
+              job.prhProblem = e.message;
+              usePrh = false;
+            } else {
+              job.errors.push(`${p.title} (Penguin Random House): ${errorMessage(e)}`);
+            }
+            found = null;
+          }
+        }
+        const google = found ?? (await lookupIsbn(isbn));
+        if (found) job.fromPrh++;
+        else if (google) job.fromGoogle++;
         if (!google) job.notFound++;
         else if (!google.date) job.noDate++;
         else {
@@ -254,7 +346,9 @@ export async function runBooksCheck(shop, { bulkId = null, source = "Manual" } =
           `${job.done} of ${job.total} checked`,
           `${job.newCount} new to review`,
           job.noIsbn.length ? `${job.noIsbn.length} without an ISBN` : null,
-          job.notFound ? `${job.notFound} not on Google Books` : null,
+          job.fromPrh ? `${job.fromPrh} from Penguin Random House` : null,
+          job.notFound ? `${job.notFound} not found` : null,
+          job.prhProblem ? "PRH key not accepted" : null,
           job.stoppedEarly ? "stopped early (Google limit)" : null,
         ]
           .filter(Boolean)
@@ -271,7 +365,7 @@ export async function runBooksCheck(shop, { bulkId = null, source = "Manual" } =
 
 // Starts a check in the background and returns right away
 export function startBooksCheck(shop) {
-  if (isRunning(shop)) throw new Error("A Google Books check is already running.");
+  if (isRunning(shop)) throw new Error("A release date check is already running.");
   runBooksCheck(shop).catch((e) => console.error("[books] check:", errorMessage(e)));
   return getBooksJob(shop);
 }

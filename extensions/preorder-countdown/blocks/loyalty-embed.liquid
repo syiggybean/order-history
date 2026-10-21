@@ -16,6 +16,7 @@
     {
       "base": {{ ohlp_base | json }},
       "customer": {{ customer.id | json }},
+      "accountUrl": {{ routes.account_url | json }},
       "header": {{ block.settings.show_header | json }},
       "earn": {{ block.settings.show_product | json }},
       "accountSel": {{ block.settings.account_selector | default: "" | json }},

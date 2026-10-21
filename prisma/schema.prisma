@@ -66,6 +66,9 @@ model ReleaseSuggestion {
   precision   String
   googleTitle String?
   googleUrl   String?
+  // Where the suggested date came from: "prh" (Penguin Random House) or "google"
+  // (googleDate/googleTitle/googleUrl hold it whichever source it is)
+  source      String    @default("google")
   status      String    @default("pending")
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -187,6 +190,13 @@ model InventorySync {
   lastRecheckQueued String?
   paused            Boolean   @default(false)
   pausedReason      String?
+  // Variant names and SKUs from the stock report (for deleted variants)
+  namesReadAt       DateTime?
+  namesOffset       Int       @default(0)
+  // Product and variant names from the sales report (for deleted ones that sold)
+  salesReadAt       DateTime?
+  salesOffset       Int       @default(0)
+  salesError        String?
 }
 
 // App permissions: one row per staff member who has used the app
@@ -819,4 +829,336 @@ model LoyaltyRedemption {
 
   @@index([shop, customerId])
   @@index([shop, status])
+}
+
+// ---------------------------------------------------------------------------
+// Blocked customers and shipping addresses
+// ---------------------------------------------------------------------------
+
+model BlockedCustomer {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  customerId  String
+  name        String?
+  email       String?
+  // The customer themself (an address can stay blocked after they're unblocked)
+  blocked     Boolean   @default(true)
+  reason      String?
+  blockedBy   String?
+  blockedAt   DateTime  @default(now())
+  unblockedBy String?
+  unblockedAt DateTime?
+  // The "Blocked from shopping" tag is on the customer in Shopify
+  tagged      Boolean   @default(false)
+  tagError    String?
+
+  @@unique([shop, customerId])
+}
+
+model BlockedAddress {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  // Street, postcode and country, normalized ("12 elm st|62701|us")
+  key         String
+  display     String
+  customerId  String?
+  blocked     Boolean   @default(true)
+  blockedBy   String?
+  blockedAt   DateTime  @default(now())
+  unblockedBy String?
+  unblockedAt DateTime?
+
+  @@unique([shop, key])
+  @@index([shop, customerId])
+}
+
+// Orders caught by the block list
+model BlockedOrder {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  orderId    String
+  orderName  String?
+  customerId String?
+  // "customer" | "address" | "customer,address"
+  why        String
+  held       Boolean  @default(false)
+  error      String?
+  createdAt  DateTime @default(now())
+
+  @@unique([shop, orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Purchase orders
+// ---------------------------------------------------------------------------
+
+model PoSettings {
+  shop         String   @id
+  counter      Int      @default(0)
+  prefix       String   @default("PO-")
+  locationId   String?
+  // The PO document (HTML with {{fields}}); null = the built-in one
+  template     String?
+  emailSubject String?
+  emailBody    String?
+  updatedAt    DateTime @default(now()) @updatedAt
+}
+
+model Supplier {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  name       String
+  // Comma-separated
+  emails     String?
+  contact    String?
+  phone      String?
+  address    String?
+  taxRate    Float?
+  notes      String?
+  archived   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
+
+  @@index([shop, archived])
+}
+
+model PurchaseOrder {
+  id            Int       @id @default(autoincrement())
+  shop          String
+  number        Int
+  poNumber      String
+  supplierId    Int?
+  supplierName  String?
+  supplierEmails String?
+  supplierAddress String?
+  // pending | open | partial | received | closed
+  status        String    @default("pending")
+  currency      String    @default("USD")
+  locationId    String?
+  locationName  String?
+  expectedAt    DateTime?
+  // Shown on the PO document
+  supplierNote  String?
+  subtotal      Float     @default(0)
+  taxTotal      Float     @default(0)
+  total         Float     @default(0)
+  sourceFile    String?
+  createdBy     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+  openedAt      DateTime?
+  sentAt        DateTime?
+  sentTo        String?
+  exportedAt    DateTime?
+  receivedAt    DateTime?
+  closedAt      DateTime?
+  closedBy      String?
+
+  @@unique([shop, number])
+  @@index([shop, status])
+}
+
+model PurchaseOrderLine {
+  id              Int     @id @default(autoincrement())
+  poId            Int
+  position        Int
+  sku             String?
+  supplierCode    String?
+  supplierBarcode String?
+  title           String
+  quantity        Int
+  unitCost        Float   @default(0)
+  // Percent, e.g. 8.25
+  taxRate         Float   @default(0)
+  tax             Float   @default(0)
+  total           Float   @default(0)
+  received        Int     @default(0)
+  variantId       String?
+  inventoryItemId String?
+  shopifyTitle    String?
+  imageUrl        String?
+
+  @@index([poId])
+}
+
+// Private notes: staff only, never on the PO document or emails
+model PurchaseOrderNote {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  poId      Int
+  body      String
+  by        String?
+  createdAt DateTime @default(now())
+
+  @@index([poId])
+}
+
+model PurchaseOrderEvent {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  poId      Int
+  type      String
+  detail    String?
+  by        String?
+  createdAt DateTime @default(now())
+
+  @@index([poId])
+}
+
+// Products and variants created or deleted, for the inventory history.
+// Comes from Shopify's product notifications (instant) and its event log
+// (who did it, and up to a year back).
+model CatalogEvent {
+  id              Int      @id @default(autoincrement())
+  shop            String
+  subject         String   // "product" | "variant"
+  subjectId       String   // gid of the product or variant
+  action          String   // "created" | "deleted"
+  productId       String?
+  productTitle    String?
+  variantTitle    String?
+  sku             String?
+  inventoryItemId String?
+  staffName       String?
+  appName         String?
+  message         String?
+  details         String?  // the event's extra data from Shopify (JSON)
+  eventId         String?  // Shopify event, once found
+  whoCheckedAt    DateTime? // last time we looked elsewhere for who did it
+  nameCheckedAt   DateTime? // last time we looked elsewhere for its product
+  nameSource      String?   // how the product was worked out, in words
+  // A product deleted and another created at the same moment (re-created)
+  pairId          Int?      // the other row
+  likelyTitle     String?   // the re-created product's name, for an unnamed deletion
+  source          String   @default("webhook")
+  // A variant created or deleted along with its whole product: shown as the product
+  hidden          Boolean  @default(false)
+  occurredAt      DateTime
+  createdAt       DateTime @default(now())
+
+  @@unique([shop, subjectId, action])
+  @@index([shop, occurredAt])
+  @@index([shop, productId, occurredAt])
+  @@index([shop, inventoryItemId])
+}
+
+// The variants each product had last time we heard, to spot added/removed ones
+model CatalogVariant {
+  shop            String
+  variantId       String
+  productId       String?  // unknown for variants only seen in the stock report
+  productTitle    String?
+  variantTitle    String?
+  sku             String?
+  inventoryItemId String?
+  price           String?
+  barcode         String?
+  position        Int?
+  source          String   @default("webhook") // webhook | shopify | stock-report
+  deletedAt       DateTime?
+  updatedAt       DateTime @updatedAt
+
+  @@id([shop, variantId])
+  @@index([shop, productId])
+}
+
+// Progress reading Shopify's event log, one row per shop
+model CatalogSync {
+  shop       String    @id
+  cursors    String?   // JSON: { "PRODUCT:create": "2026-10-20T…", … }
+  lastRunAt  DateTime?
+  lastError  String?
+  // One-time read of every current product, for the last-known copies
+  seedCursor String?
+  seededAt   DateTime?
+}
+
+// The last-known copy of each product, so a deleted one can still be described
+model CatalogProduct {
+  shop         String
+  productId    String
+  title        String?
+  handle       String?
+  vendor       String?
+  productType  String?
+  tags         String?
+  status       String?
+  imageUrl     String?
+  variantCount Int?
+  createdAt    DateTime?
+  deletedAt    DateTime?
+  updatedAt    DateTime  @updatedAt
+
+  @@id([shop, productId])
+}
+
+// Sell-through analytics: one saved snapshot per shop and period
+model AnalyticsReport {
+  shop      String
+  periodKey String    // "90d" or "2026-01-01..2026-03-31"
+  fromDay   String
+  toDay     String
+  status    String    @default("running") // running | done | failed
+  step      String?
+  error     String?
+  data      String?   // JSON: one row per product
+  totals    String?   // JSON
+  startedAt DateTime?
+  builtAt   DateTime?
+
+  @@id([shop, periodKey])
+}
+
+// Shopify ↔ Ordoro reconciliation: each comparison run
+model OrdoroRun {
+  id         Int       @id @default(autoincrement())
+  shop       String
+  fromDay    String
+  toDay      String
+  status     String    @default("running") // running | done | failed
+  step       String?
+  error      String?
+  counts     String?   // JSON summary
+  startedBy  String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  @@index([shop, id])
+}
+
+// One order that differs between Shopify and Ordoro (kept across runs)
+model OrdoroIssue {
+  id             Int          @id @default(autoincrement())
+  shop           String
+  key            String       // "s:<Shopify order id>" or "o:<Ordoro order number>"
+  orderName      String
+  shopifyOrderId String?
+  ordoroNumber   String?
+  placedAt       DateTime
+  issues         String       // JSON: [{ type, label, shopify, ordoro }]
+  issueTypes     String       // ",shipped,tracking," for filtering
+  detail         String?      // JSON: both sides as last read
+  status         String       @default("open") // open | resolved | ignored | fixed
+  statusBy       String?
+  statusAt       DateTime?
+  lastRunId      Int?
+  firstSeenAt    DateTime     @default(now())
+  lastSeenAt     DateTime     @default(now())
+  notes          OrdoroNote[]
+
+  @@unique([shop, key])
+  @@index([shop, status, placedAt])
+}
+
+// Research notes on an order (shared by the team)
+model OrdoroNote {
+  id        Int         @id @default(autoincrement())
+  shop      String
+  issueId   Int
+  issue     OrdoroIssue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  body      String
+  by        String?
+  createdAt DateTime    @default(now())
+
+  @@index([issueId])
 }

@@ -17,7 +17,10 @@
   var KEY = "ohlp:v1:" + cfg.customer;
   var page = cfg.base + "/rewards";
   var STAR = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.9 6.4.8-4.7 4.4 1.2 6.4L12 17.2l-5.7 3.1 1.2-6.4L2.8 9.5l6.4-.8z"/></svg>';
-  var ACCOUNT = "a.header__icon--account,header a[href$='/account'],header a[href*='/account/login'],.site-header a[href$='/account'],.site-nav a[href$='/account'],a[href$='/account']";
+  // Classic accounts link to /account; new customer accounts to shopify.com/…/account
+  // or /customer_authentication/…
+  var ACCOUNT =
+    "a.header__icon--account,.site-nav__link--icon[href*='account'],.site-nav__link--icon[href*='customer_authentication'],header a[href*='/account'],.site-header a[href*='/account'],header a[href*='customer_authentication'],.site-header a[href*='customer_authentication'],a[href*='customer_authentication'],a[href$='/account']";
   var PRICE =
     ".product__info-container .price,.product-single__meta .product-single__prices,.product-single__prices,.product__price,.product-block--price,.product-info__price,.price-list,.product .price";
   var me = null;
@@ -39,6 +42,12 @@
   function badge() {
     if (!cfg.header || document.querySelector(".ohlp-badge")) return;
     var acct = first(cfg.accountSel || ACCOUNT);
+    if (!acct && cfg.accountUrl) {
+      var all = document.querySelectorAll("a[href]");
+      for (var i = 0; i < all.length && !acct; i++) if (all[i].getAttribute("href") === cfg.accountUrl) acct = all[i];
+    }
+    // Last resort: next to the wishlist heart or the cart
+    if (!acct) acct = first(".ohwl-hdr") || first("header a[href$='/cart'],.site-header a[href$='/cart'],a[href$='/cart']");
     if (!acct) return;
     var a = document.createElement("a");
     a.className = "ohlp-badge";

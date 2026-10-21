@@ -1,5 +1,6 @@
 import db from "./db.server";
 import { unauthenticated } from "./shopify.server";
+import { applySalesNames, namesFromSalesWanted, saveStockReportVariants, variantNamesWanted } from "./catalog.server";
 
 // ---------------------------------------------------------------------------
 // Inventory history sync
@@ -135,6 +136,19 @@ const rangeQuery = (from, to, limit, offset) =>
 
 const PLAN_QUERY = `FROM ${DATASET} SHOW inventory_adjustment_count GROUP BY month SINCE -10y ORDER BY month DESC`;
 
+// Every variant that ever had a stock change, with its name and SKU as the
+// stock report kept them: names deleted variants in the inventory history
+const NAMES_PAGE = 5000;
+const namesQuery = (offset) =>
+  `FROM ${DATASET} SHOW inventory_adjustment_count GROUP BY product_variant_id, inventory_item_id, product_variant_sku, product_variant_title SINCE -10y ORDER BY product_variant_id ASC LIMIT ${NAMES_PAGE} OFFSET ${offset}`;
+const NAMES_EVERY_MS = 24 * 3600 * 1000;
+
+// Every product/variant ever sold, with its names as at the time of sale:
+// names deleted products and variants that ever sold
+const SALES_PAGE = 5000;
+const salesQuery = (offset) =>
+  `FROM sales SHOW quantity_ordered GROUP BY product_id, product_variant_id, product_title_at_time_of_sale, product_variant_title_at_time_of_sale, product_variant_sku_at_time_of_sale, product_vendor_at_time_of_sale, product_type_at_time_of_sale SINCE -10y ORDER BY product_id ASC LIMIT ${SALES_PAGE} OFFSET ${offset}`;
+
 // ---------------------------------------------------------------------------
 // Storing rows
 // ---------------------------------------------------------------------------
@@ -212,6 +226,9 @@ async function storeRows(shop, admin, rows) {
       occurredAt: new Date(r.second),
       inventoryItemId: itemId,
       productId: i?.productId ?? null,
+      // Kept so items deleted later can still be named
+      variantId: gid("ProductVariant", r.product_variant_id) ?? i?.variantId ?? null,
+      sku: clean(r.product_variant_sku) ?? i?.sku ?? null,
       locationId: gid("Location", r.inventory_location_id),
       locationName: clean(r.inventory_location_name),
       state: String(r.inventory_state),
@@ -352,7 +369,7 @@ export async function getSyncStatus(shop) {
 // Jobs: each runs exactly one query and records what's next
 // ---------------------------------------------------------------------------
 
-function pickJob(s, pendingCount, now) {
+function pickJob(s, pendingCount, now, namesWanted = false, salesWanted = false) {
   if (s.paused) return null;
   const lastLive = s.lastLiveSyncAt?.getTime() ?? 0;
   const requested = s.liveRequestedAt && s.liveRequestedAt.getTime() > lastLive;
@@ -362,6 +379,9 @@ function pickJob(s, pendingCount, now) {
   if (s.recheckDay) return "recheck";
   if (!s.backfillPlan) return "plan";
   if (!s.backfillDone) return "backfill";
+  // Lowest priority, and only when something needs naming
+  if (namesWanted && (!s.namesReadAt || now - s.namesReadAt.getTime() > NAMES_EVERY_MS)) return "names";
+  if (salesWanted && (!s.salesReadAt || now - s.salesReadAt.getTime() > NAMES_EVERY_MS)) return "sales";
   return null;
 }
 
@@ -428,6 +448,45 @@ async function runJob(job, shop, admin, s) {
       backfillIndex: nextIndex,
       backfillOffset: full ? s.backfillOffset + res.rows.length : 0,
       backfillDone: nextIndex >= plan.length,
+    });
+    return true;
+  }
+
+  if (job === "names") {
+    const res = await runShopifyql(admin, namesQuery(s.namesOffset));
+    if (!res.rows) {
+      // Optional extra: never let it hold up the stock history. Try again tomorrow.
+      console.error("[inventory-sync] variant names:", res.parseErrors?.join("; ") ?? res.error ?? "failed");
+      await setState(shop, { namesReadAt: new Date(), namesOffset: 0, ...(res.rateLimited ? { nextQueryAt: new Date(Date.now() + 60_000) } : {}) });
+      return true;
+    }
+    await saveStockReportVariants(shop, res.rows);
+    const full = res.rows.length >= NAMES_PAGE;
+    await setState(shop, {
+      ...afterQuery(res),
+      ...(full ? { namesOffset: s.namesOffset + res.rows.length } : { namesOffset: 0, namesReadAt: new Date() }),
+    });
+    return true;
+  }
+
+  if (job === "sales") {
+    const res = await runShopifyql(admin, salesQuery(s.salesOffset));
+    if (!res.rows) {
+      // Optional extra: never let it hold up the stock history. Try again tomorrow.
+      console.error("[inventory-sync] sales names:", res.parseErrors?.join("; ") ?? res.error ?? "failed");
+      await setState(shop, {
+        salesReadAt: new Date(),
+        salesOffset: 0,
+        salesError: String(res.parseErrors?.join("; ") ?? res.error ?? "failed").slice(0, 300),
+        ...(res.rateLimited ? { nextQueryAt: new Date(Date.now() + 60_000) } : {}),
+      });
+      return true;
+    }
+    await applySalesNames(shop, res.rows);
+    const full = res.rows.length >= SALES_PAGE;
+    await setState(shop, {
+      ...afterQuery(res),
+      ...(full ? { salesOffset: s.salesOffset + res.rows.length } : { salesOffset: 0, salesReadAt: new Date(), salesError: null }),
     });
     return true;
   }
@@ -504,7 +563,10 @@ export function kick(shop) {
       for (;;) {
         let s = await getState(shop);
         const pendingCount = await db.inventoryEvent.count({ where: { shop, detailsStatus: "pending" } });
-        const job = pickJob(s, pendingCount, Date.now());
+        const idle = s.backfillDone && !s.paused;
+        const namesWanted = idle ? await variantNamesWanted(shop).catch(() => false) : false;
+        const salesWanted = idle ? await namesFromSalesWanted(shop).catch(() => false) : false;
+        const job = pickJob(s, pendingCount, Date.now(), namesWanted, salesWanted);
         if (!job) break;
 
         const wait = (s.nextQueryAt?.getTime() ?? 0) - Date.now();

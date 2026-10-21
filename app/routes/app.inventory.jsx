@@ -6,6 +6,7 @@ import { NoAccess } from "../components/NoAccess";
 import { getSyncStatus, kick, setPaused } from "../inventory-sync.server";
 import { KIND_OPTIONS, SINCE_OPTIONS, itemName, listChanges, whoItems, whoSummary } from "../inventory-history.server";
 import { UndoError, listUndos, previewUndo, undoChange } from "../inventory-undo.server";
+import { catalogDetail, kickCatalog } from "../catalog.server";
 
 const PAGE_SIZE = 10;
 
@@ -19,6 +20,7 @@ export const loader = async ({ request }) => {
   const kind = KIND_OPTIONS[params.get("show")] ? params.get("show") : "all";
 
   kick(shop); // make sure the sync is running (e.g. right after a deploy)
+  kickCatalog(shop); // products/variants created or deleted (who, and past ones)
 
   const [status, recent, who, undos] = await Promise.all([
     getSyncStatus(shop),
@@ -80,6 +82,10 @@ export const action = async ({ request }) => {
   if (intent === "whoItems") {
     return { intent, who, since, items: await whoItems(shop, who, since) };
   }
+  if (intent === "catalogDetail") {
+    const detail = await catalogDetail(shop, form.get("id"));
+    return detail ? { intent, detail } : { intent, error: "That entry couldn't be found." };
+  }
   if (intent === "itemChanges") {
     const inventoryItemId = String(form.get("inventoryItemId"));
     const [result, name] = await Promise.all([
@@ -93,7 +99,7 @@ export const action = async ({ request }) => {
 
 // Fetchers that only read (Show more, drill-down, undo check) don't need the
 // whole page reloaded afterwards. Reloading would also reset "Show more" lists.
-const READ_ONLY_INTENTS = new Set(["recent", "undos", "whoItems", "itemChanges", "undoPreview"]);
+const READ_ONLY_INTENTS = new Set(["recent", "undos", "whoItems", "itemChanges", "undoPreview", "catalogDetail"]);
 export const shouldRevalidate = ({ formData, defaultShouldRevalidate }) => {
   if (formData && READ_ONLY_INTENTS.has(String(formData.get("intent")))) return false;
   return defaultShouldRevalidate;
@@ -168,6 +174,177 @@ function ChangeParts({ parts }) {
       <span style={i === 0 ? undefined : muted}>{p.label}</span>
     </span>
   ));
+}
+
+
+// What we know about a created or deleted product/variant
+function CatalogPanel({ id, onItem, onClose }) {
+  const fetcher = useFetcher();
+  useEffect(() => {
+    fetcher.submit({ intent: "catalogDetail", id: String(id) }, { method: "post" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+  const d = fetcher.data?.detail;
+  if (fetcher.data?.error) return <div style={{ color: "#8e1f0b" }}>{fetcher.data.error}</div>;
+  if (!d) return <div style={muted}>Loading…</div>;
+  const p = d.product;
+  const deletedNow = d.action === "deleted";
+  const field = (label, value) =>
+    value ? (
+      <div style={{ display: "flex", gap: "8px", fontSize: "13px" }}>
+        <span style={{ ...muted, width: "110px", flexShrink: 0 }}>{label}</span>
+        <span>{value}</span>
+      </div>
+    ) : null;
+  const shown = d.variants;
+  return (
+    <div style={{ display: "flex", gap: "16px", alignItems: "flex-start", flexWrap: "wrap" }}>
+      {p?.imageUrl && (
+        <img src={p.imageUrl} alt="" style={{ width: "96px", height: "96px", objectFit: "cover", borderRadius: "8px", border: "1px solid #e3e3e3", background: "#fff" }} />
+      )}
+      <div style={{ flex: 1, minWidth: "260px", display: "grid", gap: "4px" }}>
+        <div style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}>
+          <strong style={{ fontSize: "15px" }}>
+            {d.productTitle ?? (d.likelyTitle ? `Probably “${d.likelyTitle}”` : d.subject === "product" ? "Product name not recorded" : "Product not recorded")}
+          </strong>
+          {d.subject === "variant" && <span style={muted}>{d.variantTitle ? `· ${d.variantTitle}` : "· variant name not recorded"}</span>}
+          {d.exists === false && <span style={{ ...muted, fontSize: "12px" }}>(product no longer in Shopify)</span>}
+          {d.exists && d.productId && (
+            <a href={`shopify:admin/products/${d.productId.split("/").pop()}`} target="_top" style={{ color: "#005bd3", fontSize: "13px" }}>
+              Open product
+            </a>
+          )}
+          <span style={{ flex: 1 }} />
+          <button type="button" style={linkBtn} onClick={onClose}>
+            Close
+          </button>
+        </div>
+        {field(deletedNow ? "Deleted" : "Created", `${fmtTime(d.at)}${d.who ? ` by ${d.who}` : ""}`)}
+        {field("SKU", d.subject === "variant" ? d.sku : null)}
+        {p && field("Vendor", p.vendor)}
+        {p && field("Type", p.productType)}
+        {p && field("Tags", p.tags)}
+        {p && field("Status", p.status ? p.status[0].toUpperCase() + p.status.slice(1) : null)}
+        {p && field("First created", p.createdAt ? fmtTime(p.createdAt) : null)}
+        {d.nameSource && field("How we know", d.nameSource)}
+        {d.pair && (
+          <div style={{ marginTop: "4px", padding: "8px 10px", borderRadius: "8px", background: "#fff8e6", border: "1px solid #f3e3a1", fontSize: "13px" }}>
+            <strong>{d.action === "deleted" ? "Re-created" : "Replaced a deleted product"}</strong>
+            {" · "}
+            {d.action === "deleted"
+              ? `A product${d.pair.title ? ` named “${d.pair.title}”` : ""} was created ${Math.abs(d.pair.seconds)} second${Math.abs(d.pair.seconds) === 1 ? "" : "s"} ${d.pair.seconds >= 0 ? "later" : "earlier"}`
+              : `A product${d.pair.title ? ` named “${d.pair.title}”` : ""} was deleted ${Math.abs(d.pair.seconds)} second${Math.abs(d.pair.seconds) === 1 ? "" : "s"} ${d.pair.seconds >= 0 ? "later" : "earlier"}`}
+            {d.pair.who ? ` by ${d.pair.who}` : ""}.
+            {d.action === "deleted" && d.likelyTitle && " That's why this one is probably the same product. "}
+            {d.pair.exists && d.pair.productId && (
+              <>
+                {" "}
+                <a href={`shopify:admin/products/${d.pair.productId.split("/").pop()}`} target="_top" style={{ color: "#005bd3" }}>
+                  Open the new product
+                </a>
+              </>
+            )}
+            <div style={{ ...muted, fontSize: "12px", marginTop: "2px" }}>
+              Deletions and creations at the same moment often mean an app or sync re-created the product. Use Show → “Products deleted and re-created” to see them all.
+            </div>
+          </div>
+        )}
+        {d.shopifyMessage && field("Shopify's log", `“${d.shopifyMessage}”`)}
+        {p?.copiedAt && (
+          <div style={{ ...muted, fontSize: "12px" }}>
+            Details as last seen {fmtTime(p.copiedAt)}.
+          </div>
+        )}
+        {d.lookup && (
+          <div
+            style={{
+              fontSize: "13px",
+              marginTop: "4px",
+              padding: "6px 10px",
+              borderRadius: "8px",
+              background: d.lookup.state === "error" ? "#fde7e9" : d.lookup.state === "done" ? "#f1f1f1" : "#eaf4ff",
+              color: d.lookup.state === "error" ? "#8e1f0b" : "#303030",
+            }}
+          >
+            {d.lookup.state === "working" || d.lookup.state === "waiting" ? "⏳ " : ""}
+            {d.lookup.text}
+          </div>
+        )}
+        {!p && !d.variants.length && !d.lookup && !d.pair && (
+          <div style={{ ...muted, fontSize: "12px" }}>
+            Nothing else was recorded: this happened before the app kept copies of products.
+          </div>
+        )}
+      </div>
+      {shown.length > 0 && (
+        <div style={{ flexBasis: "100%", overflowX: "auto" }}>
+          <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
+            <thead>
+              <tr>
+                {["Variant", "SKU", "Barcode", "Price", ""].map((h) => (
+                  <th key={h} style={{ ...cell, fontWeight: 600, padding: "6px 8px" }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((v) => (
+                <tr key={v.id} style={v.isThis ? { background: deletedNow ? "#fde7e9" : "#e3f1df" } : undefined}>
+                  <td style={{ ...cell, padding: "6px 8px" }}>
+                    {v.title && v.title !== "Default Title" ? v.title : <span style={muted}>—</span>}
+                    {v.isThis && <strong style={{ marginLeft: "6px", fontSize: "12px" }}>{deletedNow ? "← this one was deleted" : "← this one was added"}</strong>}
+                    {!v.isThis && v.deletedAt && <span style={{ ...muted, fontSize: "12px" }}> (deleted {fmtTime(v.deletedAt)})</span>}
+                  </td>
+                  <td style={{ ...cell, padding: "6px 8px" }}>{v.sku ?? "—"}</td>
+                  <td style={{ ...cell, padding: "6px 8px" }}>{v.barcode ?? "—"}</td>
+                  <td style={{ ...cell, padding: "6px 8px" }}>{v.price ? `$${v.price}` : "—"}</td>
+                  <td style={{ ...cell, padding: "6px 8px", textAlign: "right" }}>
+                    {onItem && v.inventoryItemId && (
+                      <button type="button" style={linkBtn} onClick={() => onItem(v.inventoryItemId)}>
+                        Stock history
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Product or variant created / deleted
+function CatalogTag({ catalog }) {
+  const deleted = catalog.action === "deleted";
+  return (
+    <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "flex-start" }}>
+    <span
+      style={{
+        display: "inline-block",
+        padding: "1px 8px",
+        borderRadius: "8px",
+        fontSize: "12px",
+        fontWeight: 600,
+        whiteSpace: "nowrap",
+        background: deleted ? "#fde7e9" : "#e3f1df",
+        color: deleted ? "#8e1f0b" : "#1a5e20",
+      }}
+    >
+      {deleted ? "Deleted" : "Created"}
+    </span>
+    {catalog.recreated && (
+      <span
+        title="A product was deleted and another created at the same moment"
+        style={{ display: "inline-block", marginTop: "4px", padding: "1px 8px", borderRadius: "8px", fontSize: "12px", fontWeight: 600, whiteSpace: "nowrap", background: "#fff1d6", color: "#7a4f01" }}
+      >
+        Re-created
+      </span>
+    )}
+    </span>
+  );
 }
 
 const undoTag = {
@@ -291,6 +468,7 @@ function ChangesTable({
 }) {
   const undo = useUndo(onUndone);
   const scrollRef = useRef(null);
+  const [openCatalog, setOpenCatalog] = useState(null);
 
   // If the rows don't fill the box yet there's nothing to scroll, so keep loading
   useEffect(() => {
@@ -320,7 +498,16 @@ function ChangesTable({
           <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtTime(c.at)}</td>
           {showItem && (
             <td style={cell}>
-              {onItem && c.inventoryItemId ? (
+              {c.catalog ? (
+                <button
+                  type="button"
+                  style={linkBtn}
+                  aria-expanded={openCatalog === c.key}
+                  onClick={() => setOpenCatalog(openCatalog === c.key ? null : c.key)}
+                >
+                  {c.item}
+                </button>
+              ) : onItem && c.inventoryItemId ? (
                 <button type="button" style={linkBtn} onClick={() => onItem(c.inventoryItemId)}>
                   {c.item}
                 </button>
@@ -328,10 +515,11 @@ function ChangesTable({
                 c.item
               )}
               {c.sku && <div style={{ ...muted, fontSize: "12px" }}>{c.sku}</div>}
+              {c.note && <div style={{ ...muted, fontSize: "12px" }}>Shopify: “{c.note}”</div>}
             </td>
           )}
           <td style={cell}>
-            <ChangeParts parts={c.parts} />
+            {c.catalog ? <CatalogTag catalog={c.catalog} /> : <ChangeParts parts={c.parts} />}
           </td>
           {c.pending ? (
             <td style={{ ...cell, ...muted, fontStyle: "italic" }} colSpan={2}>
@@ -376,6 +564,13 @@ function ChangesTable({
           )}
         </tr>
         {undo.target?.key === c.key && <UndoPanel undo={undo} colSpan={headers.length} />}
+        {c.catalog && openCatalog === c.key && (
+          <tr>
+            <td colSpan={headers.length} style={{ ...cell, background: "#fafafa" }}>
+              <CatalogPanel id={c.catalogId} onItem={onItem} onClose={() => setOpenCatalog(null)} />
+            </td>
+          </tr>
+        )}
         </Fragment>
       ))}
       {loadingMore && <SkeletonRows columns={headers.length} />}

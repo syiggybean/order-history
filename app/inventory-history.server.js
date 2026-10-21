@@ -1,5 +1,6 @@
 import db from "./db.server";
 import { PENDING_WINDOW_MS, UNDO_URI_PREFIX } from "./inventory-sync.server";
+import { catalogChange, catalogWhere } from "./catalog.server";
 
 // ---------------------------------------------------------------------------
 // Reading the inventory log. Everything here comes from the app's own
@@ -83,6 +84,10 @@ export const KIND_OPTIONS = {
   apps: { label: "App changes" },
   orders: { label: "Orders and fulfillment" },
   undos: { label: "Undos" },
+  catalog: { label: "Products added or deleted" },
+  catalogCreated: { label: "Products/variants created" },
+  catalogDeleted: { label: "Products/variants deleted" },
+  catalogRecreated: { label: "Products deleted and re-created" },
 };
 
 function kindWhere(kind) {
@@ -326,13 +331,30 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
     ...time,
     ...whoWhere(filter.who),
   };
+  const skip = (page - 1) * pageSize;
+
+  // Products and variants created or deleted live in their own table.
+  // "All activity" shows them mixed in by time; their own filter shows only them.
+  const catWhere = catalogWhere(shop, { productId: filter.productId, inventoryItemId: filter.inventoryItemId, who: filter.who, occurredAt: time.occurredAt });
+  const CATALOG_KINDS = { catalog: null, catalogCreated: "created", catalogDeleted: "deleted", catalogRecreated: null };
+  if (filter.kind in CATALOG_KINDS) {
+    if (CATALOG_KINDS[filter.kind]) catWhere.action = CATALOG_KINDS[filter.kind];
+    if (filter.kind === "catalogRecreated") catWhere.pairId = { not: null };
+    const rows = await db.catalogEvent.findMany({ where: catWhere, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], skip, take: pageSize + 1 });
+    return { changes: rows.slice(0, pageSize).map(catalogChange), hasMore: rows.length > pageSize };
+  }
   const kind = kindWhere(filter.kind);
   if (kind) where.AND = [kind];
+  const withCatalog = !kind;
+
+  // With the catalog mixed in, the top (skip + pageSize + 1) of each list is
+  // enough to know this page exactly
+  const want = withCatalog ? skip + pageSize + 1 : pageSize + 1;
+  const groupSkip = withCatalog ? 0 : skip;
 
   // For the whole store, look at recent days first and widen only if needed,
   // so the database never has to sort the entire history at once.
   // Filtered lists (one item or product) are small enough to sort directly.
-  const skip = (page - 1) * pageSize;
   const narrow = Boolean(filter.productId || filter.inventoryItemId);
   const windows = narrow || since ? [null] : [2, 14, 60, 365, null];
   let groups = [];
@@ -345,13 +367,23 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
       where: windowWhere,
       _max: { occurredAt: true },
       orderBy: { _max: { occurredAt: "desc" } },
-      skip,
-      take: pageSize + 1,
+      skip: groupSkip,
+      take: want,
     });
-    if (groups.length > pageSize) break; // enough for this page and to know there's more
+    if (groups.length >= want) break; // enough for this page and to know there's more
   }
-  const hasMore = groups.length > pageSize;
-  const shown = groups.slice(0, pageSize);
+
+  // Merge with catalog rows by time, then cut out this page
+  let entries = groups.map((g) => ({ at: g._max.occurredAt, g }));
+  if (withCatalog) {
+    const cat = await db.catalogEvent.findMany({ where: catWhere, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], take: want });
+    entries = [...entries, ...cat.map((c) => ({ at: c.occurredAt, c }))]
+      .sort((a, b) => b.at - a.at)
+      .slice(skip, skip + pageSize + 1);
+  }
+  const hasMore = entries.length > pageSize;
+  entries = entries.slice(0, pageSize);
+  const shown = entries.filter((e) => e.g).map((e) => e.g);
 
   const rows = shown.length
     ? await db.inventoryAdjustment.findMany({
@@ -371,9 +403,10 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
   }
   const names = await itemNames(shop, rows.map((r) => r.inventoryItemId));
   const undos = await loadUndos(shop, [...byKey.keys()], [...byKey.values()]);
-  let changes = shown
-    .map((g) => {
-      const key = `${g.groupId}|${g.inventoryItemId}|${g.locationId}`;
+  let changes = entries
+    .map((e) => {
+      if (e.c) return catalogChange(e.c);
+      const key = `${e.g.groupId}|${e.g.inventoryItemId}|${e.g.locationId}`;
       return byKey.has(key) ? buildChange(key, byKey.get(key), names, undos) : null;
     })
     .filter(Boolean);

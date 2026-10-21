@@ -265,6 +265,7 @@ function ChangeRow({ c, first, canUndo, orderOpen, onToggleOrder, onUndone }) {
                 {signed(p.change)} {p.label}
               </s-text>
             ))}
+            {c.catalog && <s-badge tone={c.catalog.action === "deleted" ? "critical" : "success"}>{c.catalog.label}</s-badge>}
             {c.variant && <s-badge>{c.variant}</s-badge>}
             {c.isUndo && <s-badge tone="info">Undo</s-badge>}
             {c.undoneBy && <s-badge tone="warning">Undone</s-badge>}
