@@ -1,6 +1,7 @@
 import db from "./db.server";
 import { PACKED_TAG, bulkLabelQuery } from "./pack.server";
 import { dayInStore, errorMessage, gql, TIME_ZONE } from "./preorders.server";
+import { pushBins, syncAllBins } from "./bins-sync.server";
 import {
   ShippingError,
   getShippingSettings,
@@ -643,11 +644,13 @@ export async function listBins(shop, { q = "", missing = false } = {}) {
     .slice(0, 500);
 }
 
-export async function setBin(shop, item, bin, user) {
+// Saves a bin, and writes it to the variant's "Bin location" in Shopify (push: false to batch that up)
+export async function setBin(shop, item, bin, user, { push = true } = {}) {
   if (!item?.variantId) throw new ShippingError("Pick an item first.");
   const clean = String(bin ?? "").trim().slice(0, 40);
   if (!clean) {
     await db.productBin.deleteMany({ where: { shop, variantId: item.variantId } });
+    if (push) await pushBins(shop, [{ variantId: item.variantId, bin: "" }]);
     return { variantId: item.variantId, bin: null };
   }
   const data = {
@@ -659,7 +662,8 @@ export async function setBin(shop, item, bin, user) {
     updatedBy: user?.name ?? null,
   };
   await db.productBin.upsert({ where: { shop_variantId: { shop, variantId: item.variantId } }, create: { shop, variantId: item.variantId, ...data }, update: data });
-  return { variantId: item.variantId, bin: clean };
+  const sent = push ? await pushBins(shop, [{ variantId: item.variantId, bin: clean }]) : null;
+  return { variantId: item.variantId, bin: clean, ...(sent?.errors?.length ? { shopifyError: `Saved here, but Shopify's Bin location field wasn't updated: ${sent.errors[0]}` } : {}) };
 }
 
 const FIND_VARIANTS = `#graphql
@@ -725,15 +729,19 @@ export async function importBins(shop, admin, text, user) {
   }
   let updated = 0;
   const notFound = [];
+  const toShopify = [];
   for (const [code, bin] of rows) {
     const it = byCode.get(norm(code));
     if (!it) {
       notFound.push(code);
       continue;
     }
-    await setBin(shop, it, bin, user);
+    await setBin(shop, it, bin, user, { push: false });
+    toShopify.push({ variantId: it.variantId, bin });
     updated++;
   }
+  // All at once to Shopify's Bin location fields
+  await pushBins(shop, toShopify, { admin });
   await logEvent(shop, { type: "bins_imported", detail: `${updated} bin${updated === 1 ? "" : "s"} set${notFound.length ? `, ${notFound.length} not found` : ""}`, user });
   return { updated, notFound: notFound.slice(0, 50), notFoundCount: notFound.length };
 }
@@ -749,6 +757,8 @@ export async function exportBins(shop) {
 // ---------------------------------------------------------------------------
 
 onAfterRun(async (shop, admin, step) => {
+  // Bin locations edited in Shopify admin: a full check every 30 minutes, in the background
+  syncAllBins(shop).catch((e) => console.error(`[bins] sync (${shop}):`, errorMessage(e)));
   const settings = await getShippingSettings(shop);
   if (autoBatchDue(settings)) {
     step("Auto-batching");

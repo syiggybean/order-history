@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import db from "./db.server";
 import { errorMessage, gql } from "./preorders.server";
+import { RECEIVE_ADDS_STOCK } from "./po-template";
 
 // ---------------------------------------------------------------------------
 // Purchase orders
@@ -222,19 +223,63 @@ export const splitEmails = (s) =>
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
 
+// A supplier's points of contact (up to 3). Suppliers saved before contacts existed:
+// their contact name/phone and email list become the contacts, all getting POs as before.
+export const MAX_CONTACTS = 3;
+const cleanContact = (c) => ({
+  name: String(c?.name ?? "").trim().slice(0, 120),
+  role: String(c?.role ?? "").trim().slice(0, 80),
+  email: String(c?.email ?? "").trim().toLowerCase().slice(0, 200),
+  phone: String(c?.phone ?? "").trim().slice(0, 60),
+  getsPo: Boolean(c?.getsPo),
+});
+export function contactsOf(s) {
+  let saved = null;
+  try {
+    saved = s?.contacts ? JSON.parse(s.contacts) : null;
+  } catch {
+    saved = null;
+  }
+  if (Array.isArray(saved)) return saved.slice(0, MAX_CONTACTS).map(cleanContact);
+  const emails = splitEmails(s?.emails);
+  const list = [];
+  if (s?.contact || s?.phone || emails.length) list.push({ name: s?.contact ?? "", role: "", email: emails[0] ?? "", phone: s?.phone ?? "", getsPo: Boolean(emails[0]) });
+  for (const e of emails.slice(1, MAX_CONTACTS)) list.push({ name: "", role: "", email: e, phone: "", getsPo: true });
+  return list;
+}
+// Who gets a PO unless someone picks otherwise
+export const poRecipients = (contacts) => contacts.filter((c) => c.getsPo && c.email);
+
+// A PO's supplier contacts as they are now (or, if the supplier was removed, the emails saved on the PO)
+export async function poContacts(shop, po) {
+  const s = po.supplierId ? await db.supplier.findFirst({ where: { shop, id: Number(po.supplierId) } }) : null;
+  if (s) return contactsOf(s);
+  return splitEmails(po.supplierEmails).map((email) => ({ name: "", role: "", email, phone: "", getsPo: true }));
+}
+
 export async function saveSupplier(shop, input) {
   const name = String(input.name ?? "").trim().slice(0, 120);
   if (!name) throw new PoError("The supplier needs a name.");
-  const emails = splitEmails(input.emails);
-  const bad = emails.filter((e) => !EMAIL.test(e));
+  const contacts = (Array.isArray(input.contacts) ? input.contacts : contactsOf(input)).map(cleanContact).filter((c) => c.name || c.email || c.phone || c.role);
+  if (contacts.length > MAX_CONTACTS) throw new PoError(`Up to ${MAX_CONTACTS} contacts per supplier.`);
+  const bad = contacts.filter((c) => c.email && !EMAIL.test(c.email)).map((c) => c.email);
   if (bad.length) throw new PoError(`Not a valid email: ${bad.join(", ")}`);
+  for (const c of contacts) if (!c.email) c.getsPo = false;
+  // Someone with an email should get POs: the first one, if nobody was chosen
+  if (!contacts.some((c) => c.getsPo)) {
+    const first = contacts.find((c) => c.email);
+    if (first) first.getsPo = true;
+  }
+  const emails = poRecipients(contacts).map((c) => c.email);
   const rate = input.taxRate === "" || input.taxRate == null ? null : parseRate(input.taxRate);
   if (Number.isNaN(rate) || rate < 0 || rate > 100) throw new PoError("Default tax rate should be a percentage, e.g. 8.25.");
   const data = {
     name,
     emails: emails.join(", ") || null,
-    contact: String(input.contact ?? "").trim().slice(0, 120) || null,
-    phone: String(input.phone ?? "").trim().slice(0, 60) || null,
+    contacts: JSON.stringify(contacts),
+    // The first contact, for anything that reads a single contact
+    contact: contacts[0]?.name || null,
+    phone: contacts[0]?.phone || null,
     address: String(input.address ?? "").trim().slice(0, 1000) || null,
     taxRate: rate,
     notes: String(input.notes ?? "").trim().slice(0, 2000) || null,
@@ -389,6 +434,10 @@ export async function updatePo(shop, admin, id, input, user) {
   }
   if (input.lines !== undefined) {
     if (po.status !== "pending") throw new PoError("Lines can only be changed while the PO is pending.");
+    // Check-ins point at these lines: replacing them would lose the counts
+    if (await db.purchaseOrderLine.count({ where: { poId: po.id, checkedIn: { gt: 0 } } })) {
+      throw new PoError("Items on this PO have been checked in on the Receiving page, so its lines can't be changed. Undo those check-ins first.");
+    }
     const lines = input.lines.map((l, i) => {
       const quantity = Math.round(Number(l.quantity));
       const unitCost = round4(Number(l.unitCost));
@@ -506,7 +555,7 @@ export async function receive(shop, admin, id, counts, user) {
     todo.push({ l, n });
   }
   if (!todo.length) throw new PoError("Enter how many of each item arrived.");
-  const toStock = todo.filter((x) => x.l.inventoryItemId);
+  const toStock = RECEIVE_ADDS_STOCK ? todo.filter((x) => x.l.inventoryItemId) : [];
   if (toStock.length && !po.locationId) throw new PoError("Choose the location this PO is received at first.");
   if (toStock.length) {
     const data = await gql(admin, ADJUST, {
@@ -529,16 +578,18 @@ export async function receive(shop, admin, id, counts, user) {
     data: { status, ...(po.status === "pending" ? { openedAt: now } : {}), ...(status === "received" ? { receivedAt: now } : {}) },
   });
   const units = todo.reduce((t, x) => t + x.n, 0);
-  const off = todo.filter((x) => !x.l.inventoryItemId).reduce((t, x) => t + x.n, 0);
+  const off = RECEIVE_ADDS_STOCK ? todo.filter((x) => !x.l.inventoryItemId).reduce((t, x) => t + x.n, 0) : 0;
   await logPo(
     shop,
     po.id,
     "received",
-    `${units} unit${units === 1 ? "" : "s"} at ${po.locationName ?? "the location"}${off ? ` (${off} not in Shopify, so not added to stock)` : ""}`,
+    `${units} unit${units === 1 ? "" : "s"} at ${po.locationName ?? "the location"}${
+      !RECEIVE_ADDS_STOCK ? " (recorded only: stock in Shopify not changed)" : off ? ` (${off} not in Shopify, so not added to stock)` : ""
+    }`,
     user,
   );
   if (status !== po.status) await logPo(shop, po.id, "status", `${STATUS_LABELS[po.status]} → ${STATUS_LABELS[status]}`, user);
-  return { status, units, notStocked: off };
+  return { status, units, notStocked: off, stockChanged: RECEIVE_ADDS_STOCK };
 }
 
 // A scan while receiving: which line is it? (SKU, supplier barcode or code)
@@ -587,6 +638,7 @@ export function viewPo(po, lines = null) {
     taxTotal: po.taxTotal,
     total: po.total,
     sourceFile: po.sourceFile,
+    externalRef: po.externalRef ?? null,
     createdBy: po.createdBy,
     createdAt: iso(po.createdAt),
     openedAt: iso(po.openedAt),
@@ -610,6 +662,7 @@ export function viewPo(po, lines = null) {
             tax: l.tax,
             total: l.total,
             received: l.received,
+            checkedIn: l.checkedIn ?? 0,
             variantId: l.variantId,
             matched: Boolean(l.inventoryItemId),
             shopifyTitle: l.shopifyTitle,

@@ -2,6 +2,7 @@ import { useContext as useCtx, useEffect, useRef, useState } from "react";
 import { useFetcher } from "react-router";
 import { ShopAdminContext } from "./Notice";
 import { GreenButton, input, muted, small } from "./ui";
+import { IN_APP_LABELS } from "./features";
 
 // ---------------------------------------------------------------------------
 // Box and weight for a packed shipment, and the settings behind them.
@@ -219,7 +220,9 @@ export function PackageSettings({ st, canSettings }) {
     weightUnit: st.weightUnit ?? "lb",
     dimUnit: st.dimUnit ?? "in",
     packedTag: st.packedTag !== false,
-    boxes: parseBoxes(st.boxes).map((b) => ({ ...b, l: String(b.l), w: String(b.w), h: String(b.h) })),
+    labelBoxId: st.labelBoxId ?? "",
+    labelNotify: st.labelNotify !== false,
+    boxes: parseBoxes(st.boxes).map((b) => ({ ...b, l: String(b.l), w: String(b.w), h: String(b.h), wt: b.wt != null ? String(b.wt) : "" })),
   });
   const [f, setF] = useState(initial);
   const [dirty, setDirty] = useState(false);
@@ -227,7 +230,7 @@ export function PackageSettings({ st, canSettings }) {
     setF(initial());
     setDirty(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [st.packageStep, st.weightUnit, st.dimUnit, st.boxes, st.packedTag]);
+  }, [st.packageStep, st.weightUnit, st.dimUnit, st.boxes, st.packedTag, st.labelBoxId, st.labelNotify]);
   const set = (patch) => {
     setF((x) => ({ ...x, ...patch }));
     setDirty(true);
@@ -243,8 +246,9 @@ export function PackageSettings({ st, canSettings }) {
     <s-section heading="Packages and labels">
       <s-paragraph>
         <span style={muted}>
-          Box and weight are entered at the pack station and shown next to the label button, ready to copy into Shopify. Shopify doesn't let apps fill
-          in its label page, so they can't go in automatically.
+          {IN_APP_LABELS
+            ? "Box and weight are entered at the pack station and used when the label is bought in the app. Labels are bought through Shopify Shipping and charged to your Shopify bill as usual."
+            : "Box and weight are entered at the pack station and shown at the label step, ready to enter on Shopify's label page."}
         </span>
       </s-paragraph>
       <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
@@ -291,6 +295,21 @@ export function PackageSettings({ st, canSettings }) {
                 </span>
               ))}
               <span style={small}>{f.dimUnit}</span>
+              {IN_APP_LABELS && (
+                <>
+                  <input
+                    value={b.wt}
+                    disabled={dis}
+                    inputMode="decimal"
+                    onChange={(e) => setBox(i, { wt: e.target.value })}
+                    placeholder="Empty wt"
+                    title="Weight of the empty box (used when no weight is entered)"
+                    aria-label="Empty weight"
+                    style={{ ...input, width: "72px" }}
+                  />
+                  <span style={small}>{f.weightUnit}</span>
+                </>
+              )}
               {!dis && (
                 <s-button variant="tertiary" tone="critical" onClick={() => set({ boxes: f.boxes.filter((_, j) => j !== i) })}>
                   Remove
@@ -301,19 +320,47 @@ export function PackageSettings({ st, canSettings }) {
         </div>
         {!dis && (
           <div style={{ marginTop: "8px" }}>
-            <s-button variant="tertiary" onClick={() => set({ boxes: [...f.boxes, { id: `n${Date.now().toString(36)}`, name: "", l: "", w: "", h: "" }] })}>
+            <s-button variant="tertiary" onClick={() => set({ boxes: [...f.boxes, { id: `n${Date.now().toString(36)}`, name: "", l: "", w: "", h: "", wt: "" }] })}>
               + Add a box
             </s-button>
           </div>
         )}
       </div>
 
+      {IN_APP_LABELS && (
+      <>
+      <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", marginTop: "14px", alignItems: "center" }}>
+        <label style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
+          Box for labels when none was entered
+          <select value={f.labelBoxId} disabled={dis} onChange={(e) => set({ labelBoxId: e.target.value })} style={input}>
+            <option value="">None (ask for one)</option>
+            {f.boxes
+              .filter((b) => b.name)
+              .map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+          </select>
+        </label>
+      </div>
+      <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", marginTop: "10px" }}>
+        <input type="checkbox" checked={f.labelNotify} disabled={dis} onChange={(e) => set({ labelNotify: e.target.checked })} style={{ marginTop: "3px" }} />
+        <span>
+          <strong>Email the customer when their label is bought</strong>
+          <div style={small}>Shopify's shipping confirmation, with tracking.</div>
+        </span>
+      </label>
+      </>
+      )}
+
       <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", marginTop: "14px" }}>
         <input type="checkbox" checked={f.packedTag} disabled={dis} onChange={(e) => set({ packedTag: e.target.checked })} style={{ marginTop: "3px" }} />
         <span>
           <strong>Tag packed orders "Packed"</strong>
           <div style={small}>
-            Lets "Buy labels in bulk" open Shopify's order list with just a batch's packed, unshipped orders. The tag comes off once the order ships.
+            For buying labels on Shopify's own bulk page: opens Shopify's order list with just a batch's packed, unshipped orders. The
+            tag comes off once the order ships.
           </div>
         </span>
       </label>
@@ -324,7 +371,16 @@ export function PackageSettings({ st, canSettings }) {
             variant="primary"
             onClick={() =>
               fetcher.submit(
-                { intent: "packageSettings", step: f.step, weightUnit: f.weightUnit, dimUnit: f.dimUnit, packedTag: f.packedTag ? "1" : "", boxes: JSON.stringify(f.boxes) },
+                {
+                  intent: "packageSettings",
+                  step: f.step,
+                  weightUnit: f.weightUnit,
+                  dimUnit: f.dimUnit,
+                  packedTag: f.packedTag ? "1" : "",
+                  boxes: JSON.stringify(f.boxes),
+                  labelBoxId: f.labelBoxId,
+                  labelNotify: f.labelNotify ? "1" : "0",
+                },
                 { method: "post" },
               )
             }

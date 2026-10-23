@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { useFetcher, useLoaderData, useRevalidator } from "react-router";
 import { Err, box, cell, head, input, muted, pill } from "./ui";
 
-const EMPTY = { name: "", emails: "", contact: "", phone: "", address: "", taxRate: "", notes: "", archived: false };
+const MAX_CONTACTS = 3;
+const NEW_CONTACT = { name: "", role: "", email: "", phone: "", getsPo: false };
+const EMPTY = { name: "", contacts: [{ ...NEW_CONTACT, getsPo: true }], address: "", taxRate: "", notes: "", archived: false };
 
 // Saved suppliers: who POs go to, their emails and default tax rate
 export function Suppliers() {
@@ -46,8 +48,7 @@ export function Suppliers() {
               <thead>
                 <tr>
                   <th style={head}>Name</th>
-                  <th style={head}>Email</th>
-                  <th style={head}>Contact</th>
+                  <th style={head}>Contacts</th>
                   <th style={{ ...head, textAlign: "right" }}>Tax rate</th>
                   <th style={head} />
                 </tr>
@@ -58,11 +59,26 @@ export function Suppliers() {
                     <td style={cell}>
                       <strong>{s.name}</strong> {s.archived && <span style={pill("#ececec", "#4a4a4a")}>Archived</span>}
                     </td>
-                    <td style={cell}>{s.emails ?? <span style={muted}>—</span>}</td>
-                    <td style={cell}>{[s.contact, s.phone].filter(Boolean).join(" · ") || <span style={muted}>—</span>}</td>
+                    <td style={cell}>
+                      {s.contacts.length === 0 && <span style={muted}>—</span>}
+                      {s.contacts.map((c, i) => (
+                        <div key={i} style={{ marginBottom: "2px" }}>
+                          {c.getsPo && (
+                            <span title="Gets POs" style={{ marginRight: "4px" }}>
+                              ✉
+                            </span>
+                          )}
+                          {[c.name, c.role && `(${c.role})`].filter(Boolean).join(" ") || <span style={muted}>No name</span>}
+                          <span style={muted}> {[c.email, c.phone].filter(Boolean).join(" · ")}</span>
+                        </div>
+                      ))}
+                    </td>
                     <td style={{ ...cell, textAlign: "right" }}>{s.taxRate == null ? "—" : `${s.taxRate}%`}</td>
                     <td style={{ ...cell, whiteSpace: "nowrap", textAlign: "right" }}>
-                      <s-button variant="tertiary" onClick={() => setEditing({ ...EMPTY, ...s, taxRate: s.taxRate == null ? "" : String(s.taxRate) })}>
+                      <s-button
+                        variant="tertiary"
+                        onClick={() => setEditing({ ...EMPTY, ...s, contacts: s.contacts.length ? s.contacts.map((c) => ({ ...c })) : [{ ...NEW_CONTACT, getsPo: true }], taxRate: s.taxRate == null ? "" : String(s.taxRate) })}
+                      >
                         Edit
                       </s-button>
                       <s-button variant="tertiary" onClick={() => save({ ...s, archived: !s.archived })}>
@@ -82,11 +98,9 @@ export function Suppliers() {
         <s-section heading={editing.id ? `Edit ${editing.name || "supplier"}` : "New supplier"}>
           <div style={{ display: "grid", gap: "12px", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
             <Field label="Name *" value={editing.name} onChange={(v) => setEditing({ ...editing, name: v })} />
-            <Field label="Email(s), separated by commas" value={editing.emails ?? ""} onChange={(v) => setEditing({ ...editing, emails: v })} placeholder="orders@supplier.com" />
-            <Field label="Contact person" value={editing.contact ?? ""} onChange={(v) => setEditing({ ...editing, contact: v })} />
-            <Field label="Phone" value={editing.phone ?? ""} onChange={(v) => setEditing({ ...editing, phone: v })} />
             <Field label="Default tax rate (%)" value={editing.taxRate ?? ""} onChange={(v) => setEditing({ ...editing, taxRate: v })} placeholder="e.g. 8.25" hint="Used for CSV rows with no tax rate." />
           </div>
+          <Contacts list={editing.contacts} onChange={(contacts) => setEditing({ ...editing, contacts })} />
           <label style={{ display: "block", marginTop: "12px" }}>
             <div style={muted}>Address (printed on the PO)</div>
             <textarea value={editing.address ?? ""} onChange={(e) => setEditing({ ...editing, address: e.target.value })} rows={3} style={{ ...input, width: "100%" }} />
@@ -107,6 +121,40 @@ export function Suppliers() {
         </s-section>
       )}
     </>
+  );
+}
+
+// Up to three people at the supplier; ticked ones get POs unless someone picks otherwise when sending
+function Contacts({ list, onChange }) {
+  const set = (i, patch) => onChange(list.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  return (
+    <div style={{ marginTop: "14px" }}>
+      <div style={{ ...muted, marginBottom: "6px" }}>Points of contact (up to {MAX_CONTACTS}). Ticked people get POs by default; you can choose others when sending.</div>
+      <div style={{ display: "grid", gap: "8px" }}>
+        {list.map((c, i) => (
+          <div key={i} style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr)) auto auto", gap: "8px", alignItems: "center", padding: "8px", border: "1px solid #e3e3e3", borderRadius: "8px" }}>
+            <input value={c.name} onChange={(e) => set(i, { name: e.target.value })} placeholder="Name" aria-label={`Contact ${i + 1} name`} style={input} />
+            <input value={c.role} onChange={(e) => set(i, { role: e.target.value })} placeholder="Role, e.g. Sales rep" aria-label={`Contact ${i + 1} role`} style={input} />
+            <input value={c.email} onChange={(e) => set(i, { email: e.target.value, ...(e.target.value ? {} : { getsPo: false }) })} placeholder="Email" aria-label={`Contact ${i + 1} email`} style={input} />
+            <input value={c.phone} onChange={(e) => set(i, { phone: e.target.value })} placeholder="Phone" aria-label={`Contact ${i + 1} phone`} style={input} />
+            <label style={{ display: "inline-flex", gap: "4px", alignItems: "center", whiteSpace: "nowrap", fontSize: "13px" }} title={c.email ? "Gets POs by default" : "Add an email first"}>
+              <input type="checkbox" checked={c.getsPo} disabled={!c.email} onChange={(e) => set(i, { getsPo: e.target.checked })} aria-label={`Contact ${i + 1} gets POs`} />
+              Gets POs
+            </label>
+            <s-button variant="tertiary" tone="critical" onClick={() => onChange(list.filter((_, j) => j !== i))}>
+              Remove
+            </s-button>
+          </div>
+        ))}
+      </div>
+      {list.length < MAX_CONTACTS && (
+        <div style={{ marginTop: "6px" }}>
+          <s-button variant="tertiary" onClick={() => onChange([...list, { ...NEW_CONTACT }])}>
+            + Add a contact
+          </s-button>
+        </div>
+      )}
+    </div>
   );
 }
 

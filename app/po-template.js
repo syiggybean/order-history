@@ -8,6 +8,8 @@ export const FIELDS = [
   { key: "supplier_name", label: "Supplier name", sample: "Seven Seas Distribution" },
   { key: "supplier_address", label: "Supplier address", sample: "123 Harbor Way<br>Los Angeles, CA 90021" },
   { key: "supplier_email", label: "Supplier email", sample: "orders@supplier.com" },
+  { key: "contact_name", label: "Contact name(s) getting the PO", sample: "Dana Lee" },
+  { key: "contact_email", label: "Contact email(s) getting the PO", sample: "dana@supplier.com" },
   { key: "store_name", label: "Store name", sample: "Yiggybean Books" },
   { key: "ship_to", label: "Ship-to address", sample: "Yiggybean Warehouse<br>500 Main St<br>Reno, NV 89501" },
   { key: "supplier_note", label: "Note for supplier", sample: "Please ship by ground. Call ahead for delivery." },
@@ -134,3 +136,8 @@ export function sampleValues() {
   out.line_items = linesTableHtml(lines, (n) => `$${Number(n).toFixed(2)}`);
   return out;
 }
+
+// Receiving a PO adds stock in Shopify at its location. Off for now: receiving only
+// records what arrived, until leadership decides how inventory should be handled.
+// Switch on to add stock again (the code for it is in po.server.js receive()).
+export const RECEIVE_ADDS_STOCK = false;

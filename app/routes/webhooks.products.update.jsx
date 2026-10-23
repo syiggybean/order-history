@@ -4,6 +4,7 @@ import { recheckProduct } from "../preorder-windows.server";
 import { productChanged } from "../shipping.server";
 import { wishProductChanged } from "../wishlist.server";
 import { productNotified } from "../catalog.server";
+import { pullProductBins } from "../bins-sync.server";
 
 // Shopify calls this when a product is created or edited.
 // We answer right away and update the product in the background, because
@@ -36,6 +37,9 @@ export const action = async ({ request }) => {
     wishProductChanged(shop, productId).catch((e) =>
       console.error(`[wishlist] product edit ${productId}:`, errorMessage(e)),
     );
+    // Bin location edited on a variant in Shopify admin: update Shipping → Bins
+    if (topic !== "PRODUCTS_CREATE" && topic !== "products/create")
+      pullProductBins(shop, productId).catch((e) => console.error(`[bins] product edit ${productId}:`, errorMessage(e)));
   }
 
   return new Response();

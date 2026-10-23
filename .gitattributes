@@ -1,0 +1,2 @@
+# The print agent scripts run on Macs: always Unix line endings
+*.sh text eol=lf

@@ -92,6 +92,7 @@ export function PoList() {
                   <td style={cell}>
                     {fmtDate(p.createdAt)}
                     {p.createdBy && <div style={muted}>{p.createdBy}</div>}
+                    {p.externalRef && <div style={muted}>{p.externalRef}</div>}
                   </td>
                   <td style={cell}>{p.expectedAt ? fmtDay(p.expectedAt) : "—"}</td>
                 </tr>

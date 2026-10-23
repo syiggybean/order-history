@@ -1,6 +1,6 @@
 import { mailFrom, sendNow } from "./mailer.server";
 import { getSettings as getMailSettings } from "./preorder-notify.server";
-import { PoError, getPoSettings, listLocations, markSent, poDetail, splitEmails } from "./po.server";
+import { PoError, getPoSettings, listLocations, markSent, poContacts, poDetail, poRecipients, splitEmails } from "./po.server";
 import { DEFAULT_EMAIL_BODY, DEFAULT_EMAIL_SUBJECT, DEFAULT_TEMPLATE, DOC_CSS, FIELDS, linesTableHtml, sanitizeTemplate } from "./po-template";
 
 // ---------------------------------------------------------------------------
@@ -19,7 +19,8 @@ export function money(n, currency = "USD") {
 const day = (iso, timeZone = "America/Los_Angeles") => (iso ? new Date(iso).toLocaleDateString("en-US", { timeZone, month: "long", day: "numeric", year: "numeric" }) : "");
 
 // The values for {{fields}}. HTML-safe; multi-line text keeps its breaks.
-export function fieldValues(po, { storeName = "", locationAddress = "" } = {}) {
+export function fieldValues(po, { storeName = "", locationAddress = "", contacts = [] } = {}) {
+  const to = poRecipients(contacts);
   const units = po.lines.reduce((t, l) => t + l.quantity, 0);
   return {
     po_number: esc(po.poNumber),
@@ -30,6 +31,9 @@ export function fieldValues(po, { storeName = "", locationAddress = "" } = {}) {
     status: esc(po.status),
     supplier_name: esc(po.supplierName ?? ""),
     supplier_email: esc(po.supplierEmails ?? ""),
+    // The contacts who get POs (names, emails)
+    contact_name: esc(to.map((c) => c.name).filter(Boolean).join(" and ")),
+    contact_email: esc(to.map((c) => c.email).join(", ")),
     supplier_address: nl2br(po.supplierAddress ?? ""),
     store_name: esc(storeName),
     ship_to: nl2br(locationAddress || po.locationName || ""),
@@ -66,10 +70,11 @@ export async function renderPoHtml(shop, admin, poId, { forPrint = true } = {}) 
       // the document still renders without them
     }
   }
-  const values = fieldValues(po, { storeName, locationAddress });
+  const contacts = await poContacts(shop, po);
+  const values = fieldValues(po, { storeName, locationAddress, contacts });
   const body = fillTemplate(sanitizeTemplate(settings.template || DEFAULT_TEMPLATE), values);
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(po.poNumber)}</title><style>${DOC_CSS}</style></head><body>${body}</body></html>`;
-  return { po, html, values, storeName, forPrint };
+  return { po, html, values, storeName, forPrint, contacts };
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +130,13 @@ export async function poPdf(shop, admin, poId) {
 
 export async function emailDefaults(shop, admin, poId) {
   const settings = await getPoSettings(shop);
-  const { po, values } = await renderPoHtml(shop, admin, poId);
+  const { po, values, contacts } = await renderPoHtml(shop, admin, poId);
   const plain = Object.fromEntries(Object.entries(values).map(([k, v]) => [k, String(v).replace(/<br>/g, "\n").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")]));
   delete plain.line_items;
   return {
-    to: po.supplierEmails ?? "",
+    to: poRecipients(contacts).map((c) => c.email).join(", ") || po.supplierEmails || "",
+    // Everyone at the supplier, to choose from
+    contacts: contacts.filter((c) => c.email),
     subject: fillTemplate(settings.emailSubject || DEFAULT_EMAIL_SUBJECT, plain),
     body: fillTemplate(settings.emailBody || DEFAULT_EMAIL_BODY, plain),
     bcc: PO_BCC,

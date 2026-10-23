@@ -1,4 +1,32 @@
 import { useContext, useEffect, useRef, useState } from "react";
+import { MethodBadge, MethodRulesContext } from "../components/shipping/MethodBadge";
+import { LabelPrintingHelp, MethodRulesSettings } from "../components/shipping/Labels";
+import { PackingComputers, PrintProvider } from "../components/shipping/Printing";
+import {
+  AGENT_VERSION,
+  PrintError,
+  addStation,
+  appUrl,
+  fallbackText,
+  jobStatus,
+  listStations,
+  myStationId,
+  newInstallCode,
+  queuePrint,
+  recentJobs,
+  refreshPrinters,
+  rememberStation,
+  removeStation,
+  retryJob,
+  saveStation,
+  stationReady,
+  testPrint,
+  uninstallCommand,
+} from "../print.server";
+import { slipsPdf } from "../slips-pdf.server";
+import { binSyncStatus, syncAllBins } from "../bins-sync.server";
+import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
+import { IN_APP_LABELS } from "../components/shipping/features";
 import { useFetcher, useLoaderData, useNavigation, useRevalidator, useSearchParams } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
@@ -12,6 +40,7 @@ import { PackStation } from "../components/shipping/Pack";
 import { Slips } from "../components/shipping/Slips";
 import { findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, savePackageSettings, unpack } from "../pack.server";
 import { createPortal } from "react-dom";
+import { assertInBatch, batchLabelFile, bulkStatus, buyLabel, labelFile, startBulkLabels } from "../labels.server";
 import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "../flags.server";
 import { enterSandbox, inSandbox, leaveSandbox, resetSandbox, sandboxAdmin, sandboxShopOf, sandboxSummary } from "../sandbox.server";
 import { EnterSandboxButton, SandboxBanner, SandboxSettings } from "../components/shipping/Sandbox";
@@ -55,10 +84,13 @@ import {
   staffKeyOf,
   recentEvents,
   runNow,
+  saveMethodRules,
   saveShippingSettings,
   shippingOverview,
   startFullRead,
   suggestProducts,
+  doublePairs,
+  productVariants,
   syncStatus,
 } from "../shipping.server";
 import { ProductPicker } from "../components/shipping/ProductPicker";
@@ -72,7 +104,10 @@ const filterFrom = (params) => ({
   country: params.get("country") || "",
   product: params.get("product") || "",
   productName: params.get("pname") || "",
+  variant: params.get("product") ? params.get("variant") || "" : "",
   singles: params.get("singles") === "1",
+  doubles: params.get("singles") !== "1" && params.get("doubles") === "1",
+  pair: params.get("singles") !== "1" && params.get("doubles") === "1" ? params.get("pair") || "" : "",
   sort: params.get("sort") === "newest" ? "newest" : "oldest",
 });
 
@@ -148,6 +183,18 @@ export const loader = async ({ request }) => {
         ? await packingSlips(shop, sandboxOn ? sandboxAdmin(admin, shop) : admin, batchId, (params.get("slips") || "").split(",").filter(Boolean)).catch(() => null)
         : null,
     sync: syncStatus(shop),
+    binSync: tab === "bins" ? await binSyncStatus(shop) : null,
+    // Doubles: the most common pairs; product filter: its variants
+    pairs: (tab === "ready" || tab === "waiting") && filter.doubles ? await doublePairs(shop, { ...filter, state: tab }) : null,
+    variants: (tab === "ready" || tab === "waiting") && filter.product ? await productVariants(shop, { ...filter, state: tab }) : null,
+    // Direct printing: the packing computers (always the real shop, even in sandbox)
+    printing: {
+      stations: await listStations(session.shop),
+      myStationId: await myStationId(session.shop, viewer),
+      jobs: tab === "settings" ? await recentJobs(session.shop) : null,
+      uninstall: uninstallCommand(appUrl(request)),
+      agentVersion: AGENT_VERSION,
+    },
     can: {
       settings: can(user, "shipping", "settings"),
       shipOutside: can(user, "shipping", "shipOutside"),
@@ -155,6 +202,7 @@ export const loader = async ({ request }) => {
       pick: can(user, "shipping", "pick"),
       review: can(user, "shipping", "review"),
       pack: can(user, "shipping", "pack"),
+      ship: can(user, "shipping", "ship"),
       override: can(user, "shipping", "override"),
       // Release dates can be changed from the quick view by people who manage pre-orders
       editRelease: !sandboxOn && (can(user, "preorders", "manage") || can(user, "releaseReview", "manage")),
@@ -183,6 +231,7 @@ const NEEDS = {
   finishPicking: "pick",
   reopenPicking: "pick",
   setBin: "settings",
+  syncBins: "settings",
   assignBatch: "batches",
   ackNotice: "view",
   recheckOrder: "view",
@@ -191,6 +240,13 @@ const NEEDS = {
   packScan: "pack",
   unpack: "pack",
   labelCheck: "pack",
+  // In-app labels: buying needs Ship; printing a bought label, Pack or Ship
+  buyLabel: "ship",
+  buyLabels: "ship",
+  bulkLabelStatus: ["pack", "ship"],
+  labelFile: ["pack", "ship"],
+  batchLabelFile: ["pack", "ship"],
+  methodRules: "settings",
   productSuggest: "view",
   savePackage: "pack",
   packageSettings: "settings",
@@ -200,6 +256,18 @@ const NEEDS = {
   reopenFlag: "review",
   importBins: "settings",
   exportBins: "view",
+  // Direct printing (packing computers)
+  agentPrint: ["pick", "pack", "ship", "batches"],
+  printJobs: "view",
+  printStations: "view",
+  setMyStation: "view",
+  retryPrint: ["pick", "pack", "ship", "batches"],
+  testPrint: ["settings", "pack", "ship"],
+  addStation: "settings",
+  saveStation: "settings",
+  removeStation: "settings",
+  installCode: "settings",
+  refreshPrinters: "settings",
 };
 
 export const action = async ({ request }) => {
@@ -207,7 +275,9 @@ export const action = async ({ request }) => {
   const form = await request.formData();
   const intent = String(form.get("intent") ?? "");
   if (!NEEDS[intent]) return { intent, error: "Unknown action" };
-  if (!can(user, "shipping", NEEDS[intent])) return { intent, ...denied("shipping", NEEDS[intent]) };
+  if (!IN_APP_LABELS && (intent === "buyLabel" || intent === "buyLabels")) return { intent, error: "Labels are bought on Shopify's own pages for now." };
+  const needs = [NEEDS[intent]].flat();
+  if (!needs.some((c) => can(user, "shipping", c))) return { intent, ...denied("shipping", needs[0]) };
   const id = Number(form.get("id"));
 
   // Entering and leaving sandbox act on the real shop
@@ -232,7 +302,7 @@ export const action = async ({ request }) => {
   if (intent === "sync" && sandboxOn) return { intent, error: "Reading from Shopify is off in sandbox. Use Reset copy in the sandbox bar for fresh data." };
   try {
     if (intent === "productSuggest") {
-      return { intent, q: String(form.get("q") ?? ""), products: await suggestProducts(shop, { q: form.get("q"), state: String(form.get("state") ?? "ready"), singles: form.get("singles") === "1" }) };
+      return { intent, q: String(form.get("q") ?? ""), products: await suggestProducts(shop, { q: form.get("q"), state: String(form.get("state") ?? "ready"), singles: form.get("singles") === "1", doubles: form.get("doubles") === "1" }) };
     }
     if (intent === "more") {
       const filter = JSON.parse(String(form.get("filter") ?? "{}"));
@@ -264,6 +334,44 @@ export const action = async ({ request }) => {
     if (intent === "packScan") return { intent, ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user)) };
     if (intent === "overridePack") return { intent, ...(await overridePack(shop, id, Number(form.get("shipmentId")), form.get("reason"), user)) };
     if (intent === "labelCheck") return { intent, ...(await labelCheck(shop, admin, id, Number(form.get("shipmentId")))) };
+    if (intent === "buyLabel") {
+      const sid = Number(form.get("shipmentId"));
+      await assertInBatch(shop, id, sid);
+      const r = await buyLabel(shop, admin, sid, { shipDate: form.get("shipDate") || null }, user);
+      const check = r.ok ? await labelCheck(shop, admin, id, sid).catch(() => null) : null;
+      return { intent, ...r, shipped: check?.shipped ?? false };
+    }
+    if (intent === "buyLabels") {
+      const override = JSON.parse(String(form.get("override") ?? "null"));
+      const job = await startBulkLabels(shop, id, { override, notify: form.get("notify") === null ? undefined : form.get("notify") === "1", shipDate: form.get("shipDate") || null }, user);
+      return { intent, ok: true, job };
+    }
+    if (intent === "bulkLabelStatus") return { intent, job: bulkStatus(shop, id) };
+    if (intent === "labelFile") {
+      const sid = Number(form.get("shipmentId"));
+      await assertInBatch(shop, id, sid);
+      return { intent, ok: true, purpose: String(form.get("purpose") ?? "print"), shipmentId: sid, file: await labelFile(shop, admin, sid, user) };
+    }
+    if (intent === "batchLabelFile") return { intent, ok: true, purpose: String(form.get("purpose") ?? "print"), file: await batchLabelFile(shop, admin, id, user) };
+    if (intent === "agentPrint") return { intent, ...(await printOnStation({ shop, printShop: session.shop, admin, user, form, id })) };
+    if (intent === "printJobs") return { intent, jobs: await jobStatus(session.shop, JSON.parse(String(form.get("ids") ?? "[]"))) };
+    if (intent === "printStations") return { intent, stations: await listStations(session.shop), ...(form.get("jobs") === "1" ? { jobs: await recentJobs(session.shop) } : {}) };
+    if (intent === "setMyStation") return (await rememberStation(session.shop, staffKeyOf(user), Number(form.get("stationId")) || null), { intent, ok: true });
+    if (intent === "retryPrint") return { intent, ...(await retryJob(session.shop, id, user)) };
+    if (intent === "testPrint") return { intent, role: String(form.get("role")), ...(await testPrint(session.shop, id, form.get("role") === "slip" ? "slip" : "label", user)) };
+    if (intent === "addStation") return { intent, ok: true, ...(await addStation(session.shop, form.get("name"), user, appUrl(request))) };
+    if (intent === "installCode") return { intent, ok: true, ...(await newInstallCode(session.shop, id, appUrl(request))) };
+    if (intent === "removeStation") return { intent, ok: true, ...(await removeStation(session.shop, id)) };
+    if (intent === "refreshPrinters") return { intent, ok: true, ...(await refreshPrinters(session.shop, id)) };
+    if (intent === "saveStation") {
+      const input = {};
+      for (const k of ["name", "labelPrinter", "slipPrinter", "labelOptions", "slipOptions", "slipSize"]) if (form.has(k)) input[k] = String(form.get(k));
+      return { intent, ok: true, station: await saveStation(session.shop, id, input) };
+    }
+    if (intent === "methodRules") {
+      await saveMethodRules(shop, JSON.parse(String(form.get("rules") ?? "{}")), user);
+      return { intent, ok: true };
+    }
     if (intent === "savePackage")
       return {
         intent,
@@ -281,7 +389,15 @@ export const action = async ({ request }) => {
         ok: true,
         pkg: await savePackageSettings(
           shop,
-          { step: String(form.get("step")), weightUnit: String(form.get("weightUnit")), dimUnit: String(form.get("dimUnit")), boxes: form.get("boxes"), packedTag: form.get("packedTag") === "1" },
+          {
+            step: String(form.get("step")),
+            weightUnit: String(form.get("weightUnit")),
+            dimUnit: String(form.get("dimUnit")),
+            boxes: form.get("boxes"),
+            packedTag: form.get("packedTag") === "1",
+            labelBoxId: form.get("labelBoxId") || null,
+            labelNotify: form.has("labelNotify") ? form.get("labelNotify") === "1" : undefined,
+          },
           user,
         ),
       };
@@ -329,6 +445,10 @@ export const action = async ({ request }) => {
       await reopenPicking(shop, id, user);
       return { intent, ok: true };
     }
+    if (intent === "syncBins") {
+      if (sandboxOn) return { intent, error: "The sandbox copy doesn't sync with Shopify." };
+      return { intent, ok: true, result: await syncAllBins(shop, { admin, force: true }) };
+    }
     if (intent === "setBin") return { intent, ok: true, ...(await setBin(shop, JSON.parse(String(form.get("item"))), form.get("bin"), user)) };
     if (intent === "importBins") return { intent, ok: true, ...(await importBins(shop, admin, String(form.get("text") ?? ""), user)) };
     if (intent === "exportBins") return { intent, ok: true, csv: await exportBins(shop) };
@@ -336,20 +456,61 @@ export const action = async ({ request }) => {
       return { intent, ok: true, ...startFullRead(shop) };
     }
   } catch (e) {
-    if (!(e instanceof ShippingError)) console.error(`[shipping] ${intent}:`, e);
+    if (!(e instanceof ShippingError) && !(e instanceof PrintError)) console.error(`[shipping] ${intent}:`, e);
     return { intent, id, error: e?.message ?? String(e) };
   }
   return { intent, error: "Unknown action" };
 };
 
+// Send a label, a batch's labels, or packing slips to this person's packing computer.
+// Returns { job } when queued, or { fallback, text } when the browser should print instead.
+async function printOnStation({ shop, printShop, admin, user, form, id }) {
+  const what = String(form.get("what") ?? "");
+  const role = what === "slips" ? "slip" : "label";
+  if (!["label", "labels", "slips"].includes(what)) return { error: "Unknown print" };
+  if (role === "label" && !["pack", "ship"].some((c) => can(user, "shipping", c))) return denied("shipping", "pack");
+  const stationId = Number(form.get("stationId")) || null;
+  const ready = await stationReady(printShop, stationId, role);
+  if (!ready.ready) return { what, fallback: ready.reason, text: fallbackText(ready) };
+  let doc;
+  let count = 1;
+  if (what === "label") {
+    const sid = Number(form.get("shipmentId"));
+    await assertInBatch(shop, id, sid);
+    const f = await labelFile(shop, admin, sid, user);
+    doc = { title: f.filename.replace(/\.\w+$/, ""), format: f.format, bytes: Buffer.from(f.data, "base64") };
+  } else if (what === "labels") {
+    const f = await batchLabelFile(shop, admin, id, user);
+    count = f.count;
+    doc = { title: f.filename.replace(/\.\w+$/, ""), format: f.format, bytes: Buffer.from(f.data, "base64") };
+  } else {
+    const ids = String(form.get("ids") ?? "").split(",").filter(Boolean);
+    const data = await packingSlips(shop, admin, id, ids);
+    if (!data.slips.length) return { what, error: "There are no packing slips to print." };
+    count = data.slips.length;
+    let bytes;
+    try {
+      bytes = await slipsPdf(data, ready.station.slipSize === "4x6" ? "4x6" : "letter");
+    } catch (e) {
+      console.error("[print] slips PDF:", e?.message ?? e);
+      return { what, fallback: "server", text: "The slips couldn't be made into a file on the server" };
+    }
+    doc = { title: count === 1 ? `Packing slip ${data.slips[0].orderName}` : `${count} packing slips ${data.batch.tag}`, format: "PDF", bytes };
+  }
+  await rememberStation(printShop, staffKeyOf(user), stationId);
+  return { what, count, ...(await queuePrint(printShop, stationId, { ...doc, role, kind: what }, user)) };
+}
+
 // Actions on a batch (its id is in "id"): people limited to their assigned batches only get theirs
 const BATCH_INTENTS = new Set([
   "scan", "setPicked", "finishPicking", "reopenPicking", "packScan", "findBox", "overridePack", "unpack", "labelCheck", "savePackage",
+  "buyLabel", "buyLabels", "bulkLabelStatus", "labelFile", "batchLabelFile", "agentPrint",
   "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch",
 ]);
 
 // Busy, local-only actions don't reload the whole page
-const LOCAL = new Set(["more", "order", "scan", "setPicked", "setBin", "exportBins", "packScan", "findBox", "ackNotice", "recheckOrder", "keepAddress", "labelCheck", "savePackage", "productSuggest"]);
+const LOCAL = new Set(["more", "order", "scan", "setPicked", "setBin", "exportBins", "packScan", "findBox", "ackNotice", "recheckOrder", "keepAddress", "labelCheck", "savePackage", "productSuggest", "labelFile", "batchLabelFile", "bulkLabelStatus",
+  "agentPrint", "printJobs", "printStations", "setMyStation", "retryPrint", "testPrint"]);
 export const shouldRevalidate = ({ formData, defaultShouldRevalidate }) =>
   LOCAL.has(formData?.get("intent")) ? false : defaultShouldRevalidate;
 
@@ -558,7 +719,7 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
         <Items lines={s.lines} />
       </td>
       <td style={cell}>
-        {s.shippingMethod ?? <span style={muted}>—</span>}
+        {s.shippingMethod ? <MethodBadge method={s.shippingMethod} /> : <span style={muted}>—</span>}
         <div style={small}>{[s.province, s.country].filter(Boolean).join(", ")}</div>
       </td>
       <td style={cell}>
@@ -633,7 +794,7 @@ function ShipmentTable({ list, filter, state, canOutside, canReview = false, sel
     return (
       <s-paragraph>
         {state === "ready" ? "Nothing is ready to ship right now." : state === "batch" ? "This batch is empty." : "Nothing is waiting."}
-        {state !== "batch" && [filter.q, filter.method, filter.country, filter.product, filter.singles].some(Boolean) ? " Try clearing the filters." : ""}
+        {state !== "batch" && [filter.q, filter.method, filter.country, filter.product, filter.singles, filter.doubles].some(Boolean) ? " Try clearing the filters." : ""}
       </s-paragraph>
     );
   const loadedIds = rows.shipments.map((x) => x.id);
@@ -700,22 +861,40 @@ function ShipmentTable({ list, filter, state, canOutside, canReview = false, sel
   );
 }
 
-function Filters({ filter, overview, state = "ready" }) {
+function Filters({ filter, overview, state = "ready", pairs = null, variants = null }) {
   const [params, setParams] = useSearchParams();
   const navigation = useNavigation();
   const [q, setQ] = useState(filter.q);
   const timer = useRef(null);
-  const set = (k, v) =>
+  // Several URL params at once ({ key: value | null })
+  const setMany = (patch) =>
     setParams(
       (p) => {
         const n = new URLSearchParams(p);
-        if (v) n.set(k, v);
-        else n.delete(k);
+        for (const [k, v] of Object.entries(patch)) {
+          if (v) n.set(k, v);
+          else n.delete(k);
+        }
         return n;
       },
       { preventScrollReset: true, replace: true },
     );
+  const set = (k, v) => setMany({ [k]: v });
+  const toggle = (on) => ({
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    padding: "4px 10px",
+    borderRadius: "999px",
+    border: `1px solid ${on ? "#303030" : "#c9c9c9"}`,
+    background: on ? "#303030" : "#fff",
+    color: on ? "#fff" : "#303030",
+    cursor: "pointer",
+    fontSize: "13px",
+  });
+  const showVariants = filter.product && variants && (variants.length > 1 || filter.variant);
   return (
+    <>
     <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px" }}>
       <input
         type="search"
@@ -749,46 +928,93 @@ function Filters({ filter, overview, state = "ready" }) {
         name={filter.productName}
         state={state}
         singles={filter.singles}
-        onPick={(p) =>
-          setParams(
-            (prev) => {
-              const n = new URLSearchParams(prev);
-              if (p) {
-                n.set("product", p.productId);
-                n.set("pname", p.title ?? "");
-              } else {
-                n.delete("product");
-                n.delete("pname");
-              }
-              return n;
-            },
-            { preventScrollReset: true, replace: true },
-          )
-        }
+        doubles={filter.doubles}
+        onPick={(p) => setMany({ product: p?.productId ?? null, pname: p ? p.title ?? "" : null, variant: null })}
       />
-      <label
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: "6px",
-          padding: "4px 10px",
-          borderRadius: "999px",
-          border: `1px solid ${filter.singles ? "#303030" : "#c9c9c9"}`,
-          background: filter.singles ? "#303030" : "#fff",
-          color: filter.singles ? "#fff" : "#303030",
-          cursor: "pointer",
-          fontSize: "13px",
-        }}
-        title="Shipments with just one item in them"
-      >
-        <input type="checkbox" checked={filter.singles} onChange={(e) => set("singles", e.target.checked ? "1" : "")} style={{ margin: 0 }} />
+      {showVariants && (
+        <select value={filter.variant} onChange={(e) => set("variant", e.target.value)} style={{ ...input, maxWidth: "260px" }} aria-label="Variant">
+          <option value="">All variants ({variants.reduce((n, v) => n + v.shipments, 0)})</option>
+          {variants.map((v) => (
+            <option key={v.variantId} value={v.variantId}>
+              {v.title}
+              {v.sku ? ` · ${v.sku}` : ""} ({v.shipments})
+            </option>
+          ))}
+          {filter.variant && !variants.some((v) => v.variantId === filter.variant) && <option value={filter.variant}>Chosen variant (0)</option>}
+        </select>
+      )}
+      <label style={toggle(filter.singles)} title="Shipments with just one item in them">
+        <input type="checkbox" checked={filter.singles} onChange={(e) => setMany({ singles: e.target.checked ? "1" : null, doubles: null, pair: null })} style={{ margin: 0 }} />
         Singles
+      </label>
+      <label style={toggle(filter.doubles)} title="Shipments with exactly two items: shows the most common pairs">
+        <input type="checkbox" checked={filter.doubles} onChange={(e) => setMany({ doubles: e.target.checked ? "1" : null, singles: null, pair: null })} style={{ margin: 0 }} />
+        Doubles
       </label>
       <select value={filter.sort} onChange={(e) => set("sort", e.target.value === "newest" ? "newest" : "")} style={input} aria-label="Order">
         <option value="oldest">Oldest orders first</option>
         <option value="newest">Newest orders first</option>
       </select>
       {navigation.state === "loading" && <span style={muted}>Loading…</span>}
+    </div>
+    {filter.doubles && pairs && <PairList pairs={pairs} chosen={filter.pair} onChoose={(key) => set("pair", key)} />}
+    </>
+  );
+}
+
+// Doubles: the biggest pairings, as tiles; picking one filters the list to it (ready to batch)
+function PairList({ pairs, chosen, onChoose }) {
+  if (!pairs.pairs.length) return <div style={{ ...small, marginBottom: "10px" }}>No two-item shipments here.</div>;
+  const name = (i) => `${i.title}${i.variantTitle ? ` – ${i.variantTitle}` : ""}`;
+  return (
+    <div style={{ marginBottom: "12px" }}>
+      <div style={{ ...small, marginBottom: "6px" }}>
+        Biggest pairs: {pairs.shipments.toLocaleString()} two-item shipment{pairs.shipments === 1 ? "" : "s"} in {pairs.combinations.toLocaleString()} combination
+        {pairs.combinations === 1 ? "" : "s"}
+        {pairs.combinations > pairs.pairs.length ? ` (top ${pairs.pairs.length})` : ""}. Pick one to show just those, then select and batch them.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px, 1fr))", gap: "8px" }}>
+        {pairs.pairs.map((g) => {
+          const on = chosen === g.key;
+          return (
+            <button
+              key={g.key}
+              type="button"
+              aria-pressed={on}
+              onClick={() => onChoose(on ? "" : g.key)}
+              title={g.items.map((i) => `${i.qty} × ${name(i)}`).join("\n")}
+              style={{
+                appearance: "none",
+                display: "flex",
+                gap: "8px",
+                alignItems: "center",
+                textAlign: "left",
+                padding: "8px 10px",
+                borderRadius: "10px",
+                border: `${on ? 2 : 1}px solid ${on ? "#303030" : "#e3e3e3"}`,
+                background: on ? "#f4f4f4" : "#fff",
+                cursor: "pointer",
+                font: "inherit",
+              }}
+            >
+              <span style={{ display: "inline-flex", flexShrink: 0 }}>
+                {g.items.map((i, n) => (
+                  <img key={n} src={i.imageUrl || undefined} alt="" style={{ ...thumb, width: "34px", height: "34px", marginLeft: n ? "-10px" : 0, border: "2px solid #fff" }} />
+                ))}
+              </span>
+              <span style={{ minWidth: 0, flex: 1, fontSize: "13px", lineHeight: 1.3 }}>
+                {g.items.map((i, n) => (
+                  <span key={n} style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {i.qty > 1 ? <strong>{i.qty} × </strong> : n ? <span style={muted}>+ </span> : null}
+                    {name(i)}
+                  </span>
+                ))}
+              </span>
+              <span style={{ fontWeight: 700, fontSize: "15px", flexShrink: 0 }}>{g.shipments}</span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -887,7 +1113,7 @@ const EVENT_LABEL = {
   bins_imported: "Bins imported",
 };
 
-function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn }) {
+function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn, printing, canPrint }) {
   const fetcher = useFetcher();
   const sync = useFetcher();
   const [mode, setMode] = useState(overview.settings.holdMode);
@@ -940,6 +1166,12 @@ function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn })
       <AutoBatchSettings st={st} canSettings={canSettings} />
 
       <PackageSettings st={st} canSettings={canSettings} />
+
+      <MethodRulesSettings rules={st.methodRules} methods={overview?.methods ?? []} canSettings={canSettings} />
+
+      <PackingComputers printing={printing} canSettings={canSettings} canPrint={canPrint} />
+
+      {IN_APP_LABELS && <LabelPrintingHelp />}
 
       <s-section heading="Sync">
         <s-paragraph>
@@ -1215,7 +1447,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, binSync } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1254,6 +1486,8 @@ function Page() {
   });
 
   return (
+    <PrintProvider printing={printing}>
+    <MethodRulesContext.Provider value={overview?.settings?.methodRules ?? DEFAULT_METHOD_RULES}>
     <ShopAdminContext.Provider value={shopAdmin}>
     <QuickViewContext.Provider value={setQuickView}>
     <OrderViewContext.Provider value={openOrder}>
@@ -1326,7 +1560,7 @@ function Page() {
             <span style={{ display: "inline-block", width: "14px", height: "14px", borderRadius: "3px", background: NOTICE_BG, boxShadow: `inset 3px 0 0 ${NOTICE_EDGE}` }} />
             Orange rows have an order note or an address Shopify flagged as possibly invalid. Clicking one shows it first, every time.
           </div>
-          <Filters filter={filter} overview={overview} state={tab} />
+          <Filters filter={filter} overview={overview} state={tab} pairs={pairs} variants={variants} />
           {tab === "ready" ? (
             <ReadyTab list={list} filter={filter} overview={overview} allowed={allowed} openBatches={openBatches} />
           ) : (
@@ -1358,15 +1592,15 @@ function Page() {
       )}
       {tab === "batches" && batch && <BatchDetail batch={batch} list={list} filter={filter} allowed={allowed} staff={staff} me={me} />}
       {tab === "batches" && pick && <PickList key={pick.batch.id} data={pick} canPick={allowed.pick} />}
-      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, override: allowed.override, pick: allowed.pick }} sandbox={Boolean(sandbox)} />}
+      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick }} sandbox={Boolean(sandbox)} />}
       {tab === "batches" && slips && <Slips data={slips} />}
       {tab === "batches" && !batches && !batch && !pick && !pack && !slips && (
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
       )}
       {tab === "review" && flags && <ReviewTab flags={flags} status={flagStatus} canReview={allowed.review} />}
-      {tab === "bins" && bins && <BinsTab items={bins} q={binQuery.q} missing={binQuery.missing} canEdit={allowed.settings} />}
+      {tab === "bins" && bins && <BinsTab items={bins} q={binQuery.q} missing={binQuery.missing} canEdit={allowed.settings} sync={binSync} />}
       {tab === "stock" && <StockTab overview={overview} />}
-      {tab === "settings" && <SettingsTab overview={overview} events={events} sync={sync} canSettings={allowed.settings} sandboxOn={Boolean(sandbox)} />}
+      {tab === "settings" && <SettingsTab overview={overview} events={events} sync={sync} canSettings={allowed.settings} sandboxOn={Boolean(sandbox)} printing={printing} canPrint={allowed.pack || allowed.ship} />}
       {orderView && (
         <OrderQuickView
           key={`${orderView.id}:${orderView.flag}`}
@@ -1393,6 +1627,8 @@ function Page() {
     </OrderViewContext.Provider>
     </QuickViewContext.Provider>
     </ShopAdminContext.Provider>
+    </MethodRulesContext.Provider>
+    </PrintProvider>
   );
 }
 

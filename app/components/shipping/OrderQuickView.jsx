@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { MethodBadge } from "./MethodBadge";
 import { useFetcher } from "react-router";
 import { FlagForm, ResolveFlag } from "./Review";
 import { ProductName, fmtDate, muted, pill, small, ProductThumb } from "./ui";
@@ -175,7 +176,11 @@ export function OrderQuickView({ orderId, onClose, onOpenBatch, canReview = fals
                           <div style={{ ...small, marginTop: "4px" }}>
                             {s.lines.map((l) => `${l.quantity} × ${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""}`).join(", ")}
                           </div>
-                          {s.shippingMethod && <div style={small}>{s.shippingMethod}</div>}
+                          {s.shippingMethod && (
+                            <div style={{ marginTop: "4px" }}>
+                              <MethodBadge method={s.shippingMethod} size="small" />
+                            </div>
+                          )}
                           {s.state === "waiting" && s.waitingReason && <div style={{ marginTop: "4px", color: "#7a4f01" }}>{s.waitingReason}</div>}
                           {s.flag && <div style={{ marginTop: "4px", color: "#b42318", fontWeight: 600 }}>{s.flag}</div>}
                           {s.override && (

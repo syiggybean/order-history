@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import db from "./db.server";
+import { methodRulesOf } from "./components/shipping/methods";
 import { unauthenticated } from "./shopify.server";
 import { dayInStore, errorMessage, gql, toDay } from "./preorders.server";
 
@@ -231,6 +232,9 @@ async function closeMissing(shop, admin, shipment) {
   const data = await gql(admin, ONE_FO, { id: shipment.fulfillmentOrderId }).catch(() => null);
   const fo = data?.fulfillmentOrder;
   const shipped = fo?.status === "CLOSED" && fo.fulfillments.nodes.length > 0;
+  // Label bought in the app before the box was packed: Shopify sees it as
+  // fulfilled, but it stays on the pack bench until it's packed
+  if (shipped && shipment.labelEarly && shipment.labelStatus === "bought" && shipment.state === "batched") return;
   await db.shipment.update({
     where: { id: shipment.id },
     data: shipped
@@ -393,7 +397,8 @@ export function allocate(shipments, stock, now = new Date(), products = {}) {
   const changes = new Map(); // id -> data
 
   // Batched work keeps its claim on stock; if the stock isn't there, flag it
-  for (const s of shipments.filter((x) => ["batched", "packed", "labeling"].includes(x.state)).sort(byAge)) {
+  // (Boxes whose label is already bought were fulfilled in Shopify: their stock has left)
+  for (const s of shipments.filter((x) => ["batched", "packed", "labeling"].includes(x.state) && x.labelStatus !== "bought").sort(byAge)) {
     const short = take(s);
     const pre = preorderLines(s, today, products);
     const flag =
@@ -560,6 +565,15 @@ export async function saveShippingSettings(shop, { holdMode }, user) {
   if (before.holdMode !== holdMode) await logEvent(shop, { type: "hold_mode", detail: `${before.holdMode} → ${holdMode}`, user });
 }
 
+// Words that decide the shipping method badges (cheapest / fastest / buyer-selected)
+export async function saveMethodRules(shop, input, user) {
+  const rules = methodRulesOf(input);
+  await getShippingSettings(shop);
+  await db.shippingSettings.update({ where: { shop }, data: { methodRules: JSON.stringify(rules) } });
+  await logEvent(shop, { type: "method_rules", detail: `Fastest: ${rules.fastest.join(", ") || "—"} · Cheapest: ${rules.cheapest.join(", ") || "—"} · Buyer-selected: ${rules.buyer.join(", ") || "—"} · otherwise ${rules.otherwise}`, user });
+  return rules;
+}
+
 // ---------------------------------------------------------------------------
 // Lists for the Shipping page
 // ---------------------------------------------------------------------------
@@ -603,7 +617,8 @@ export async function withFlags(shop, shipments) {
   return shipments.map((s) => ({ ...s, review: byOrder.get(s.orderId) ?? [] }));
 }
 
-// filter: { state, q, product, method, country, batchId, flagged, sort: oldest | newest }
+// filter: { state, q, product, variant, method, country, batchId, singles, doubles, pair, sort: oldest | newest }
+//   singles: one unit in the box; doubles: two units (pair: "variantA|variantB", or "variantA" for two of one item)
 export function shipmentWhere(shop, filter = {}) {
   const where = { shop, state: filter.state ?? "ready" };
   if (filter.batchId) {
@@ -621,20 +636,30 @@ export function shipmentWhere(shop, filter = {}) {
       { lines: { contains: q, mode: "insensitive" } },
     ];
   }
-  if (filter.product) where.lines = { contains: `"productId":"${filter.product}"` };
+  const and = [];
+  if (filter.product) and.push({ lines: { contains: `"productId":"${filter.product}"` } });
+  if (filter.variant) and.push({ lines: { contains: `"variantId":"${filter.variant}"` } });
   if (filter.singles) where.units = 1;
+  else if (filter.doubles) {
+    where.units = 2;
+    const pair = String(filter.pair ?? "").split("|").filter(Boolean).slice(0, 2);
+    for (const v of pair) and.push({ lines: { contains: `"variantId":"${v}"` } });
+    // Two of one item: a single line (lines are stored as a JSON array, so two lines contain "},{")
+    if (pair.length === 1) and.push({ NOT: { lines: { contains: "},{" } } });
+  }
+  if (and.length) where.AND = and;
   return where;
 }
 
 // Products in shipments of one state, for the product filter's suggestions.
 // Matches the title, variant or SKU; titles that start with the text come first.
-export async function suggestProducts(shop, { q = "", state = "ready", singles = false, limit = 10 } = {}) {
+export async function suggestProducts(shop, { q = "", state = "ready", singles = false, doubles = false, limit = 10 } = {}) {
   const text = String(q ?? "").trim().toLowerCase();
   const rows = await db.shipment.findMany({
     where: {
       shop,
       state: ["ready", "waiting"].includes(state) ? state : "ready",
-      ...(singles ? { units: 1 } : {}),
+      ...(singles ? { units: 1 } : doubles ? { units: 2 } : {}),
       ...(text ? { lines: { contains: text, mode: "insensitive" } } : {}),
     },
     select: { lines: true },
@@ -657,6 +682,58 @@ export async function suggestProducts(shop, { q = "", state = "ready", singles =
   return [...found.values()]
     .sort((a, b) => starts(a) - starts(b) || b.shipments - a.shipments || String(a.title).localeCompare(String(b.title)))
     .slice(0, limit);
+}
+
+// Doubles: the most common two-item combinations (two different items, or two of one),
+// among the shipments the other filters show. Picking one filters the list to it.
+const pairItem = (l, qty = 1) => ({ variantId: l.variantId, productId: l.productId ?? null, title: l.title, variantTitle: l.variantTitle ?? null, imageUrl: l.imageUrl ?? null, qty });
+export async function doublePairs(shop, filter = {}, { limit = 12 } = {}) {
+  const where = shipmentWhere(shop, { ...filter, singles: false, doubles: true, pair: "" });
+  const rows = await db.shipment.findMany({ where, select: { lines: true }, take: 20000 });
+  const groups = new Map();
+  for (const r of rows) {
+    const lines = json(r.lines, []);
+    if (!lines.length || lines.some((l) => !l.variantId)) continue;
+    let key;
+    let items;
+    if (lines.length === 1 && lines[0].quantity === 2) {
+      key = lines[0].variantId;
+      items = [pairItem(lines[0], 2)];
+    } else if (lines.length === 2 && lines.every((l) => l.quantity === 1) && lines[0].variantId !== lines[1].variantId) {
+      const [a, b] = [...lines].sort((x, y) => x.variantId.localeCompare(y.variantId));
+      key = `${a.variantId}|${b.variantId}`;
+      items = [pairItem(a), pairItem(b)];
+    } else continue;
+    const g = groups.get(key) ?? { key, items, shipments: 0 };
+    g.shipments++;
+    groups.set(key, g);
+  }
+  const all = [...groups.values()];
+  const label = (g) => g.items.map((i) => i.title).join(" + ");
+  return {
+    shipments: rows.length,
+    combinations: all.length,
+    pairs: all.sort((a, b) => b.shipments - a.shipments || label(a).localeCompare(label(b))).slice(0, limit),
+  };
+}
+
+// The variants of the chosen product in the shipments shown, with how many shipments have each
+export async function productVariants(shop, filter = {}) {
+  if (!filter.product) return [];
+  const where = shipmentWhere(shop, { ...filter, variant: "", pair: "" });
+  const rows = await db.shipment.findMany({ where, select: { lines: true }, take: 20000 });
+  const found = new Map();
+  for (const r of rows) {
+    const seen = new Set();
+    for (const l of json(r.lines, [])) {
+      if (l.productId !== filter.product || !l.variantId || seen.has(l.variantId)) continue;
+      seen.add(l.variantId);
+      const v = found.get(l.variantId) ?? { variantId: l.variantId, title: l.variantTitle || l.title, sku: l.sku ?? null, shipments: 0 };
+      v.shipments++;
+      found.set(l.variantId, v);
+    }
+  }
+  return [...found.values()].sort((a, b) => String(a.title).localeCompare(String(b.title), undefined, { numeric: true }));
 }
 
 export const shipmentOrder = (sort) => {
@@ -723,6 +800,9 @@ export async function shippingOverview(shop) {
       dimUnit: settings.dimUnit,
       boxes: settings.boxes,
       packedTag: settings.packedTag,
+      labelBoxId: settings.labelBoxId ?? null,
+      labelNotify: settings.labelNotify !== false,
+      methodRules: methodRulesOf(settings.methodRules),
     },
   };
 }

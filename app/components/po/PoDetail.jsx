@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useFetcher, useLoaderData, useRevalidator, useSearchParams } from "react-router";
 import { Err, StatusPill, box, cell, dayValue, fmtDate, head, input, money, muted, num, pill } from "./ui";
+import { RECEIVE_ADDS_STOCK } from "../../po-template";
 
-const EVENT_TEXT = { created: "Created", edited: "Edited", matched: "Matched to Shopify", status: "Status", emailed: "Emailed", exported: "Exported", received: "Received" };
+const EVENT_TEXT = { created: "Created", edited: "Edited", matched: "Matched to Shopify", status: "Status", emailed: "Emailed", exported: "Exported", received: "Received", checkedIn: "Checked in (Receiving)", checkInUndone: "Check-in undone" };
 
 // Saves a base64 PDF from the server
 function downloadPdf(filename, b64) {
@@ -66,6 +67,7 @@ export function PoDetail() {
           <span style={muted}>
             {po.supplierName ?? "No supplier"} · {money(po.total, po.currency)} · created {fmtDate(po.createdAt)}
             {po.createdBy ? ` by ${po.createdBy}` : ""}
+            {po.externalRef ? ` · ${po.externalRef}` : ""}
           </span>
           <span style={{ flex: 1 }} />
           <s-button
@@ -194,12 +196,39 @@ function EmailPanel({ po, bcc, onClose }) {
   const defaults = useFetcher();
   const sender = useFetcher();
   const [f, setF] = useState(null);
+  const [picked, setPicked] = useState([]);
+  const contacts = defaults.data?.contacts ?? [];
+  const names = (emails) =>
+    contacts
+      .filter((c) => emails.includes(c.email) && c.name)
+      .map((c) => c.name)
+      .join(" and ");
+  // Choosing who gets it: rebuilds To (keeping any other addresses typed there), and swaps the names in the greeting
+  const pick = (email, on) => {
+    const next = on ? [...picked, email] : picked.filter((e) => e !== email);
+    const others = f.to
+      .split(/[,;\s]+/)
+      .map((e) => e.trim())
+      .filter((e) => e && !contacts.some((c) => c.email === e.toLowerCase()));
+    const before = names(picked);
+    const after = names(next);
+    setPicked(next);
+    setF({
+      ...f,
+      to: [...contacts.filter((c) => next.includes(c.email)).map((c) => c.email), ...others].join(", "),
+      body: before && after && before !== after ? f.body.split(before).join(after) : f.body,
+    });
+  };
   useEffect(() => {
     defaults.submit({ intent: "emailDefaults", id: String(po.id) }, { method: "post" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [po.id]);
   useEffect(() => {
-    if (defaults.data?.intent === "emailDefaults" && !defaults.data.error && !f) setF({ to: defaults.data.to, cc: "", subject: defaults.data.subject, body: defaults.data.body });
+    if (defaults.data?.intent === "emailDefaults" && !defaults.data.error && !f) {
+      const d = defaults.data;
+      setF({ to: d.to, cc: "", subject: d.subject, body: d.body });
+      setPicked((d.contacts ?? []).filter((c) => c.getsPo).map((c) => c.email));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [defaults.data]);
   useDone(sender);
@@ -211,6 +240,23 @@ function EmailPanel({ po, bcc, onClose }) {
       {!f && !defaults.data?.error && <span style={muted}>Loading…</span>}
       {f && !sent && (
         <>
+          {contacts.length > 0 && (
+            <div style={{ ...row, alignItems: "start" }}>
+              <span>Send to</span>
+              <div style={{ display: "grid", gap: "4px" }}>
+                {contacts.map((c) => (
+                  <label key={c.email} style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "13px" }}>
+                    <input type="checkbox" checked={picked.includes(c.email)} onChange={(e) => pick(c.email, e.target.checked)} />
+                    <span>
+                      <strong>{c.name || c.email}</strong>
+                      {c.role ? ` (${c.role})` : ""}
+                      {c.name ? <span style={muted}> · {c.email}</span> : null}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
           <div style={row}>
             <span>To</span>
             <input value={f.to} onChange={(e) => setF({ ...f, to: e.target.value })} placeholder="supplier@example.com" style={{ ...input, width: "100%" }} />
@@ -334,6 +380,7 @@ function Lines({ po, editable, canMatch }) {
   const matcher = useFetcher();
   const toEdit = () => po.lines.map((l) => ({ ...l, quantity: String(l.quantity), unitCost: String(l.unitCost), taxRate: String(l.taxRate), tax: String(l.tax), taxOverride: false }));
   const [rows, setRows] = useState(toEdit);
+  const checkedIn = po.lines.some((l) => (l.checkedIn ?? 0) > 0);
   useEffect(() => setRows(toEdit()), [po]); // eslint-disable-line react-hooks/exhaustive-deps
   useDone(saver);
   useDone(matcher);
@@ -353,7 +400,7 @@ function Lines({ po, editable, canMatch }) {
           <span style={pill("#fff4d6", "#7a4f01")}>
             {unmatched} line{unmatched === 1 ? "" : "s"} not found in Shopify
           </span>
-          <span style={muted}>Matched by SKU, then barcode. Unmatched lines can still be received, but won't add stock.</span>
+          <span style={muted}>Matched by SKU, then barcode.{RECEIVE_ADDS_STOCK ? " Unmatched lines can still be received, but won't add stock." : ""}</span>
           {canMatch && (
             <s-button variant="tertiary" onClick={() => matcher.submit({ intent: "rematch", id: String(po.id) }, { method: "post" })} {...(matcher.state !== "idle" ? { loading: true } : {})}>
               Look again
@@ -376,6 +423,11 @@ function Lines({ po, editable, canMatch }) {
               <th style={{ ...head, textAlign: "right" }}>Tax</th>
               <th style={{ ...head, textAlign: "right" }}>Total</th>
               {!editable && <th style={{ ...head, textAlign: "right" }}>Received</th>}
+              {!editable && checkedIn && (
+                <th style={{ ...head, textAlign: "right" }} title="Counted in on the Receiving page (doesn't change stock)">
+                  Checked in
+                </th>
+              )}
               {editable && <th style={head} />}
             </tr>
           </thead>
@@ -422,6 +474,11 @@ function Lines({ po, editable, canMatch }) {
                       {l.received}/{l.quantity}
                     </td>
                   )}
+                  {!editable && checkedIn && (
+                    <td style={{ ...num, color: l.checkedIn > l.quantity ? "#b42318" : undefined }}>
+                      {l.checkedIn}/{l.quantity}
+                    </td>
+                  )}
                   {editable && (
                     <td style={cell}>
                       <s-button variant="tertiary" tone="critical" onClick={() => setRows(rows.filter((_, j) => j !== i))}>
@@ -445,6 +502,7 @@ function Lines({ po, editable, canMatch }) {
               <td style={num}>{money(po.taxTotal, po.currency)}</td>
               <td style={{ ...num, fontWeight: 700 }}>{money(po.total, po.currency)}</td>
               {!editable && <td style={num}>{po.lines.reduce((t, l) => t + l.received, 0).toLocaleString()}</td>}
+              {!editable && checkedIn && <td style={num}>{po.lines.reduce((t, l) => t + (l.checkedIn ?? 0), 0).toLocaleString()}</td>}
               {editable && <td style={cell} />}
             </tr>
           </tfoot>
@@ -488,7 +546,7 @@ function Receive({ po }) {
   const scanRef = useRef(null);
   useDone(fetcher, (d) => {
     setCounts({});
-    setMsg({ ok: true, text: `Received ${d.units} unit${d.units === 1 ? "" : "s"}${d.notStocked ? ` (${d.notStocked} not in Shopify, so no stock added)` : ""}.` });
+    setMsg({ ok: true, text: `Received ${d.units} unit${d.units === 1 ? "" : "s"}${d.stockChanged === false ? " (recorded only: stock in Shopify wasn't changed)" : d.notStocked ? ` (${d.notStocked} not in Shopify, so no stock added)` : ""}.` });
   });
   const open = po.lines.filter((l) => l.received < l.quantity);
   const total = Object.values(counts).reduce((t, n) => t + (Number(n) || 0), 0);
@@ -509,7 +567,10 @@ function Receive({ po }) {
   return (
     <s-section heading="Receive">
       <div style={{ ...muted, marginBottom: "8px" }}>
-        Scan items (SKU or supplier barcode), or type how many arrived. Receiving adds them to stock at {po.locationName ?? "the PO's location"} in Shopify.
+        Scan items (SKU or supplier barcode), or type how many arrived.{" "}
+        {RECEIVE_ADDS_STOCK
+          ? `Receiving adds them to stock at ${po.locationName ?? "the PO's location"} in Shopify.`
+          : "For now this only records what arrived: stock in Shopify isn't changed."}
       </div>
       <form onSubmit={onScan} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", marginBottom: "10px" }}>
         <input ref={scanRef} value={scan} onChange={(e) => setScan(e.target.value)} placeholder="Scan a barcode" aria-label="Scan" autoComplete="off" style={{ ...input, width: "260px", fontSize: "15px" }} />
@@ -534,7 +595,7 @@ function Receive({ po }) {
                 <td style={cell}>
                   {l.title}
                   <div style={muted}>{[l.sku, l.supplierBarcode].filter(Boolean).join(" · ")}</div>
-                  {!l.matched && <div style={{ ...muted, color: "#7a4f01" }}>Not in Shopify: no stock will be added</div>}
+                  {RECEIVE_ADDS_STOCK && !l.matched && <div style={{ ...muted, color: "#7a4f01" }}>Not in Shopify: no stock will be added</div>}
                 </td>
                 <td style={num}>{l.quantity}</td>
                 <td style={num}>{l.received}</td>
@@ -561,7 +622,7 @@ function Receive({ po }) {
           {...(fetcher.state !== "idle" ? { loading: true } : {})}
           {...(!total ? { disabled: true } : {})}
         >
-          Receive {total ? `${total} unit${total === 1 ? "" : "s"}` : ""} into stock
+          {RECEIVE_ADDS_STOCK ? `Receive ${total ? `${total} unit${total === 1 ? "" : "s"} ` : ""}into stock` : `Mark ${total ? `${total} unit${total === 1 ? "" : "s"} ` : ""}received`}
         </s-button>
       </div>
       <Err data={fetcher.data} />

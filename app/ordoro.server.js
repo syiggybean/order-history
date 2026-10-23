@@ -431,6 +431,42 @@ export async function listIssues(shop, { status = "open", type = "", q = "", pag
   };
 }
 
+// Each side's shipping status as of the last comparison, and whether they agree
+const SHOPIFY_FULFILLMENT = {
+  FULFILLED: "Fulfilled",
+  UNFULFILLED: "Unfulfilled",
+  PARTIALLY_FULFILLED: "Partially fulfilled",
+  IN_PROGRESS: "In progress",
+  ON_HOLD: "On hold",
+  OPEN: "Unfulfilled",
+  PENDING_FULFILLMENT: "Pending",
+  SCHEDULED: "Scheduled",
+  RESTOCKED: "Restocked",
+  REQUEST_DECLINED: "Request declined",
+};
+const words = (v) => (v ? String(v).replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase()) : null);
+export function shippingStatus(detail) {
+  const s = detail?.shopify ?? null;
+  const o = detail?.ordoro ?? null;
+  const shopify = !s
+    ? { kind: "missing", label: "Not in Shopify" }
+    : s.cancelled
+      ? { kind: "cancelled", label: "Cancelled" }
+      : {
+          kind: s.fulfillment === "FULFILLED" ? "shipped" : s.fulfillment === "PARTIALLY_FULFILLED" ? "partial" : "open",
+          label: SHOPIFY_FULFILLMENT[s.fulfillment] ?? words(s.fulfillment) ?? "Unfulfilled",
+        };
+  const shippedWord = o && /shipped/.test(o.status ?? "");
+  const ordoro = !o
+    ? { kind: "missing", label: "Not in Ordoro" }
+    : o.cancelled
+      ? { kind: "cancelled", label: "Cancelled" }
+      : o.shipped
+        ? { kind: "shipped", label: shippedWord ? words(o.status) : "Shipped" }
+        : { kind: "open", label: words(o.status) ?? "No status" };
+  return { shopify, ordoro, match: shopify.kind === ordoro.kind };
+}
+
 const issueView = (r) => ({
   id: r.id,
   key: r.key,
@@ -444,6 +480,7 @@ const issueView = (r) => ({
   statusAt: r.statusAt?.toISOString() ?? null,
   lastSeenAt: r.lastSeenAt.toISOString(),
   notes: r._count?.notes ?? 0,
+  shipping: shippingStatus(JSON.parse(r.detail ?? "{}")),
 });
 
 export async function issueDetail(shop, id) {
@@ -488,7 +525,7 @@ export async function exportIssues(shop, filter) {
     const s = v === null || v === undefined ? "" : String(v);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const lines = [["Order", "Shopify order ID", "Ordoro order", "Placed", "Status", "Problems", "Shopify says", "Ordoro says", "Notes"].join(",")];
+  const lines = [["Order", "Shopify order ID", "Ordoro order", "Placed", "Status", "Shopify shipping status", "Ordoro status", "Shipping status matches", "Problems", "Shopify says", "Ordoro says", "Notes"].join(",")];
   for (const r of rows) {
     lines.push(
       [
@@ -497,6 +534,9 @@ export async function exportIssues(shop, filter) {
         r.ordoroNumber,
         r.placedAt.slice(0, 10),
         STATUSES[r.status],
+        r.shipping.shopify.label,
+        r.shipping.ordoro.label,
+        r.shipping.match ? "Yes" : "No",
         r.issues.map((i) => i.label).join("; "),
         r.issues.map((i) => `${i.label}: ${i.shopify}`).join("; "),
         r.issues.map((i) => `${i.label}: ${i.ordoro}`).join("; "),

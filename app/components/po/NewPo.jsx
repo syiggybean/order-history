@@ -188,7 +188,11 @@ export function NewPo() {
                   </option>
                 ))}
               </select>
-              {supplier && <div style={muted}>{supplier.emails ?? "No email saved"}</div>}
+              {supplier && (
+                <div style={muted}>
+                  {supplier.contacts.filter((c) => c.getsPo).map((c) => (c.name ? `${c.name} <${c.email}>` : c.email)).join(", ") || "No email saved"}
+                </div>
+              )}
               <div style={muted}>
                 Not listed?{" "}
                 <a href="?view=suppliers" onClick={(e) => (e.preventDefault(), setParams({ view: "suppliers" }))}>

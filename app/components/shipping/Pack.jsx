@@ -1,8 +1,12 @@
 import { useContext, useEffect, useRef, useState } from "react";
+import { MethodBadge } from "./MethodBadge";
 import { useFetcher, useRevalidator } from "react-router";
 import { StatusPill, batchTitle } from "./Batches";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "./Notice";
-import { BulkLabelsButton, PackageForShopify, PackagePanel } from "./Packages";
+import { BulkLabelsButton, PackagePanel, packageText } from "./Packages";
+import { BulkLabelsPanel, LabelActions } from "./Labels";
+import { IN_APP_LABELS } from "./features";
+import { SlipPrintButton, ThisComputer } from "./Printing";
 import { PINK, ProductName, box, cell, head, input, muted, pill, small, ProductThumb, useParamSetter } from "./ui";
 
 // Short beeps so packers can scan without looking at the screen
@@ -97,21 +101,27 @@ function NotPickedYet({ batch, canPick }) {
   );
 }
 
-// After a box is packed: buy and print its label on the order's Shopify page
-function LabelPanel({ box: b, label, sandbox, onOpen, onCheck, checking, needsPackage }) {
-  const shipped = b.state === "shipped" || label?.status === "done";
+// After a box is packed: buy its label in the app (Shopify Shipping), then print.
+// Shopify's own order page stays available as a fallback.
+function LabelPanel({ box: b, batchId, label, sandbox, canShip, canPrint, buying, buyResult, onBuy, onShopify, onCheck, checking, needsPackage, pkgCfg, autoPrintKey }) {
+  const L = b.label ?? {};
+  const shipped = b.state === "shipped" || label?.status === "done" || L.status === "bought";
   const wrap = (bg, border, children) => (
     <div className="sh-rise" style={{ marginTop: "12px", padding: "12px", borderRadius: "10px", background: bg, border: `2px solid ${border}` }}>
       {children}
     </div>
   );
-  if (shipped)
+  const tracking = L.status === "bought" && L.tracking?.length ? L.tracking : label?.tracking ?? [];
+  if (shipped) {
+    const notPackedYet = b.state === "batched";
     return wrap(
       "#f0faf2",
       "#36a15a",
       <>
-        <strong style={{ color: "#1a5e20" }}>✓ Label bought. {b.orderName} is shipped.</strong>
-        {(label?.tracking ?? []).map((t, i) => (
+        <strong style={{ color: "#1a5e20" }}>
+          ✓ Label bought{L.early ? " before packing" : ""}. {notPackedYet ? `Pack ${b.orderName} and it's on its way.` : `${b.orderName} is shipped.`}
+        </strong>
+        {tracking.map((t, i) => (
           <div key={i} style={{ fontSize: "13px", marginTop: "4px" }}>
             {t.company ? `${t.company} ` : ""}
             {t.url ? (
@@ -123,26 +133,54 @@ function LabelPanel({ box: b, label, sandbox, onOpen, onCheck, checking, needsPa
             )}
           </div>
         ))}
-        <div style={{ fontSize: "13px", marginTop: "4px", color: "#303030" }}>Scan the next packing slip.</div>
+        {label?.labels > 1 && (
+          <div style={{ marginTop: "8px", padding: "8px 10px", borderRadius: "8px", background: "#fff1d6", border: "1px solid #e8c95a", fontSize: "13px", color: "#5c3c00" }}>
+            <strong>⚠ {b.orderName} has {label.labels} labels.</strong> Only one should be needed for one box. Another app (e.g. Ordoro) or a second purchase may
+            have bought one too. Check the order and void the extra label so you're refunded.{" "}
+            {label.url && (
+              <a href={label.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
+                Open {b.orderName}
+              </a>
+            )}
+          </div>
+        )}
+        {L.inApp && canPrint ? (
+          <div style={{ marginTop: "8px" }}>
+            <LabelActions batchId={batchId} shipmentId={b.id} autoPrintKey={autoPrintKey} />
+          </div>
+        ) : (
+          <div style={{ ...small, marginTop: "6px" }}>Bought on Shopify's page: reprint it from the order in Shopify.</div>
+        )}
+        {!notPackedYet && <div style={{ fontSize: "13px", marginTop: "6px", color: "#303030" }}>Scan the next packing slip.</div>}
       </>,
     );
+  }
   if (sandbox)
     return wrap(
       "#fff7d6",
       "#e8c95a",
       <span style={{ fontSize: "13px" }}>
-        <strong>Label step skipped in sandbox.</strong> For real orders, the order's Shopify page opens here so you can buy and print the label.
+        <strong>Label step skipped in sandbox.</strong>{" "}
+        {IN_APP_LABELS ? "For real orders, the label is bought and printed here." : "For real orders, the order's Shopify page opens here so you can buy and print the label."}
       </span>,
     );
   const st = label?.status;
+  const pkgUsed = b.pkg && (b.pkg.l != null || b.pkg.box) ? packageText(b.pkg) : pkgCfg?.labelBoxId ? `${pkgCfg.boxes.find((x) => x.id === pkgCfg.labelBoxId)?.name ?? "Default box"} (default)${b.pkg?.weight != null ? ` · ${b.pkg.weight} ${b.pkg.weightUnit}` : ""}` : null;
+  const err = buyResult && !buyResult.ok ? buyResult.error : L.status === "failed" ? L.error : null;
   return wrap(
     "#eef3ff",
     "#7aa2e3",
     <>
       <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
         <strong>Label for {b.orderName}</strong>
+        {b.shippingMethod && <MethodBadge method={b.shippingMethod} size="small" />}
         <span style={{ flex: 1 }} />
-        {st === "open" ? (
+        {buying ? (
+          <>
+            <span className="sh-spin" style={{ display: "inline-block", width: "12px", height: "12px" }} />
+            <span style={{ fontSize: "13px" }}>Buying the label from Shopify…</span>
+          </>
+        ) : st === "open" ? (
           <>
             <span className="sh-spin" style={{ display: "inline-block", width: "12px", height: "12px" }} />
             <span style={{ fontSize: "13px" }}>In Shopify: Create shipping label → buy → print. Close that window when done.</span>
@@ -153,9 +191,22 @@ function LabelPanel({ box: b, label, sandbox, onOpen, onCheck, checking, needsPa
         ) : (
           <>
             {needsPackage && <span style={{ fontSize: "13px", color: "#7a4f01" }}>Enter the weight first</span>}
-            <s-button variant="primary" onClick={onOpen} {...(needsPackage ? { disabled: true } : {})}>
-              {st === "none" ? "Open Shopify again ↗" : "Print label in Shopify ↗"}
-            </s-button>
+            {!IN_APP_LABELS ? (
+              <s-button variant="primary" onClick={onShopify} {...(needsPackage ? { disabled: true } : {})}>
+                {st === "none" ? "Open Shopify again ↗" : "Buy label in Shopify ↗"}
+              </s-button>
+            ) : canShip ? (
+              <s-button variant="primary" onClick={onBuy} {...(needsPackage || (!pkgUsed && !b.pkg) ? { disabled: true } : {})}>
+                {err ? "Try again" : "Buy label"}
+              </s-button>
+            ) : (
+              <span style={small}>Buying labels needs the Ship permission.</span>
+            )}
+            {IN_APP_LABELS && (
+              <s-button variant="tertiary" onClick={onShopify}>
+                Buy in Shopify instead ↗
+              </s-button>
+            )}
             {st && st !== "ready" && (
               <s-button variant="tertiary" onClick={onCheck} {...(checking ? { loading: true } : {})}>
                 Check again
@@ -164,8 +215,20 @@ function LabelPanel({ box: b, label, sandbox, onOpen, onCheck, checking, needsPa
           </>
         )}
       </div>
-      <PackageForShopify pkg={b.pkg} />
-      {st === "none" && <div style={{ fontSize: "13px", marginTop: "6px", color: "#7a4f01" }}>No label on this order yet. Open Shopify again, or carry on and label it later.</div>}
+      <div style={{ ...small, marginTop: "6px" }}>
+        {IN_APP_LABELS ? (
+          <>
+            {pkgUsed ? `Package: ${pkgUsed}. ` : "Choose a box above, or set a default box in Settings. "}
+            Service: what the customer chose at checkout when available, otherwise Shopify's pick.
+          </>
+        ) : b.pkg && (b.pkg.l != null || b.pkg.box || b.pkg.weight != null) ? (
+          `Enter in Shopify: ${packageText(b.pkg)}. In Shopify: Create shipping label → buy → print.`
+        ) : (
+          "In Shopify: Create shipping label → buy → print."
+        )}
+      </div>
+      {err && <div style={{ fontSize: "13px", marginTop: "6px", color: "#b42318" }}>{err}</div>}
+      {st === "none" && <div style={{ fontSize: "13px", marginTop: "6px", color: "#7a4f01" }}>No label on this order yet.</div>}
       {st === "blocked" && (
         <div style={{ fontSize: "13px", marginTop: "6px" }}>
           The browser blocked the pop-up.{" "}
@@ -174,7 +237,7 @@ function LabelPanel({ box: b, label, sandbox, onOpen, onCheck, checking, needsPa
               Open the order in a new tab
             </a>
           )}{" "}
-          then choose Check again. (Allowing pop-ups for this site makes it automatic.)
+          then choose Check again.
         </div>
       )}
       {st === "checking" && <div style={{ fontSize: "13px", marginTop: "6px" }}>Checking Shopify for the label…</div>}
@@ -182,7 +245,6 @@ function LabelPanel({ box: b, label, sandbox, onOpen, onCheck, checking, needsPa
     </>,
   );
 }
-
 
 export function PackStation({ data, boxData, can, sandbox = false }) {
   const go = useParamSetter();
@@ -199,6 +261,30 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
   const admin = useContext(ShopAdminContext);
   const labelCheck = useFetcher();
   const [lab, setLabel] = useState(null); // { boxId, orderName, orderNumber, status, tracking }
+  // Labels bought in the app
+  const buyF = useFetcher();
+  const [justBought, setJustBought] = useState(null); // { boxId, key } → print it straight away
+  const [autoPrint, setAutoPrint] = useState(() => {
+    try {
+      return localStorage.getItem("sh-auto-print") !== "off";
+    } catch {
+      return true;
+    }
+  });
+  const toggleAutoPrint = (on) => {
+    setAutoPrint(on);
+    try {
+      localStorage.setItem("sh-auto-print", on ? "on" : "off");
+    } catch {
+      /* not saved */
+    }
+  };
+  const buyFor = (bx) => {
+    if (!bx || sandbox) return;
+    if (!IN_APP_LABELS || !can.ship) return openLabel(bx);
+    buyF.submit({ intent: "buyLabel", id: String(batch.id), shipmentId: String(bx.id) }, { method: "post" });
+  };
+  const buyingId = buyF.state !== "idle" ? Number(buyF.formData?.get("shipmentId")) : null;
   const labelWin = useRef(null);
   const [autoLabel, setAutoLabel] = useState(() => {
     try {
@@ -249,13 +335,24 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
       setLabel((l) => (l ? { ...l, status: "error", error: r.error } : l));
       return;
     }
-    setLabel((l) => (l ? { ...l, status: r.shipped ? "done" : "none", tracking: r.tracking ?? [] } : l));
+    setLabel((l) => (l ? { ...l, status: r.shipped ? "done" : "none", tracking: r.tracking ?? [], labels: r.labels ?? 0 } : l));
     if (r.shipped) {
       beep(true);
       revalidator.revalidate();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [labelCheck.data]);
+  useEffect(() => {
+    const r = buyF.data;
+    if (buyF.state !== "idle" || r?.intent !== "buyLabel") return;
+    if (r.ok) {
+      beep(true);
+      if (autoPrint) setJustBought({ boxId: r.id, key: `${r.id}-${Date.now()}` });
+      setCurrent((c) => (c && c.id === r.id ? { ...c, label: { ...(c.label ?? {}), status: "bought", inApp: true, tracking: r.tracking ?? [] }, state: r.shipped ? "shipped" : c.state } : c));
+      revalidator.revalidate();
+    } else beep(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buyF.state, buyF.data]);
   const ackF = useFetcher();
   const unpackF = useFetcher();
   const inputRef = useRef(null);
@@ -287,7 +384,7 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
     const bx = current ? { ...current, pkg } : null;
     setCurrent(bx);
     revalidator.revalidate();
-    if (bx && autoLabel && !sandbox && lab?.boxId === bx.id && lab.status === "ready") openLabel(bx);
+    if (bx && autoLabel && !sandbox && lab?.boxId === bx.id && lab.status === "ready") buyFor(bx);
     inputRef.current?.focus?.();
   };
   const scanFromPackage = (c) => {
@@ -336,11 +433,15 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
         setLast({ ok: true, key: r.key, text: r.complete ? "Packed ✓ Every item scanned. Scan the next packing slip." : `${r.title}: ${r.scanned} of ${r.qty}` });
         if (r.complete) {
           revalidator.revalidate();
-          if (pkgCfg.step !== "off" && current && !current.pkg) {
+          // Label already bought (before packing): packed = shipped, nothing more to do
+          if (current?.label?.status === "bought") {
+            setCurrent((c) => (c ? { ...c, state: "shipped" } : c));
+            setLast({ ok: true, key: r.key, text: "Packed ✓ Its label was already bought, so it's ready to go. Scan the next packing slip." });
+          } else if (pkgCfg.step !== "off" && current && !current.pkg) {
             // Box and weight first; the label opens when they're saved
             setPkgFocus(true);
             setLabel({ boxId: current.id, orderName: current.orderName, orderNumber: current.orderNumber, status: "ready" });
-          } else if (autoLabel && current) openLabel(current);
+          } else if (autoLabel && current) buyFor(current);
           // Straight on to the label for this box
           else if (current) setLabel({ boxId: current.id, orderName: current.orderName, orderNumber: current.orderNumber, status: "ready" });
         }
@@ -391,13 +492,37 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
         <StatusPill status={batch.status} />
         <span style={{ flex: 1 }} />
         {!sandbox && (
-          <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "13px" }} title="Opens the order's Shopify page as soon as the last item is scanned">
-            <input type="checkbox" checked={autoLabel} onChange={(e) => toggleAuto(e.target.checked)} />
-            Open the label page after each box
-          </label>
+          <>
+            <label
+              style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "13px" }}
+              title={IN_APP_LABELS ? "Buys the label as soon as the last item is scanned (and the box and weight are saved)" : "Opens the order's Shopify page, ready to buy the label, as soon as the last item is scanned"}
+            >
+              <input type="checkbox" checked={autoLabel} onChange={(e) => toggleAuto(e.target.checked)} />
+              {IN_APP_LABELS ? "Buy the label after each box" : "Open the label page after each box"}
+            </label>
+            {IN_APP_LABELS && (
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "13px" }} title="Sends each label to the printer as soon as it's bought">
+                <input type="checkbox" checked={autoPrint} onChange={(e) => toggleAutoPrint(e.target.checked)} />
+                Print labels as soon as they're bought
+              </label>
+            )}
+          </>
         )}
-        <s-button onClick={() => go({ view: "slips", slips: null }, { replace: false })}>Print all packing slips</s-button>
+        <SlipPrintButton batchId={batch.id} onBrowser={() => go({ view: "slips", slips: null }, { replace: false })}>
+          Print all packing slips
+        </SlipPrintButton>
+        <ThisComputer />
       </div>
+
+      {/* Every box holds the same items: buy (and print) all the labels at once, before or after packing */}
+      {!sandbox && IN_APP_LABELS && <BulkLabelsPanel batch={batch} bulk={data.bulk} cfg={pkgCfg} canShip={can.ship} canPrint={can.pack || can.ship} />}
+      {/* Every box packed, all with the same items: buy all the labels at once on Shopify's bulk page */}
+      {!sandbox && !IN_APP_LABELS && data.bulk?.complete && data.bulk.identical && (data.bulk.ready > 0 || data.bulk.pending > 0) && (
+        <div style={{ padding: "12px", border: "1px solid #b7dfc2", background: "#f6fbf7", borderRadius: "10px", margin: "10px 0" }}>
+          <BulkLabelsButton bulk={data.bulk} />
+          <div style={{ ...small, marginTop: "6px" }}>Every box has the same items. In Shopify, select all, then Create shipping labels.</div>
+        </div>
+      )}
 
       {!data.canPack ? (
         <NotPickedYet batch={batch} canPick={can.pick} />
@@ -475,19 +600,18 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
                               {x.scanned}/{x.units}
                             </span>
                           ) : null}
+                          {x.state === "batched" && x.label?.status === "bought" && (
+                            <div style={{ ...small, color: "#1a5e20", fontWeight: 600 }} title="Label bought before packing">
+                              🏷 Label ready
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
-              {/* Every box packed, all with the same items: buy all the labels at once */}
-              {!sandbox && data.bulk?.complete && data.bulk.identical && (
-                <div style={{ padding: "12px", borderTop: "1px solid #e3e3e3", background: "#f6fbf7" }}>
-                  <BulkLabelsButton bulk={data.bulk} />
-                  <div style={{ ...small, marginTop: "6px" }}>Every box has the same items. In Shopify, select all, then Create shipping labels.</div>
-                </div>
-              )}
+
             </div>
 
             {/* The box */}
@@ -521,12 +645,17 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
                     )}
                     <NoticeTag notice={b.notice} />
                     <span style={{ flex: 1 }} />
-                    <s-button variant="tertiary" onClick={() => go({ view: "slips", slips: String(b.id) }, { replace: false })}>
+                    <SlipPrintButton key={b.id} variant="tertiary" batchId={batch.id} ids={[b.id]} onBrowser={() => go({ view: "slips", slips: String(b.id) }, { replace: false })}>
                       Print slip
-                    </s-button>
+                    </SlipPrintButton>
                   </div>
                   <div style={{ ...small, marginTop: "4px" }}>
-                    {[b.customerName, b.shippingMethod, [b.province, b.country].filter(Boolean).join(", ")].filter(Boolean).join(" · ")}
+                    {b.shippingMethod && (
+                      <>
+                        <MethodBadge method={b.shippingMethod} />{" "}
+                      </>
+                    )}
+                    {[b.customerName, [b.province, b.country].filter(Boolean).join(", ")].filter(Boolean).join(" · ")}
                   </div>
 
                   {b.notice && b.packAcked && (
@@ -561,13 +690,21 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
                       onScan={scanFromPackage}
                     />
                   )}
-                  {b.state !== "batched" && (
+                  {(b.state !== "batched" || b.label?.status === "bought") && (
                     <LabelPanel
                       needsPackage={pkgCfg.step === "required" && b.pkg?.weight == null && b.state !== "shipped"}
                       box={b}
+                      batchId={batch.id}
                       label={lab?.boxId === b.id ? lab : null}
                       sandbox={sandbox}
-                      onOpen={() => openLabel(b)}
+                      canShip={can.ship}
+                      canPrint={can.pack || can.ship}
+                      pkgCfg={pkgCfg}
+                      buying={buyingId === b.id}
+                      buyResult={buyF.state === "idle" && buyF.data?.intent === "buyLabel" && buyF.data.id === b.id ? buyF.data : null}
+                      autoPrintKey={justBought?.boxId === b.id ? justBought.key : null}
+                      onBuy={() => buyFor(b)}
+                      onShopify={() => openLabel(b)}
                       onCheck={() => checkLabel(b.id)}
                       checking={labelCheck.state !== "idle"}
                     />

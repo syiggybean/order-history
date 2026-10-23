@@ -43,6 +43,11 @@ function BinCell({ item, canEdit }) {
       <span style={{ ...small, width: "52px", color: state === "error" ? "#b42318" : state === "saved" ? "#1a7f37" : "#616161" }}>
         {state === "saving" ? "Saving…" : state === "saved" ? "✓ Saved" : state === "error" ? "Not saved" : ""}
       </span>
+      {fetcher.state === "idle" && fetcher.data?.shopifyError && (
+        <span style={{ ...small, color: "#8a6100" }} title={fetcher.data.shopifyError}>
+          ⚠ Not in Shopify yet
+        </span>
+      )}
     </span>
   );
 }
@@ -120,7 +125,39 @@ function Export() {
   );
 }
 
-export function BinsTab({ items, q, missing, canEdit }) {
+// Bins also live on each variant in Shopify admin ("Bin location"); kept in step both ways
+function ShopifySync({ status, canEdit }) {
+  const f = useFetcher();
+  const busy = f.state !== "idle" || status?.running;
+  const r = f.data?.intent === "syncBins" ? f.data : null;
+  return (
+    <div style={{ ...small, display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", marginBottom: "8px" }}>
+      <span>
+        Also on every variant in Shopify admin as <strong>Bin location</strong>, kept in step both ways.
+        {status?.syncedAt ? ` Last full check ${new Date(status.syncedAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}.` : ""}
+      </span>
+      {status?.error && !r && <span style={{ color: "#b42318" }}>Last check: {status.error}</span>}
+      {canEdit && (
+        <button
+          type="button"
+          onClick={() => f.submit({ intent: "syncBins" }, { method: "post" })}
+          disabled={busy}
+          style={{ appearance: "none", border: 0, background: "none", padding: 0, font: "inherit", color: "#005bd3", cursor: "pointer" }}
+        >
+          {busy ? "Checking Shopify…" : "Check Shopify now"}
+        </button>
+      )}
+      {r?.error && <span style={{ color: "#b42318" }}>{r.error}</span>}
+      {r?.ok && r.result && (
+        <span style={{ color: "#1a7f37" }}>
+          ✓ {r.result.fromShopify} updated from Shopify, {r.result.pushed} sent to Shopify{r.result.cleared ? `, ${r.result.cleared} cleared` : ""}.
+        </span>
+      )}
+    </div>
+  );
+}
+
+export function BinsTab({ items, q, missing, canEdit, sync }) {
   const go = useParamSetter();
   const navigation = useNavigation();
   const [query, setQuery] = useState(q);
@@ -163,6 +200,7 @@ export function BinsTab({ items, q, missing, canEdit }) {
         {canEdit && <Import />}
         <Export />
       </div>
+      <ShopifySync status={sync} canEdit={canEdit} />
       {!missing && without > 0 && <div style={{ ...small, marginBottom: "8px" }}>{without} of these have no bin yet.</div>}
       {!items.length ? (
         <s-paragraph>{q || missing ? "No items match." : "No items yet. Items appear here once they're on an open order."}</s-paragraph>

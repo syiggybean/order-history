@@ -104,7 +104,7 @@ export function ProductThumb({ src, size, style }) {
   );
 }
 // The "next step" button: green, so the way on is obvious
-export function GreenButton({ onClick, href, children, target }) {
+export function GreenButton({ onClick, href, children, target, disabled = false }) {
   const style = {
     display: "inline-flex",
     alignItems: "center",
@@ -126,7 +126,7 @@ export function GreenButton({ onClick, href, children, target }) {
       {children}
     </a>
   ) : (
-    <button type="button" onClick={onClick} style={style}>
+    <button type="button" onClick={onClick} disabled={disabled} style={disabled ? { ...style, opacity: 0.5, cursor: "default" } : style}>
       {children}
     </button>
   );

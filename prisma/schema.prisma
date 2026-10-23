@@ -470,6 +470,17 @@ model Shipment {
   pkgBy          String?
   // The order carries the "Packed" tag (for buying labels in bulk)
   packTagged     Boolean   @default(false)
+  // Label bought in the app (Shopify Shipping)
+  labelStatus    String?   // buying | bought | failed
+  labelResultId  String?   // Shopify's purchase job, while buying
+  labelId        String?   // ShippingLabel
+  labelTracking  String?   // JSON [{company, number, url}]
+  labelError     String?
+  labelBoughtAt  DateTime?
+  labelBoughtBy  String?
+  labelPrintedAt DateTime?
+  // Bought before the box was packed (it stays on the pack bench until packed)
+  labelEarly     Boolean   @default(false)
   closedAt           DateTime?
   syncedAt           DateTime  @default(now())
   createdAt          DateTime  @default(now())
@@ -508,6 +519,14 @@ model ShippingSettings {
   // Saved boxes: [{ id, name, l, w, h }] in dimUnit
   boxes          String?
   packedTag      Boolean   @default(true)
+  // In-app labels: the box used when none was entered, and whether customers get Shopify's shipping email
+  labelBoxId        String?
+  labelNotify       Boolean   @default(true)
+  // Shipping method badges: JSON { cheapest: [words], fastest: [words], buyer: [words] }
+  methodRules       String?
+  // Bins ↔ Shopify's "Bin location" variant field: last full sync
+  binsSyncedAt  DateTime?
+  binsSyncError String?
 }
 
 // A batch: up to 250 shipments picked together, then packed and shipped.
@@ -598,6 +617,8 @@ model ProductBin {
   bin       String
   updatedBy String?
   updatedAt DateTime @default(now()) @updatedAt
+  // Last time this bin matched the "Bin location" field on the variant in Shopify
+  shopifySyncedAt DateTime?
 
   @@unique([shop, variantId])
   @@index([shop, sku])
@@ -908,8 +929,10 @@ model Supplier {
   id         Int      @id @default(autoincrement())
   shop       String
   name       String
-  // Comma-separated
+  // Comma-separated: the contacts who get POs by default (kept in step with contacts)
   emails     String?
+  // Up to 3: JSON [{ name, role, email, phone, getsPo }]
+  contacts   String?
   contact    String?
   phone      String?
   address    String?
@@ -953,8 +976,14 @@ model PurchaseOrder {
   receivedAt    DateTime?
   closedAt      DateTime?
   closedBy      String?
+  // Imported from Linnworks: its purchase order id (pkPurchaseID) and reference
+  linnworksId   String?
+  externalRef   String?
 
   @@unique([shop, number])
+  // Not a unique constraint: adding one to an existing table makes Prisma stop the deploy.
+  // The import checks for an existing linnworksId before creating a PO.
+  @@index([shop, linnworksId])
   @@index([shop, status])
 }
 
@@ -973,6 +1002,8 @@ model PurchaseOrderLine {
   tax             Float   @default(0)
   total           Float   @default(0)
   received        Int     @default(0)
+  // Counted in on the Receiving page (doesn't change stock)
+  checkedIn       Int     @default(0)
   variantId       String?
   inventoryItemId String?
   shopifyTitle    String?
@@ -1161,4 +1192,122 @@ model OrdoroNote {
   createdAt DateTime    @default(now())
 
   @@index([issueId])
+}
+
+// ---------------------------------------------------------------------------
+// Direct printing: packing computers (Macs running the print agent) and their print jobs
+// ---------------------------------------------------------------------------
+
+model PrintStation {
+  id            Int       @id @default(autoincrement())
+  shop          String
+  name          String
+  tokenHash     String?   @unique // the agent's key (sha256); the key itself is only on the Mac
+  pairHash      String?   @unique // one-time install code (sha256)
+  pairExpiresAt DateTime?
+  host          String?   // the Mac's name
+  agentVersion  String?
+  osVersion     String?
+  printers      String?   // JSON: [{ name, description, state, isDefault, device }]
+  printersAt    DateTime?
+  lastSeenAt    DateTime?
+  wantHello     Boolean   @default(false) // ask the agent to report its printers again
+  labelPrinter  String?
+  labelOptions  String?   // extra lp options for labels, e.g. "fit-to-page"
+  slipPrinter   String?
+  slipOptions   String?
+  slipSize      String?   // letter | 4x6
+  createdAt     DateTime  @default(now())
+  createdBy     String?
+
+  @@index([shop])
+}
+
+model PrintJob {
+  id        Int       @id @default(autoincrement())
+  shop      String
+  stationId Int
+  kind      String    // label | labels | slips | test-label | test-slip
+  role      String    // label | slip (which of the station's printers)
+  title     String
+  printer   String
+  options   String?
+  format    String    // PDF | ZPL
+  copies    Int       @default(1)
+  data      Bytes?    // cleared once printed
+  status    String    @default("queued") // queued | printing | printed | waiting | failed | expired
+  message   String?
+  createdAt DateTime  @default(now())
+  claimedAt DateTime?
+  doneAt    DateTime?
+  createdBy String?
+
+  @@index([stationId, status])
+  @@index([shop, createdAt])
+}
+
+// The packing computer each person last printed from (when their browser forgets)
+model PrintPref {
+  shop      String
+  staffKey  String
+  stationId Int
+  updatedAt DateTime @updatedAt
+
+  @@id([shop, staffKey])
+}
+
+// ---------------------------------------------------------------------------
+// Stamps.com rate test (Debug): the connected Stamps.com account, and test runs
+// ---------------------------------------------------------------------------
+
+model StampsConnection {
+  shop             String    @id
+  env              String    // staging | production
+  refreshToken     String?   // encrypted
+  accessToken      String?   // encrypted
+  accessExpiresAt  DateTime?
+  connectedBy      String?
+  connectedAt      DateTime?
+  pendingState     String?   @unique // OAuth sign-in in progress
+  pendingBy        String?
+  pendingExpiresAt DateTime?
+  fromName         String?
+  fromLine1        String?
+  fromCity         String?
+  fromState        String?
+  fromZip          String?
+  fromCountry      String?
+  updatedAt        DateTime  @default(now()) @updatedAt
+}
+
+model RateTestRun {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  env       String
+  by        String?
+  settings  String   // JSON: carriers, package, concurrency
+  results   String   // JSON: per shipment and carrier, rates and timings
+  summary   String   // JSON
+  createdAt DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+// Receiving: one check-in of a PO's delivery (counts only; stock isn't changed)
+model PoCheckIn {
+  id        Int       @id @default(autoincrement())
+  shop      String
+  poId      Int
+  // JSON [{ lineId, qty }]
+  lines     String
+  units     Int       @default(0)
+  // JSON [{ code, count }]: scanned but not on the PO
+  unknown   String?
+  note      String?
+  by        String?
+  createdAt DateTime  @default(now())
+  undoneAt  DateTime?
+  undoneBy  String?
+
+  @@index([shop, poId])
 }

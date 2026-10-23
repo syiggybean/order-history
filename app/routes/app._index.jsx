@@ -111,6 +111,14 @@ const TOOLS = [
     status: "live",
   },
   {
+    title: "Receiving",
+    feature: "receiving",
+    description: "Check in deliveries against their purchase orders by scanning or counting. Records what arrived; doesn't change stock yet.",
+    href: "/app/receiving",
+    action: "Open receiving",
+    status: "live",
+  },
+  {
     title: "Sell-through analytics",
     feature: "analytics",
     description:

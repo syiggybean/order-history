@@ -41,6 +41,11 @@ export const FEATURES = {
     levels: ["hidden", "view", "manage"],
     levelLabels: { hidden: "Hidden", view: "View", manage: "View + notes, statuses and runs" },
   },
+  receiving: {
+    label: "Receiving",
+    levels: ["hidden", "view", "checkIn"],
+    levelLabels: { hidden: "Hidden", view: "View", checkIn: "View + check in items" },
+  },
   debug: {
     label: "Debug",
     levels: ["hidden", "view"],
@@ -73,13 +78,14 @@ export const CAPABILITY_FEATURES = {
       generate: "Create, edit and receive POs (suppliers and template too)",
       email: "Email POs to suppliers",
       export: "Export POs as PDF",
+      importLinnworks: "Import POs from Linnworks",
     },
   },
 };
 export const isCapabilityFeature = (f) => Boolean(CAPABILITY_FEATURES[f]);
 
 // Higher levels include everything below them
-export const LEVEL_RANK = { hidden: 0, view: 1, undo: 2, manage: 2 };
+export const LEVEL_RANK = { hidden: 0, view: 1, undo: 2, manage: 2, checkIn: 2 };
 
 export const emptyAccess = () => ({
   ...Object.fromEntries(Object.keys(FEATURES).map((f) => [f, "hidden"])),

@@ -14,6 +14,7 @@ import {
   listLocations,
   listPos,
   listSuppliers,
+  contactsOf,
   markSent,
   poDetail,
   receive,
@@ -26,6 +27,8 @@ import {
 import { PO_BCC, emailDefaults, emailPo, poPdf, renderPoHtml } from "../po-document.server";
 import { DEFAULT_EMAIL_BODY, DEFAULT_EMAIL_SUBJECT, DEFAULT_TEMPLATE, sanitizeTemplate } from "../po-template";
 import db from "../db.server";
+import { LinnworksError, linnworksConfigured, linnworksJob, linnworksMissing, searchLinnworks, startImport } from "../linnworks.server";
+import { LinnworksImport } from "../components/po/LinnworksImport";
 import { PoList } from "../components/po/PoList";
 import { NewPo } from "../components/po/NewPo";
 import { PoDetail } from "../components/po/PoDetail";
@@ -40,6 +43,7 @@ const capsOf = (user) => ({
   generate: can(user, "purchaseOrders", "generate"),
   email: can(user, "purchaseOrders", "email"),
   export: can(user, "purchaseOrders", "export"),
+  importLinnworks: can(user, "purchaseOrders", "importLinnworks"),
 });
 
 export const loader = async ({ request }) => {
@@ -47,8 +51,8 @@ export const loader = async ({ request }) => {
   if (noAccess) return { noAccess: true };
   const shop = session.shop;
   const p = new URL(request.url).searchParams;
-  const view = ["new", "suppliers", "template"].includes(p.get("view")) ? p.get("view") : p.get("po") ? "po" : "list";
   const caps = capsOf(user);
+  const view = ["new", "suppliers", "template", "import"].includes(p.get("view")) && (p.get("view") !== "import" || caps.importLinnworks) ? p.get("view") : p.get("po") ? "po" : "list";
   const settings = await getPoSettings(shop);
   let locations = [];
   if (view !== "list") {
@@ -60,6 +64,7 @@ export const loader = async ({ request }) => {
   }
   const base = { view, caps, bcc: PO_BCC, locations, defaultLocationId: settings.locationId ?? locations[0]?.id ?? null };
   if (view === "list") return { ...base, ...(await listPos(shop, { status: p.get("status") ?? "active", q: p.get("q") ?? "" })), status: p.get("status") ?? "active" };
+  if (view === "import") return { ...base, linnworks: { configured: linnworksConfigured(), missing: linnworksMissing(), job: linnworksJob(shop) } };
   if (view === "new") return { ...base, suppliers: (await listSuppliers(shop)).map(supplierView) };
   if (view === "suppliers") return { ...base, suppliers: (await listSuppliers(shop, { archived: true })).map(supplierView) };
   if (view === "template")
@@ -79,7 +84,7 @@ export const loader = async ({ request }) => {
   }
 };
 
-const supplierView = (s) => ({ id: s.id, name: s.name, emails: s.emails, contact: s.contact, phone: s.phone, address: s.address, taxRate: s.taxRate, notes: s.notes, archived: s.archived });
+const supplierView = (s) => ({ id: s.id, name: s.name, emails: s.emails, contacts: contactsOf(s), address: s.address, taxRate: s.taxRate, notes: s.notes, archived: s.archived });
 
 const NEEDS = {
   parse: "generate",
@@ -98,6 +103,9 @@ const NEEDS = {
   emailDefaults: "email",
   email: "email",
   pdf: "export",
+  lwSearch: "importLinnworks",
+  lwImport: "importLinnworks",
+  lwJob: "importLinnworks",
 };
 
 export const action = async ({ request }) => {
@@ -189,6 +197,12 @@ export const action = async ({ request }) => {
         return { intent, ...(await emailDefaults(shop, admin, id)) };
       case "email":
         return { intent, ok: true, ...(await emailPo(shop, admin, id, { to: form.get("to"), cc: form.get("cc"), subject: form.get("subject"), body: form.get("body") }, user)) };
+      case "lwSearch":
+        return { intent, ...(await searchLinnworks(shop, { status: String(form.get("status") ?? ""), from: String(form.get("from") ?? ""), to: String(form.get("to") ?? ""), q: String(form.get("q") ?? ""), page: Number(form.get("page") ?? 1) })) };
+      case "lwImport":
+        return { intent, ok: true, job: await startImport(shop, admin, { ids: json("ids", null), all: json("all", null) }, user) };
+      case "lwJob":
+        return { intent, job: linnworksJob(shop) };
       case "pdf": {
         const { po, pdf, filename } = await poPdf(shop, admin, id);
         await markSent(shop, po.id, { how: "export" }, user);
@@ -196,12 +210,15 @@ export const action = async ({ request }) => {
       }
     }
   } catch (e) {
-    if (e instanceof PoError) return { intent, error: e.message };
+    if (e instanceof PoError || e instanceof LinnworksError) return { intent, error: e.message };
     console.error(`[po] ${intent}:`, errorMessage(e));
     return { intent, error: errorMessage(e) };
   }
   return { intent, error: "Unknown action" };
 };
+
+// Following an import, and Linnworks searches, don't need the page reloaded
+export const shouldRevalidate = ({ formData, defaultShouldRevalidate }) => (["lwSearch", "lwJob"].includes(formData?.get("intent")) ? false : defaultShouldRevalidate);
 
 let currencyCache = null;
 async function shopCurrency(admin) {
@@ -231,6 +248,7 @@ function Page() {
   const tabs = [
     ["list", "Purchase orders"],
     ...(data.caps.generate ? [["suppliers", "Suppliers"], ["template", "PO template"]] : []),
+    ...(data.caps.importLinnworks ? [["import", "Import from Linnworks"]] : []),
   ];
   const active = data.view === "po" || data.view === "new" || data.view === "missing" ? "list" : data.view;
   return (
@@ -252,6 +270,7 @@ function Page() {
       {data.view === "po" && <PoDetail />}
       {data.view === "suppliers" && <Suppliers />}
       {data.view === "template" && <TemplateEditor />}
+      {data.view === "import" && <LinnworksImport />}
       {data.view === "missing" && (
         <s-section>
           <s-banner tone="critical" heading={data.error} />

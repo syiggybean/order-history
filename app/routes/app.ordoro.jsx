@@ -220,28 +220,25 @@ function Page() {
       </s-section>
 
       <s-section>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
+        <FilterRow label="Status">
           {[["open", "Open"], ["resolved", "Resolved"], ["ignored", "Ignored"], ["fixed", "Now matches"], ["all", "All"]].map(([k, label]) => (
-            <button
-              key={k}
-              type="button"
-              onClick={() => go({ status: k })}
-              style={{ ...input, cursor: "pointer", background: filter.status === k ? "#303030" : "#fff", color: filter.status === k ? "#fff" : "#303030" }}
-            >
+            <FilterButton key={k} active={filter.status === k} onClick={() => go({ status: k })}>
               {label}
               {k !== "all" ? ` (${(d.counts.byStatus[k] ?? 0).toLocaleString()})` : ""}
-            </button>
+            </FilterButton>
           ))}
-        </div>
+        </FilterRow>
+        <FilterRow label="Problem">
+          <FilterButton active={!filter.type} onClick={() => go({ type: "" })}>
+            Every problem
+          </FilterButton>
+          {Object.entries(issueTypes).map(([k, label]) => (
+            <FilterButton key={k} active={filter.type === k} onClick={() => go({ type: filter.type === k ? "" : k })} dim={!d.counts.byType[k]}>
+              {label} ({(d.counts.byType[k] ?? 0).toLocaleString()})
+            </FilterButton>
+          ))}
+        </FilterRow>
         <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginBottom: "10px" }}>
-          <select value={filter.type} onChange={(e) => go({ type: e.target.value })} style={input} aria-label="Problem">
-            <option value="">Every problem</option>
-            {Object.entries(issueTypes).map(([k, label]) => (
-              <option key={k} value={k}>
-                {label} ({(d.counts.byType[k] ?? 0).toLocaleString()})
-              </option>
-            ))}
-          </select>
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -274,6 +271,9 @@ function Page() {
                 <tr>
                   <th style={head}>Order</th>
                   <th style={head}>Placed</th>
+                  <th style={head} title="As of the last comparison">
+                    Shipping status
+                  </th>
                   <th style={head}>Problems</th>
                   <th style={head}>Status</th>
                   <th style={head}>Notes</th>
@@ -290,6 +290,9 @@ function Page() {
                         {r.ordoroNumber && <div style={muted}>Ordoro {r.ordoroNumber}</div>}
                       </td>
                       <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDay(r.placedAt)}</td>
+                      <td style={cell}>
+                        <ShipStatus s={r.shipping} />
+                      </td>
                       <td style={cell}>
                         {r.issues.map((i) => {
                           const [bg, fg] = TYPE_COLORS[i.type] ?? ["#f1f1f1", "#303030"];
@@ -308,7 +311,7 @@ function Page() {
                     </tr>
                     {open === r.id && (
                       <tr>
-                        <td colSpan={5} style={{ ...cell, background: "#fafafa", padding: "10px 14px 14px" }}>
+                        <td colSpan={6} style={{ ...cell, background: "#fafafa", padding: "10px 14px 14px" }}>
                           <Detail id={r.id} canManage={canManage} shopAdmin={d.shopAdmin} statuses={statuses} onChanged={() => revalidator.revalidate()} />
                         </td>
                       </tr>
@@ -334,6 +337,68 @@ function Page() {
         )}
       </s-section>
     </s-page>
+  );
+}
+
+// A labelled row of toggle buttons (status, problem type)
+function FilterRow({ label, children }) {
+  return (
+    <div role="group" aria-label={label} style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", marginBottom: "8px" }}>
+      <span style={{ ...muted, width: "60px" }}>{label}</span>
+      {children}
+    </div>
+  );
+}
+function FilterButton({ active, onClick, dim = false, children }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      style={{
+        ...input,
+        cursor: "pointer",
+        borderRadius: "999px",
+        padding: "4px 12px",
+        fontSize: "13px",
+        background: active ? "#303030" : "#fff",
+        color: active ? "#fff" : dim ? "#8a8a8a" : "#303030",
+        borderColor: active ? "#303030" : "#c9c9c9",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// Shopify's and Ordoro's shipping status side by side; red when they disagree
+const SHIP_KIND = {
+  shipped: ["#e3f1df", "#1a5e20"],
+  partial: ["#fff1d6", "#8a5a00"],
+  open: ["#eef3ff", "#1c4a9c"],
+  cancelled: ["#f1f1f1", "#616161"],
+  missing: ["#fff", "#b42318"],
+};
+function ShipStatus({ s }) {
+  if (!s) return null;
+  const side = (name, x) => {
+    const [bg, fg] = SHIP_KIND[x.kind] ?? SHIP_KIND.open;
+    return (
+      <div style={{ display: "flex", gap: "6px", alignItems: "center", whiteSpace: "nowrap" }}>
+        <span style={{ ...muted, fontSize: "12px", width: "48px" }}>{name}</span>
+        <span style={{ ...pill(bg, fg), ...(x.kind === "missing" ? { border: "1px dashed #b42318" } : {}) }}>{x.label}</span>
+      </div>
+    );
+  };
+  return (
+    <div
+      title={s.match ? "Same in both" : "Shopify and Ordoro disagree"}
+      style={{ display: "inline-grid", gap: "3px", padding: "4px 6px", borderRadius: "8px", ...(s.match ? {} : { background: "#fef3f2", boxShadow: "inset 3px 0 0 #d92d20" }) }}
+    >
+      {side("Shopify", s.shopify)}
+      {side("Ordoro", s.ordoro)}
+      {!s.match && <span style={{ fontSize: "11px", fontWeight: 700, color: "#b42318" }}>≠ Don't match</span>}
+    </div>
   );
 }
 

@@ -4,7 +4,7 @@ import { input, small } from "./ui";
 
 // Product filter: type part of a title, variant or SKU and pick from the
 // suggestions (products in this tab's shipments, with how many each is in).
-export function ProductPicker({ value, name, state, singles, onPick }) {
+export function ProductPicker({ value, name, state, singles, doubles, onPick }) {
   const fetcher = useFetcher();
   const [text, setText] = useState(value ? name || "Selected product" : "");
   const [open, setOpen] = useState(false);
@@ -17,7 +17,7 @@ export function ProductPicker({ value, name, state, singles, onPick }) {
   const ask = (q) => {
     clearTimeout(timer.current);
     timer.current = setTimeout(
-      () => fetcher.submit({ intent: "productSuggest", q, state: state === "waiting" ? "waiting" : "ready", singles: singles ? "1" : "" }, { method: "post" }),
+      () => fetcher.submit({ intent: "productSuggest", q, state: state === "waiting" ? "waiting" : "ready", singles: singles ? "1" : "", doubles: doubles ? "1" : "" }, { method: "post" }),
       q ? 200 : 0,
     );
   };

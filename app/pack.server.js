@@ -85,8 +85,20 @@ function viewBox(s, flags, bins) {
     packAcked: !notice || s.packAckKey === s.noticeKey,
     flags: flags?.get(s.orderId) ?? [],
     stockFlag: s.flag,
+    label: labelViewOf(s),
   };
 }
+
+const labelViewOf = (s) => ({
+  status: s.labelStatus ?? null,
+  error: s.labelError ?? null,
+  tracking: json(s.labelTracking, []),
+  boughtAt: s.labelBoughtAt?.toISOString() ?? null,
+  boughtBy: s.labelBoughtBy ?? null,
+  printedAt: s.labelPrintedAt?.toISOString() ?? null,
+  early: Boolean(s.labelEarly),
+  inApp: Boolean(s.labelId),
+});
 
 async function binsFor(shop, shipments) {
   const ids = [...new Set(shipments.flatMap((s) => linesOf(s).map((l) => l.variantId)).filter(Boolean))];
@@ -123,7 +135,7 @@ export function packageOf(s) {
 export const boxesOf = (settings) =>
   json(settings.boxes, [])
     .filter((b) => b && b.name)
-    .map((b) => ({ id: String(b.id), name: String(b.name), l: Number(b.l) || null, w: Number(b.w) || null, h: Number(b.h) || null }));
+    .map((b) => ({ id: String(b.id), name: String(b.name), l: Number(b.l) || null, w: Number(b.w) || null, h: Number(b.h) || null, wt: Number(b.wt) > 0 ? Number(b.wt) : null }));
 
 export function packageSettingsOf(settings) {
   return {
@@ -132,6 +144,8 @@ export function packageSettingsOf(settings) {
     dimUnit: DIM_UNITS.includes(settings.dimUnit) ? settings.dimUnit : "in",
     boxes: boxesOf(settings),
     packedTag: settings.packedTag !== false,
+    labelBoxId: settings.labelBoxId ?? null,
+    labelNotify: settings.labelNotify !== false,
   };
 }
 
@@ -206,16 +220,20 @@ export async function savePackageSettings(shop, input, user) {
     if (!name && d.every((v) => v === null)) continue;
     if (!name) throw new ShippingError(`Box ${i + 1} needs a name.`);
     if (d.some((v) => v === null || Number.isNaN(v) || v <= 0 || v > 500)) throw new ShippingError(`Enter all three sizes for "${name}".`);
-    clean.push({ id: String(x?.id || `b${Date.now().toString(36)}${i}`), name, l: d[0], w: d[1], h: d[2] });
+    const wt = num(x?.wt);
+    if (wt !== null && (Number.isNaN(wt) || wt < 0 || wt > 100)) throw new ShippingError(`Enter the empty weight of "${name}" as a number, or leave it blank.`);
+    clean.push({ id: String(x?.id || `b${Date.now().toString(36)}${i}`), name, l: d[0], w: d[1], h: d[2], wt });
   }
   const before = await getShippingSettings(shop);
+  const labelBoxId = input.labelBoxId && clean.some((x) => x.id === String(input.labelBoxId)) ? String(input.labelBoxId) : null;
+  const labelNotify = input.labelNotify === undefined ? before.labelNotify !== false : Boolean(input.labelNotify);
   await db.shippingSettings.update({
     where: { shop },
-    data: { packageStep: step, weightUnit, dimUnit, boxes: JSON.stringify(clean), packedTag: Boolean(input.packedTag) },
+    data: { packageStep: step, weightUnit, dimUnit, boxes: JSON.stringify(clean), packedTag: Boolean(input.packedTag), labelBoxId, labelNotify },
   });
   await logEvent(shop, { type: "package_settings", detail: `${step}, ${weightUnit}/${dimUnit}, ${clean.length} box${clean.length === 1 ? "" : "es"}${input.packedTag ? ", Packed tag on" : ", Packed tag off"}`, user });
   if (before.packedTag !== Boolean(input.packedTag)) kick(shop, 2000);
-  return packageSettingsOf({ packageStep: step, weightUnit, dimUnit, boxes: JSON.stringify(clean), packedTag: Boolean(input.packedTag) });
+  return packageSettingsOf({ packageStep: step, weightUnit, dimUnit, boxes: JSON.stringify(clean), packedTag: Boolean(input.packedTag), labelBoxId, labelNotify });
 }
 
 const trim = (n) => String(Math.round(n * 100) / 100);
@@ -257,6 +275,9 @@ export async function packQueue(shop, batchId) {
       tagging: settings.packedTag !== false,
       identical,
       complete: rows.length > 0 && rows.every((r) => r.state !== "batched"),
+      // In-app labels for the whole batch
+      unlabelled: rows.filter((r) => ["batched", "packed"].includes(r.state) && r.labelStatus !== "bought").length,
+      labelled: rows.filter((r) => r.labelStatus === "bought").length,
     },
     batch: { id: b.id, tag: b.tag, name: b.name, status: b.status, number: b.number, assignees: json(b.assignees, []), packStartedAt: b.packStartedAt?.toISOString() ?? null, packDoneAt: b.packDoneAt?.toISOString() ?? null },
     boxes,
@@ -313,9 +334,11 @@ async function settleBatch(b) {
 }
 
 async function markPacked(shop, b, s, user, override = null) {
+  // Its label was bought before packing (Shopify already fulfilled it): packed = on its way
+  const preLabelled = s.labelStatus === "bought" && s.labelEarly;
   await db.shipment.update({
     where: { id: s.id },
-    data: { state: "packed", packedAt: new Date(), packedBy: user?.name ?? null, packOverride: override },
+    data: { state: preLabelled ? "shipped" : "packed", packedAt: new Date(), packedBy: user?.name ?? null, packOverride: override, ...(preLabelled ? { closedAt: new Date() } : {}) },
   });
   await logEvent(shop, {
     shipmentId: s.id,
@@ -408,7 +431,7 @@ const FO_TRACKING = `#graphql
     fulfillmentOrder(id: $id) {
       id
       status
-      fulfillments(first: 5) { nodes { createdAt trackingInfo(first: 2) { company number url } } }
+      fulfillments(first: 10) { nodes { createdAt status trackingInfo(first: 5) { company number url } } }
     }
   }`;
 
@@ -418,20 +441,40 @@ export async function labelCheck(shop, admin, batchId, shipmentId) {
   await syncOrder(shop, admin, s.orderId);
   const fresh = await db.shipment.findUnique({ where: { id: s.id } });
   let tracking = [];
+  let voided = 0;
+  let labels = 0;
   if (fresh.state === "shipped") {
     const justNow = s.state !== "shipped";
     const data = await gql(admin, FO_TRACKING, { id: s.fulfillmentOrderId }).catch(() => null);
-    tracking = (data?.fulfillmentOrder?.fulfillments?.nodes ?? []).flatMap((f) => f.trackingInfo).filter((t) => t.number);
+    // Only this box's label: an order shipped in parts (e.g. in-stock items in
+    // May, the pre-order now) keeps the earlier shipments on the same
+    // fulfillment order. Those were created before this box was packed.
+    const nodes = data?.fulfillmentOrder?.fulfillments?.nodes ?? [];
+    const since = fresh.packedAt ?? s.packedAt;
+    const cutoff = since ? new Date(since).getTime() - 10 * 60 * 1000 : null;
+    let all = cutoff === null ? nodes : nodes.filter((f) => Date.parse(f.createdAt) >= cutoff);
+    // No packing time to go by (or the label predates it): just the newest shipment
+    const newest = () => [...nodes].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 1);
+    if (cutoff === null && all.length > 1) all = newest();
+    if (!all.length && nodes.length) all = newest();
+    // Voided labels leave a cancelled fulfillment behind: not a label that's going out
+    const live = all.filter((f) => !["CANCELLED", "ERROR", "FAILURE"].includes(f.status));
+    tracking = live.flatMap((f) => f.trackingInfo ?? []).filter((t) => t.number);
+    voided = all.length - live.length;
+    // More than one live shipment with tracking: probably paid for two labels
+    labels = live.filter((f) => (f.trackingInfo ?? []).some((t) => t.number)).length;
     if (justNow) await logEvent(shop, {
       shipmentId: s.id,
       batchId: b.id,
       orderName: s.orderName,
       type: "label_bought",
-      detail: tracking.length ? tracking.map((t) => `${t.company ?? ""} ${t.number}`.trim()).join(", ") : "Fulfilled in Shopify",
+      detail:
+        (tracking.length ? tracking.map((t) => `${t.company ?? ""} ${t.number}`.trim()).join(", ") : "Fulfilled in Shopify") +
+        (labels > 1 ? ` (${labels} labels on this order)` : ""),
     });
     await settleBatch(b);
   }
-  return { ok: true, shipped: fresh.state === "shipped", state: fresh.state, tracking };
+  return { ok: true, shipped: fresh.state === "shipped", state: fresh.state, tracking, labels, voided };
 }
 
 // ---------------------------------------------------------------------------
