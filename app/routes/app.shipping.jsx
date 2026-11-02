@@ -63,6 +63,10 @@ import {
   reopenPicking,
   runAutoBatch,
   saveAutoBatchSettings,
+  setBatchPriority,
+  batchLock,
+  batchLocks,
+  getBatchRow,
   scanPick,
   setPicked,
 } from "../batches.server";
@@ -93,6 +97,12 @@ import {
 import { OrderLookupBox } from "../components/shipping/OrderLookup";
 import { ProductPicker } from "../components/shipping/ProductPicker";
 
+// Locks for the batches on screen (the batch itself is loaded for its priority)
+async function batchLocksFor(shop, list, user, early) {
+  const full = list.every((b) => b.number != null) ? list : await Promise.all(list.map((b) => getBatchRow(shop, b.id)));
+  return batchLocks(shop, full.filter(Boolean), user, { early });
+}
+
 const PAGE_SIZE = 50;
 const TABS = ["ready", "waiting", "batches", "review", "stock", "settings"];
 
@@ -103,6 +113,9 @@ const filterFrom = (params) => ({
   product: params.get("product") || "",
   productName: params.get("pname") || "",
   variant: params.get("product") ? params.get("variant") || "" : "",
+  // Combinations: also containing these products (with their names, for the chips)
+  with: params.get("product") ? (params.get("with") || "").split(",").filter(Boolean).slice(0, 5) : [],
+  withNames: params.get("product") ? (params.get("wnames") || "").split("|").slice(0, 5) : [],
   singles: params.get("singles") === "1",
   doubles: params.get("singles") !== "1" && params.get("doubles") === "1",
   pair: params.get("singles") !== "1" && params.get("doubles") === "1" ? params.get("pair") || "" : "",
@@ -156,7 +169,13 @@ export const loader = async ({ request }) => {
     tab === "review" ? listFlags(shop, { status: params.get("status") === "resolved" ? "resolved" : "open" }) : null,
     openFlagCount(shop),
   ]);
+  // What stops this person picking / packing (release dates, higher-priority batches)
+  const early = can(user, "shipping", "pickEarly");
+  const lockBatches = batchId ? [{ id: batchId }] : (batches ?? []);
+  const lockMap = lockBatches.length ? await batchLocksFor(shop, lockBatches, user, early) : new Map();
   return {
+    batchLockList: Object.fromEntries(lockMap),
+    lock: batchId ? (lockMap.get(batchId) ?? null) : null,
     tab,
     filter,
     overview,
@@ -211,6 +230,8 @@ export const loader = async ({ request }) => {
       pack: can(user, "shipping", "pack"),
       ship: can(user, "shipping", "ship"),
       override: can(user, "shipping", "override"),
+      priority: can(user, "shipping", "priority"),
+      pickEarly: can(user, "shipping", "pickEarly"),
       // Release dates can be changed from the quick view by people who manage pre-orders
       editRelease: !sandboxOn && (can(user, "preorders", "manage") || can(user, "releaseReview", "manage")),
     },
@@ -238,6 +259,7 @@ const NEEDS = {
   finishPicking: "pick",
   reopenPicking: "pick",
   assignBatch: "batches",
+  setPriority: "priority",
   ackNotice: "view",
   recheckOrder: "view",
   lookupOrder: "view",
@@ -307,6 +329,12 @@ export const action = async ({ request }) => {
       return { intent, error: "That batch isn't assigned to you.", denied: true };
     }
   }
+  // Release dates and priority order: pick / pack the right batch first
+  const stage = PICK_INTENTS.has(intent) ? "pick" : PACK_INTENTS.has(intent) ? "pack" : null;
+  if (stage && id) {
+    const lock = await batchLock(shop, id, user, { early: can(user, "shipping", "pickEarly") });
+    if (lock?.[stage]) return { intent, ok: false, error: lock[stage], locked: true };
+  }
   if (intent === "resetSandbox") {
     if (!sandboxOn) return { intent, error: "You're not in sandbox mode." };
     return { intent, ok: true, ...(await resetSandbox(session.shop, user)) };
@@ -314,7 +342,17 @@ export const action = async ({ request }) => {
   if (intent === "sync" && sandboxOn) return { intent, error: "Reading from Shopify is off in sandbox. Use Reset copy in the sandbox bar for fresh data." };
   try {
     if (intent === "productSuggest") {
-      return { intent, q: String(form.get("q") ?? ""), products: await suggestProducts(shop, { q: form.get("q"), state: String(form.get("state") ?? "ready"), singles: form.get("singles") === "1", doubles: form.get("doubles") === "1" }) };
+      return {
+        intent,
+        q: String(form.get("q") ?? ""),
+        products: await suggestProducts(shop, {
+          q: form.get("q"),
+          state: String(form.get("state") ?? "ready"),
+          singles: form.get("singles") === "1",
+          doubles: form.get("doubles") === "1",
+          withIds: String(form.get("with") ?? ""),
+        }),
+      };
     }
     if (intent === "more") {
       const filter = JSON.parse(String(form.get("filter") ?? "{}"));
@@ -463,11 +501,25 @@ export const action = async ({ request }) => {
       await renameBatch(shop, id, form.get("name"), user);
       return { intent, ok: true };
     }
+    if (intent === "setPriority") return { intent, ok: true, ...(await setBatchPriority(shop, id, form.get("priority"), user)) };
     if (intent === "autoBatch") return { intent, ok: true, ...(await runAutoBatch(shop, user)) };
     if (intent === "autoSettings") {
       await saveAutoBatchSettings(
         shop,
-        { enabled: form.get("enabled") === "1", time: String(form.get("time") ?? ""), singles: form.get("singles") === "1", min: form.get("min") },
+        {
+          enabled: form.get("enabled") === "1",
+          time: String(form.get("time") ?? ""),
+          singles: form.get("singles") === "1",
+          min: form.get("min"),
+          identical: form.get("identical") === "1",
+          identicalMin: form.get("identicalMin"),
+          multiples: form.get("multiples") === "1",
+          multiMin: form.get("multiMin"),
+          multiMaxOther: form.get("multiMaxOther"),
+          multiMaxItems: form.get("multiMaxItems"),
+          release: form.get("release") === "1",
+          releaseDays: form.get("releaseDays"),
+        },
         user,
       );
       return { intent, ok: true };
@@ -528,11 +580,15 @@ async function printOnStation({ shop, printShop, admin, user, form, id }) {
   return { what, count, ...(await queuePrint(printShop, stationId, { ...doc, role, kind: what }, user)) };
 }
 
+// Picking and packing steps (blocked by a release date still to come, or a higher-priority batch)
+const PICK_INTENTS = new Set(["scan", "setPicked", "finishPicking"]);
+const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack"]);
+
 // Actions on a batch (its id is in "id"): people limited to their assigned batches only get theirs
 const BATCH_INTENTS = new Set([
   "scan", "setPicked", "finishPicking", "reopenPicking", "packScan", "findBox", "overridePack", "unpack", "labelCheck", "savePackage",
   "buyLabel", "buyLabels", "bulkLabelStatus", "labelFile", "batchLabelFile", "agentPrint",
-  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch",
+  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox",
 ]);
 
 // Busy, local-only actions don't reload the whole page
@@ -920,6 +976,7 @@ function Filters({ filter, overview, state = "ready", pairs = null, variants = n
     fontSize: "13px",
   });
   const showVariants = filter.product && variants && (variants.length > 1 || filter.variant);
+  const setCombo = (ids, names) => setMany({ with: ids.length ? ids.join(",") : null, wnames: ids.length ? names.map((n) => String(n).replace(/\|/g, "/")).join("|") : null });
   return (
     <>
     <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginBottom: "10px" }}>
@@ -956,8 +1013,41 @@ function Filters({ filter, overview, state = "ready", pairs = null, variants = n
         state={state}
         singles={filter.singles}
         doubles={filter.doubles}
-        onPick={(p) => setMany({ product: p?.productId ?? null, pname: p ? p.title ?? "" : null, variant: null })}
+        onPick={(p) => setMany({ product: p?.productId ?? null, pname: p ? p.title ?? "" : null, variant: null, with: null, wnames: null })}
       />
+      {/* Combinations: shipments that also contain these products */}
+      {filter.product && (
+        <span style={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "6px" }}>
+          {filter.with.map((id, i) => (
+            <span key={id} style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "4px 6px 4px 10px", borderRadius: "999px", background: "#f1f1f1", fontSize: "13px", fontWeight: 600 }}>
+              <span style={{ color: "#616161", fontWeight: 400 }}>+</span> {filter.withNames[i] || "Product"}
+              <button
+                type="button"
+                aria-label={`Remove ${filter.withNames[i] || "product"}`}
+                onClick={() => setCombo(filter.with.filter((_, j) => j !== i), filter.withNames.filter((_, j) => j !== i))}
+                style={{ border: 0, background: "none", cursor: "pointer", fontSize: "15px", lineHeight: 1, color: "#616161", padding: "0 2px" }}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          {filter.with.length < 5 && (
+            <ProductPicker
+              key={`with:${filter.with.join(",")}`}
+              value=""
+              name=""
+              state={state}
+              singles={filter.singles}
+              doubles={filter.doubles}
+              withIds={[filter.product, ...filter.with]}
+              placeholder="+ and another product"
+              label="Also contains product"
+              clearOnPick
+              onPick={(p) => p && setCombo([...filter.with, p.productId], [...filter.withNames, p.title ?? ""])}
+            />
+          )}
+        </span>
+      )}
       {showVariants && (
         <select value={filter.variant} onChange={(e) => set("variant", e.target.value)} style={{ ...input, maxWidth: "260px" }} aria-label="Variant">
           <option value="">All variants ({variants.reduce((n, v) => n + v.shipments, 0)})</option>
@@ -1281,62 +1371,94 @@ function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn, p
 // Page
 // ---------------------------------------------------------------------------
 
+const AUTO_FIELDS = {
+  enabled: (st) => st.autoBatchEnabled,
+  time: (st) => st.autoBatchTime,
+  singles: (st) => st.autoSingleItem,
+  min: (st) => String(st.autoSingleMin),
+  identical: (st) => Boolean(st.autoIdentical),
+  identicalMin: (st) => String(st.autoIdenticalMin ?? 10),
+  multiples: (st) => Boolean(st.autoMultiples),
+  multiMin: (st) => String(st.autoMultiMin ?? 20),
+  multiMaxOther: (st) => String(st.autoMultiMaxOther ?? 3),
+  multiMaxItems: (st) => String(st.autoMultiMaxItems ?? 25),
+  release: (st) => Boolean(st.autoRelease),
+  releaseDays: (st) => String(st.autoReleaseDays ?? 3),
+};
+const autoFrom = (st) => Object.fromEntries(Object.entries(AUTO_FIELDS).map(([k, f]) => [k, f(st)]));
+
 function AutoBatchSettings({ st, canSettings }) {
   const fetcher = useFetcher();
-  const [enabled, setEnabled] = useState(st.autoBatchEnabled);
-  const [time, setTime] = useState(st.autoBatchTime);
-  const [singles, setSingles] = useState(st.autoSingleItem);
-  const [min, setMin] = useState(String(st.autoSingleMin));
-  useEffect(() => {
-    setEnabled(st.autoBatchEnabled);
-    setTime(st.autoBatchTime);
-    setSingles(st.autoSingleItem);
-    setMin(String(st.autoSingleMin));
-  }, [st.autoBatchEnabled, st.autoBatchTime, st.autoSingleItem, st.autoSingleMin]);
-  const dirty = enabled !== st.autoBatchEnabled || time !== st.autoBatchTime || singles !== st.autoSingleItem || min !== String(st.autoSingleMin);
-  const row = { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" };
+  const saved = autoFrom(st);
+  const [v, setV] = useState(saved);
+  const savedKey = JSON.stringify(saved);
+  useEffect(() => setV(JSON.parse(savedKey)), [savedKey]);
+  const set = (k) => (e) => setV((x) => ({ ...x, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
+  const dirty = JSON.stringify(v) !== savedKey;
+  const row = { display: "flex", gap: "10px", alignItems: "flex-start", flexWrap: "wrap" };
+  const num = (k, label, { min = 1, max = 5000, on = true, width = "70px" } = {}) => (
+    <input type="number" min={min} max={max} value={v[k]} disabled={!canSettings || !on} onChange={set(k)} style={{ ...input, width, padding: "3px 6px" }} aria-label={label} />
+  );
+  const rule = { display: "flex", gap: "10px", alignItems: "flex-start" };
   return (
     <s-section heading="Auto-batching">
       <s-paragraph>
         <span style={muted}>
-          Builds batches from the Ready list on its own, oldest orders first, up to 250 per batch. Runs from the Batches tab whenever you like, and
-          once a day if the schedule is on. Shipments already in a batch are never moved.
+          Builds batches on its own, oldest orders first, up to 250 per batch. The rules run in this order and each order goes into one batch at most. Runs from
+          the Batches tab whenever you like, and once a day if the schedule is on. Shipments already in a batch are never moved; orders flagged for review wait.
         </span>
       </s-paragraph>
-      <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginTop: "10px" }}>
-        <label style={row}>
-          <input type="checkbox" checked={singles} disabled={!canSettings} onChange={(e) => setSingles(e.target.checked)} />
+      <div style={{ display: "flex", flexDirection: "column", gap: "14px", marginTop: "10px" }}>
+        <label style={rule}>
+          <input type="checkbox" checked={v.singles} disabled={!canSettings} onChange={set("singles")} style={{ marginTop: "4px" }} />
           <span>
-            <strong>Single items:</strong> when more than{" "}
-            <input
-              type="number"
-              min="1"
-              max="5000"
-              value={min}
-              disabled={!canSettings || !singles}
-              onChange={(e) => setMin(e.target.value)}
-              style={{ ...input, width: "70px" }}
-              aria-label="Minimum shipments"
-            />{" "}
-            shipments of one item (one unit, nothing else in the box) are ready, they go into a batch named after the item, e.g. "Lore Vol. 1
-            singles".
+            <strong>Single items:</strong> when more than {num("min", "Single items minimum", { on: v.singles })} shipments of one item (one unit, nothing
+            else in the box) are ready, they go into a batch named after the item, e.g. "Lore Vol. 1 singles".
           </span>
         </label>
-        <label style={row}>
-          <input type="checkbox" checked={enabled} disabled={!canSettings} onChange={(e) => setEnabled(e.target.checked)} />
+        <label style={rule}>
+          <input type="checkbox" checked={v.identical} disabled={!canSettings} onChange={set("identical")} style={{ marginTop: "4px" }} />
           <span>
-            Run every day at{" "}
-            <input type="time" value={time} disabled={!canSettings || !enabled} onChange={(e) => setTime(e.target.value)} style={input} aria-label="Time" /> (store
+            <strong>Identical orders:</strong> when at least {num("identicalMin", "Identical orders minimum", { min: 2, on: v.identical })} orders have exactly
+            the same items and quantities, they're batched together, e.g. "Lore Vol. 1 + Lore Vol. 2 identical".
+          </span>
+        </label>
+        <div style={rule}>
+          <input type="checkbox" checked={v.multiples} disabled={!canSettings} onChange={set("multiples")} style={{ marginTop: "4px" }} aria-label="Multiples" />
+          <span>
+            <strong>Multiples:</strong> orders with more than one item that share an anchor item (the most common item first), e.g. "Lore Vol. 3 multiples".
+            <span style={{ display: "flex", flexWrap: "wrap", gap: "6px 16px", marginTop: "6px", ...small, color: "#303030" }}>
+              <span>At least {num("multiMin", "Multiples minimum orders", { min: 2, on: v.multiples })} orders</span>
+              <span>Up to {num("multiMaxOther", "Other items per order", { min: 0, max: 50, on: v.multiples, width: "60px" })} other items in each order</span>
+              <span>Up to {num("multiMaxItems", "Different items per batch", { max: 500, on: v.multiples, width: "60px" })} different items per batch</span>
+            </span>
+          </span>
+        </div>
+        <label style={rule}>
+          <input type="checkbox" checked={v.release} disabled={!canSettings} onChange={set("release")} style={{ marginTop: "4px" }} />
+          <span>
+            <strong>Upcoming releases:</strong> pre-orders releasing in the next {num("releaseDays", "Days before release", { max: 60, on: v.release, width: "60px" })}{" "}
+            days are batched ahead with the rules above (one batch per release date, e.g. "Lore Vol. 4 singles · releases Nov 12"). Those batches can't be picked
+            or packed until the release date, except by people allowed to pick early.
+          </span>
+        </label>
+        <label style={{ ...row, alignItems: "center" }}>
+          <input type="checkbox" checked={v.enabled} disabled={!canSettings} onChange={set("enabled")} />
+          <span>
+            Run every day at <input type="time" value={v.time} disabled={!canSettings || !v.enabled} onChange={set("time")} style={input} aria-label="Time" /> (store
             time, Los Angeles)
           </span>
         </label>
         <div style={small}>Last run: {st.lastAutoBatchAt ? fmtDate(st.lastAutoBatchAt, true) : "never"}</div>
         {canSettings && (
-          <div style={row}>
+          <div style={{ ...row, alignItems: "center" }}>
             <s-button
               variant="primary"
               onClick={() =>
-                fetcher.submit({ intent: "autoSettings", enabled: enabled ? "1" : "", time, singles: singles ? "1" : "", min }, { method: "post" })
+                fetcher.submit(
+                  { intent: "autoSettings", ...Object.fromEntries(Object.entries(v).map(([k, x]) => [k, typeof x === "boolean" ? (x ? "1" : "") : x])) },
+                  { method: "post" },
+                )
               }
               {...(fetcher.state !== "idle" ? { loading: true } : {})}
               {...(!dirty ? { disabled: true } : {})}
@@ -1429,7 +1551,7 @@ function ReadyTab({ list, filter, overview, allowed, openBatches }) {
   );
 }
 
-function BatchDetail({ batch, list, filter, allowed, staff, me }) {
+function BatchDetail({ batch, list, filter, allowed, staff, me, lock }) {
   const [selected, setSelected] = useState(() => new Set());
   const editable = allowed.batches && batch.removable;
   const selection = editable
@@ -1453,7 +1575,7 @@ function BatchDetail({ batch, list, filter, allowed, staff, me }) {
   const bf = { batchId: batch.id, sort: filter.sort };
   return (
     <s-section>
-      <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} />
+      <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} canPriority={allowed.priority} lock={lock} />
       {editable && <RemoveBar batch={batch} ids={[...selected]} onDone={() => setSelected(new Set())} />}
       <ShipmentTable
         key={`batch:${batch.id}:${filter.sort}`}
@@ -1474,7 +1596,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, batchLockList, lock } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1558,7 +1680,7 @@ function Page() {
             go(
               t === "batches"
                 ? { tab: t, batch: batchId ?? null, view: null, q: null, box: null, slips: null }
-                : { tab: t, q: name, batch: null, view: null, method: null, country: null, product: null, pname: null, variant: null, singles: null, doubles: null, pair: null },
+                : { tab: t, q: name, batch: null, view: null, method: null, country: null, product: null, pname: null, variant: null, with: null, wnames: null, singles: null, doubles: null, pair: null },
               { replace: false },
             )
           }
@@ -1623,12 +1745,18 @@ function Page() {
             time: overview.settings.autoBatchTime,
             singles: overview.settings.autoSingleItem,
             min: overview.settings.autoSingleMin,
+            identical: overview.settings.autoIdentical,
+            multiples: overview.settings.autoMultiples,
+            release: overview.settings.autoRelease,
+            releaseDays: overview.settings.autoReleaseDays,
           }}
+          locks={batchLockList}
+          canPriority={allowed.priority}
         />
       )}
-      {tab === "batches" && batch && <BatchDetail batch={batch} list={list} filter={filter} allowed={allowed} staff={staff} me={me} />}
-      {tab === "batches" && pick && <PickList key={pick.batch.id} data={pick} canPick={allowed.pick} />}
-      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick }} sandbox={Boolean(sandbox)} />}
+      {tab === "batches" && batch && <BatchDetail batch={batch} list={list} filter={filter} allowed={allowed} staff={staff} me={me} lock={lock} />}
+      {tab === "batches" && pick && <PickList key={pick.batch.id} data={pick} canPick={allowed.pick} lock={lock?.pick ?? null} />}
+      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick }} sandbox={Boolean(sandbox)} lock={lock?.pack ?? null} />}
       {tab === "batches" && slips && <Slips data={slips} />}
       {tab === "batches" && !batches && !batch && !pick && !pack && !slips && (
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>

@@ -430,6 +430,8 @@ model Shipment {
   partCount          Int       @default(1)
   state              String    @default("waiting")
   waitingReason      String?
+  // Pre-orders: the latest release date of its items still to come ("YYYY-MM-DD"), else null
+  releaseDay         String?
   readyAt            DateTime?
   otherHold          String?
   appHoldId          String?
@@ -510,6 +512,19 @@ model ShippingSettings {
   autoBatchTime   String    @default("07:00")
   autoSingleItem  Boolean   @default(true)
   autoSingleMin   Int       @default(50)
+  // Multiples: at least autoMultiMin orders that share one "anchor" item, each with at most
+  // autoMultiMaxOther other units, and at most autoMultiMaxItems different items per batch
+  autoMultiples     Boolean @default(false)
+  autoMultiMin      Int     @default(20)
+  autoMultiMaxOther Int     @default(3)
+  autoMultiMaxItems Int     @default(25)
+  // Identical orders: at least autoIdenticalMin orders with exactly the same items and quantities
+  autoIdentical     Boolean @default(false)
+  autoIdenticalMin  Int     @default(10)
+  // Upcoming releases: pre-orders releasing within autoReleaseDays are batched ahead
+  // (same rules as above); picking them waits for the release date
+  autoRelease       Boolean @default(false)
+  autoReleaseDays   Int     @default(3)
   // Set when Shopify won't share addresses (customer-data access not turned on)
   addressCheckError String?
   lastAutoBatchAt DateTime?
@@ -543,6 +558,8 @@ model Batch {
   name          String?
   source        String    @default("manual") // manual | auto:singleItem
   status        String    @default("open")
+  // 0 Low, 1 Normal, 2 High, 3 Urgent: assigned pickers and packers work the highest first
+  priority      Int       @default(1)
   note          String?
   // Who's working it (pickers / packers): [{id, name}] (StaffMember ids)
   assignees     String?

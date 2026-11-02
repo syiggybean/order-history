@@ -14,6 +14,60 @@ const STATUS = {
   done: ["Shipped", "#f1f1f1", "#4a4a4a"],
   cancelled: ["Cancelled", "#f1f1f1", "#6b6b6b"],
 };
+// Batch priority (matches the server's PRIORITIES)
+export const PRIORITY = [
+  { value: 3, label: "Urgent", bg: "#fde7e9", fg: "#8e1f0b" },
+  { value: 2, label: "High", bg: "#fff1e3", fg: "#8a4b00" },
+  { value: 1, label: "Normal", bg: "#f1f1f1", fg: "#4a4a4a" },
+  { value: 0, label: "Low", bg: "#eef3ff", fg: "#3c4a6b" },
+];
+export const PriorityPill = ({ priority }) => {
+  const p = PRIORITY.find((x) => x.value === (priority ?? 1)) ?? PRIORITY[2];
+  return <span style={pill(p.bg, p.fg)}>{p.label}</span>;
+};
+
+// Who may set it: a small select; everyone else sees the pill
+export function PriorityControl({ batch, canPriority }) {
+  const fetcher = useFetcher();
+  const pending = fetcher.formData?.get("priority");
+  const value = pending != null ? Number(pending) : (batch.priority ?? 1);
+  if (!canPriority) return <PriorityPill priority={value} />;
+  const p = PRIORITY.find((x) => x.value === value) ?? PRIORITY[2];
+  return (
+    <span onClick={(e) => e.stopPropagation()} style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+      <select
+        value={value}
+        aria-label={`Priority of ${batch.tag}`}
+        onChange={(e) => fetcher.submit({ intent: "setPriority", id: String(batch.id), priority: e.target.value }, { method: "post" })}
+        style={{ ...input, padding: "3px 6px", fontSize: "12px", fontWeight: 600, background: p.bg, color: p.fg, borderColor: "transparent" }}
+      >
+        {PRIORITY.map((x) => (
+          <option key={x.value} value={x.value}>
+            {x.label}
+          </option>
+        ))}
+      </select>
+      {fetcher.data?.error && <span style={{ ...small, color: "#b42318" }}>{fetcher.data.error}</span>}
+    </span>
+  );
+}
+
+// Why this person can't pick / pack it right now (release date, a higher-priority batch first)
+export function LockNote({ text, compact = false }) {
+  if (!text) return null;
+  if (compact)
+    return (
+      <span title={text} style={{ ...small, color: "#8a4b00", display: "inline-flex", gap: "4px", alignItems: "center" }}>
+        🔒 {text.length > 70 ? `${text.slice(0, 68)}…` : text}
+      </span>
+    );
+  return (
+    <div style={{ margin: "10px 0", padding: "10px 12px", borderRadius: "10px", background: "#fff4e5", border: "1px solid #f3c98b", color: "#5c3a00", fontWeight: 600 }} role="status">
+      🔒 {text}
+    </div>
+  );
+}
+
 export const StatusPill = ({ status }) => {
   const [label, bg, fg] = STATUS[status] ?? [status, "#f1f1f1", "#4a4a4a"];
   return <span style={pill(bg, fg)}>{label}</span>;
@@ -315,7 +369,7 @@ export function AssignControl({ batch, staff, canAssign, me }) {
   );
 }
 
-export function BatchList({ batches, show, canBatches, autoBatch, restricted = false, mine = false }) {
+export function BatchList({ batches, show, canBatches, autoBatch, restricted = false, mine = false, locks = {}, canPriority = false }) {
   const go = useParamSetter();
   const auto = useFetcher();
   const ran = auto.data?.intent === "autoBatch" ? auto.data : null;
@@ -353,7 +407,10 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
           <>
             <span style={small}>
               {autoBatch.enabled ? `Auto-batching runs daily at ${autoBatch.time}` : "Daily auto-batching is off"}
-              {autoBatch.singles ? ` · single items when more than ${autoBatch.min} are ready` : ""}
+              {(() => {
+                const rules = [autoBatch.singles && "single items", autoBatch.identical && "identical orders", autoBatch.multiples && "multiples"].filter(Boolean);
+                return rules.length ? ` · ${rules.join(", ")}${autoBatch.release ? `, and releases in the next ${autoBatch.releaseDays} days` : ""}` : " · no rules on";
+              })()}
             </span>
             <s-button onClick={() => auto.submit({ intent: "autoBatch" }, { method: "post" })} {...(auto.state !== "idle" ? { loading: true } : {})}>
               Run auto-batching now
@@ -373,7 +430,7 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
             </s-banner>
           ) : (
             <s-banner tone="info">
-              <s-paragraph>Nothing to auto-batch: no item has more than {autoBatch.min} single-item shipments ready.</s-paragraph>
+              <s-paragraph>Nothing to auto-batch: no group of orders met its minimum. The rules are in Settings and activity.</s-paragraph>
             </s-banner>
           )}
         </div>
@@ -393,7 +450,7 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
           <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
             <thead>
               <tr>
-                {["Batch", "Status", "Assigned", "Shipments", "Units", "Oldest order", "Created", ""].map((h, i) => (
+                {["Batch", "Priority", "Status", "Assigned", "Shipments", "Units", "Oldest order", "Created", ""].map((h, i) => (
                   <th key={i} style={head}>
                     {h}
                   </th>
@@ -412,7 +469,17 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
                     <span style={{ color: "#005bd3", fontWeight: 700 }}>{b.tag}</span>
                     {b.name && <div style={{ fontWeight: 500 }}>{b.name}</div>}
                     {b.source !== "manual" && <div style={small}>Auto-batched</div>}
+                    {(() => {
+                      const l = locks[b.id];
+                      const why = l && (["open", "picking"].includes(b.status) ? l.pick : ["picked", "packing"].includes(b.status) ? l.pack : null);
+                      return why ? (
+                        <div>
+                          <LockNote text={why} compact />
+                        </div>
+                      ) : null;
+                    })()}
                   </td>
+                  <td style={cell}>{show === "live" ? <PriorityControl batch={b} canPriority={canPriority} /> : <PriorityPill priority={b.priority} />}</td>
                   <td style={cell}>
                     <StatusPill status={b.status} />
                   </td>
@@ -441,7 +508,7 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
 // One batch
 // ---------------------------------------------------------------------------
 
-export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null }) {
+export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null, canPriority = false, lock = null }) {
   const go = useParamSetter();
   const fetcher = useFetcher();
   const [renaming, setRenaming] = useState(false);
@@ -480,7 +547,10 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null 
           </span>
         )}
         <StatusPill status={batch.status} />
+        {batch.status !== "cancelled" && batch.status !== "done" ? <PriorityControl batch={batch} canPriority={canPriority} /> : <PriorityPill priority={batch.priority} />}
       </div>
+      {lock && <LockNote text={["open", "picking"].includes(batch.status) ? lock.pick : ["picked", "packing"].includes(batch.status) ? lock.pack : null} />}
+      {lock?.releaseDay && !lock.pick && <div style={{ ...small, marginTop: "6px" }}>Batched ahead of a release ({lock.releaseDay}); you can pick it early.</div>}
       <div style={{ ...small, marginTop: "6px" }}>
         {batch.shipments} shipment{batch.shipments === 1 ? "" : "s"} · {batch.units} unit{batch.units === 1 ? "" : "s"} · created {fmtDate(batch.createdAt, true)}
         {batch.createdBy ? ` by ${batch.createdBy}` : batch.source !== "manual" ? " by auto-batching" : ""}

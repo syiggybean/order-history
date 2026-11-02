@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useFetcher } from "react-router";
 import { PINK, ProductName, box, cell, fmtDate, head, muted, small, ProductThumb, useParamSetter, GreenButton } from "./ui";
-import { StatusPill, batchTitle } from "./Batches";
+import { LockNote, StatusPill, batchTitle } from "./Batches";
 
 const PRINT_CSS = `
 @media print {
@@ -36,7 +36,7 @@ function beep(ok) {
 
 const label = (i) => `${i.title}${i.variantTitle ? ` – ${i.variantTitle}` : ""}`;
 
-export function PickList({ data, canPick }) {
+export function PickList({ data, canPick, lock = null }) {
   const go = useParamSetter();
   const { batch } = data;
   const [items, setItems] = useState(data.items);
@@ -48,7 +48,8 @@ export function PickList({ data, canPick }) {
   const finish = useFetcher();
   const inputRef = useRef(null);
   const rowRefs = useRef({});
-  const pickable = canPick && ["open", "picking"].includes(batch.status);
+  // lock: a release date still to come, or a higher-priority batch to pick first
+  const pickable = canPick && ["open", "picking"].includes(batch.status) && !lock;
 
   useEffect(() => {
     setItems(data.items);
@@ -122,6 +123,8 @@ export function PickList({ data, canPick }) {
         {batch.shipments} shipments · {units} units · {items.length} different items, sorted by bin · printed {fmtDate(new Date().toISOString(), true)}
         {batch.pickedAt ? ` · picked ${fmtDate(batch.pickedAt, true)}${batch.pickedBy ? ` by ${batch.pickedBy}` : ""}` : ""}
       </div>
+
+      {lock && ["open", "picking"].includes(batch.status) && <LockNote text={lock} />}
 
       {/* Progress */}
       <div className="sh-noprint" style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>

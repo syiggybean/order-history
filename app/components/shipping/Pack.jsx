@@ -1,7 +1,7 @@
 import { useContext, useEffect, useRef, useState } from "react";
 import { MethodBadge } from "./MethodBadge";
 import { useFetcher, useRevalidator } from "react-router";
-import { StatusPill, batchTitle } from "./Batches";
+import { LockNote, StatusPill, batchTitle } from "./Batches";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "./Notice";
 import { BulkLabelsButton, PackagePanel, packageText } from "./Packages";
 import { BulkLabelsPanel, LabelActions } from "./Labels";
@@ -294,7 +294,9 @@ function LabelPanel({ box: b, batchId, label, sandbox, canShip, canPrint, buying
   );
 }
 
-export function PackStation({ data, boxData, can, sandbox = false }) {
+export function PackStation({ data, boxData, can: canIn, sandbox = false, lock = null }) {
+  // lock: a release date still to come, or a higher-priority batch to pack first
+  const can = lock ? { ...canIn, pack: false, override: false } : canIn;
   const go = useParamSetter();
   const revalidator = useRevalidator();
   const { batch, boxes, totals } = data;
@@ -619,6 +621,7 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
         </div>
       )}
 
+      {lock && data.canPack && <LockNote text={lock} />}
       {!data.canPack ? (
         <NotPickedYet batch={batch} canPick={can.pick} />
       ) : (

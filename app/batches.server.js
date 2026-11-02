@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import db from "./db.server";
 import { PACKED_TAG, bulkLabelQuery } from "./pack.server";
-import { dayInStore, errorMessage, gql, TIME_ZONE } from "./preorders.server";
+import { dayInStore, errorMessage, gql, TIME_ZONE, todayInStore } from "./preorders.server";
 import { pushBins, syncAllBins } from "./bins-sync.server";
 import {
   ShippingError,
@@ -63,10 +64,11 @@ async function batchCount(batchId) {
 
 // Moves ready shipments into a batch. Only shipments that are still ready and
 // not in a batch move (someone else may have batched them a moment ago).
-async function assign(shop, batch, ids) {
+// from: "waiting" too for upcoming releases (batched ahead of their release date)
+async function assign(shop, batch, ids, { from = ["ready"] } = {}) {
   if (!ids.length) return 0;
   const r = await db.shipment.updateMany({
-    where: { shop, id: { in: ids }, state: "ready", batchId: null },
+    where: { shop, id: { in: ids }, state: { in: from }, batchId: null },
     data: { state: "batched", batchId: batch.id, flag: null },
   });
   return r.count;
@@ -189,6 +191,82 @@ export async function assignableStaff(shop) {
     .filter((m) => m.pick || m.pack);
 }
 
+// ---------------------------------------------------------------------------
+// Priority: assigned pickers and packers work their highest-priority batches first
+// ---------------------------------------------------------------------------
+
+export const PRIORITIES = [
+  { value: 3, label: "Urgent" },
+  { value: 2, label: "High" },
+  { value: 1, label: "Normal" },
+  { value: 0, label: "Low" },
+];
+export const priorityLabel = (p) => PRIORITIES.find((x) => x.value === p)?.label ?? "Normal";
+
+export async function setBatchPriority(shop, batchId, priority, user) {
+  const batch = await db.batch.findFirst({ where: { shop, id: Number(batchId) } });
+  if (!batch) throw new ShippingError("That batch couldn't be found.");
+  const p = Number(priority);
+  if (!PRIORITIES.some((x) => x.value === p)) throw new ShippingError("Pick Urgent, High, Normal or Low.");
+  if (p === batch.priority) return { priority: p };
+  await db.batch.update({ where: { id: batch.id }, data: { priority: p } });
+  await logEvent(shop, { batchId: batch.id, type: "batch_priority", detail: `${batch.tag}: ${priorityLabel(batch.priority)} → ${priorityLabel(p)}`, user });
+  return { priority: p };
+}
+
+// Statuses where a batch still needs picking / packing
+const TO_PICK = ["open", "picking"];
+const TO_PACK = ["open", "picking", "picked", "packing"];
+
+// Batches held for a release date (batched ahead of it): { batchId: latest release day }
+async function releaseHolds(shop, batchIds, today = todayInStore()) {
+  if (!batchIds.length) return new Map();
+  const rows = await db.shipment.groupBy({
+    by: ["batchId"],
+    where: { shop, batchId: { in: batchIds }, state: "batched", releaseDay: { gt: today } },
+    _max: { releaseDay: true },
+  });
+  return new Map(rows.map((r) => [r.batchId, r._max.releaseDay]));
+}
+
+const prettyDay = (day) =>
+  new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
+
+// What stops this person picking / packing each of these batches right now:
+//   - a release date still to come (unless they may pick early)
+//   - a higher-priority batch assigned to them that still needs that step
+//     (Urgent before High before Normal before Low; same level, any order)
+// Returns Map(batchId -> { pick: reason | null, pack: reason | null, releaseDay })
+export async function batchLocks(shop, batches, user, { early = false } = {}) {
+  const out = new Map();
+  if (!batches.length) return out;
+  const staffId = user?.id ?? null;
+  const mine = staffId == null ? [] : (await db.batch.findMany({ where: { shop, status: { in: TO_PACK } }, take: 1000 })).filter((b) => isAssignedTo(b, staffId));
+  const holds = await releaseHolds(shop, [...new Set([...batches.map((b) => b.id), ...mine.map((b) => b.id)])]);
+  const firstAbove = (b, statuses) =>
+    mine
+      .filter((m) => m.id !== b.id && statuses.includes(m.status) && (m.priority ?? 1) > (b.priority ?? 1) && (early || !holds.has(m.id)))
+      .sort((x, y) => y.priority - x.priority || x.number - y.number)[0];
+  for (const b of batches) {
+    const releaseDay = holds.get(b.id) ?? null;
+    const held = releaseDay && !early ? `Pre-orders in this batch release ${prettyDay(releaseDay)}; it can be picked and packed from then.` : null;
+    const above = (statuses) => {
+      const m = firstAbove(b, statuses);
+      return m ? `${m.tag}${m.name ? ` (${m.name})` : ""} is ${priorityLabel(m.priority)} priority: finish it first.` : null;
+    };
+    out.set(b.id, { pick: held ?? above(TO_PICK), pack: held ?? above(TO_PACK), releaseDay });
+  }
+  return out;
+}
+
+export const getBatchRow = (shop, batchId) => db.batch.findFirst({ where: { shop, id: Number(batchId) } });
+
+export async function batchLock(shop, batchId, user, opts) {
+  const b = await db.batch.findFirst({ where: { shop, id: Number(batchId) } });
+  if (!b) return { pick: null, pack: null, releaseDay: null };
+  return (await batchLocks(shop, [b], user, opts)).get(b.id);
+}
+
 export async function renameBatch(shop, batchId, name, user) {
   const batch = await db.batch.findFirst({ where: { shop, id: Number(batchId) } });
   if (!batch) throw new ShippingError("That batch couldn't be found.");
@@ -213,6 +291,7 @@ const viewBatch = (b, stats) => ({
   name: b.name,
   source: b.source,
   status: b.status,
+  priority: b.priority ?? 1,
   createdBy: b.createdBy,
   createdAt: b.createdAt.toISOString(),
   pickedAt: b.pickedAt?.toISOString() ?? null,
@@ -249,6 +328,8 @@ export async function listBatches(shop, { show = "live", onlyFor = null } = {}) 
   const status = show === "cancelled" ? ["cancelled"] : show === "done" ? ["done"] : LIVE;
   let batches = await db.batch.findMany({ where: { shop, status: { in: status } }, orderBy: { number: show === "live" ? "asc" : "desc" }, take: 500 });
   if (onlyFor != null) batches = batches.filter((b) => isAssignedTo(b, onlyFor));
+  // To ship: highest priority first, then oldest batch
+  if (show === "live") batches.sort((a, b) => (b.priority ?? 1) - (a.priority ?? 1) || a.number - b.number);
   batches = batches.slice(0, 200);
   const stats = await statsFor(batches.map((b) => b.id));
   return batches.map((b) => viewBatch(b, stats.get(b.id)));
@@ -502,56 +583,166 @@ async function syncPackedTags(shop, admin, room) {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-batching
-//   Single items: shipments of exactly one unit of one item. An item with more
-//   than `autoSingleMin` of them ready gets its own "<item> singles" batch
-//   (several if over 250). Its open singles batch is topped up first.
+// Auto-batching (oldest orders first; orders flagged for review wait)
+//   Single items: one unit of one item. An item with more than `autoSingleMin`
+//     of them gets its own "<item> singles" batch (topped up first if one's open).
+//   Identical orders: exactly the same items and quantities, at least
+//     `autoIdenticalMin` of them: "<items> identical".
+//   Multiples: orders sharing one "anchor" item (the most common first), each with
+//     at most `autoMultiMaxOther` other units, at most `autoMultiMaxItems`
+//     different items per batch, at least `autoMultiMin` orders: "<anchor> multiples".
+//   Upcoming releases: the same rules for pre-orders releasing within
+//     `autoReleaseDays`, batched ahead (picking waits for the release date).
+// Batches hold up to 250; bigger groups are split.
 // ---------------------------------------------------------------------------
 
-export async function runAutoBatch(shop, user = null, { manual = true } = {}) {
-  const settings = await getShippingSettings(shop);
-  const made = [];
+const shortHash = (t) => createHash("sha1").update(String(t)).digest("hex").slice(0, 12);
+const addDays = (day, n) => {
+  const d = new Date(`${day}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+const shortDay = (day) => new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
+const clip = (t, n = 60) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
+
+// Puts a group into batches: tops up an open batch of the same kind first (if allowed),
+// then new batches of up to 250
+async function place(shop, made, { source, name, ids, user, topUp = true, from }) {
+  let rest = ids;
+  const open = topUp ? await db.batch.findMany({ where: { shop, source, status: "open" }, orderBy: { number: "asc" } }) : [];
+  for (const b of open) {
+    if (!rest.length) break;
+    const room = MAX_BATCH - (await batchCount(b.id));
+    if (room <= 0) continue;
+    const added = await assign(shop, b, rest.slice(0, room), { from });
+    rest = rest.slice(room);
+    if (added) made.push({ id: b.id, tag: b.tag, name: b.name, added, topUp: true });
+  }
+  const parts = chunk(rest, MAX_BATCH);
+  const earlier = topUp ? open.length : await db.batch.count({ where: { shop, source } });
+  for (const [i, part] of parts.entries()) {
+    const n = earlier + i + 1;
+    const batch = await newBatch(shop, { name: `${name}${parts.length > 1 || earlier ? ` ${n}` : ""}`, source, user });
+    const added = await assign(shop, batch, part, { from });
+    made.push({ id: batch.id, tag: batch.tag, name: batch.name, added });
+  }
+}
+
+const rowsOf = (list) => list.map((s) => ({ ...s, items: json(s.lines, []) }));
+
+// Groups one pool of shipments by the rules that are on. release: the release day
+// (for names), and the shipments come from the Waiting list.
+async function batchPool(shop, settings, pool, made, { user, release = null }) {
+  let left = pool.filter((s) => s.items.length && s.items.every((l) => l.quantity > 0));
+  const tag = release ? ` · releases ${shortDay(release.until)}` : "";
+  const prefix = release ? "auto:release:" : "auto:";
+  const from = release ? ["waiting"] : ["ready"];
+  const take = (ids) => {
+    const gone = new Set(ids);
+    left = left.filter((s) => !gone.has(s.id));
+  };
+
+  // 1. Single items
   if (settings.autoSingleItem) {
     const min = settings.autoSingleMin ?? 50;
-    const ready = await db.shipment.findMany({
-      where: { shop, state: "ready", batchId: null, units: 1 },
-      orderBy: shipmentOrder("oldest"),
-      select: { id: true, lines: true, orderId: true },
-    });
-    // Orders flagged for review wait until the flag is resolved
-    const flagged = new Set(
-      (await db.orderFlag.findMany({ where: { shop, status: "open" }, select: { orderId: true } })).map((f) => f.orderId),
-    );
     const groups = new Map();
-    for (const s of ready) {
-      if (flagged.has(s.orderId)) continue;
-      const lines = json(s.lines, []);
-      if (lines.length !== 1 || lines[0].quantity !== 1) continue;
-      const k = itemKey(lines[0]);
-      const g = groups.get(k) ?? { key: k, label: lineLabel(lines[0]), ids: [] };
+    for (const s of left) {
+      if (s.items.length !== 1 || s.items[0].quantity !== 1) continue;
+      const k = itemKey(s.items[0]);
+      const g = groups.get(k) ?? { key: k, label: lineLabel(s.items[0]), ids: [] };
       g.ids.push(s.id);
       groups.set(k, g);
     }
     for (const g of groups.values()) {
       if (g.ids.length <= min) continue;
-      const source = `auto:singles:${g.key}`;
-      let ids = g.ids;
-      // Top up this item's open singles batch first
-      const open = await db.batch.findMany({ where: { shop, source, status: "open" }, orderBy: { number: "asc" } });
-      for (const b of open) {
-        if (!ids.length) break;
-        const room = MAX_BATCH - (await batchCount(b.id));
-        if (room <= 0) continue;
-        const added = await assign(shop, b, ids.slice(0, room));
-        ids = ids.slice(room);
-        if (added) made.push({ id: b.id, tag: b.tag, name: b.name, added, topUp: true });
+      await place(shop, made, { source: `${prefix}singles:${g.key}`, name: `${g.label} singles${tag}`, ids: g.ids, user, from });
+      take(g.ids);
+    }
+  }
+
+  // 2. Identical orders
+  if (settings.autoIdentical) {
+    const min = settings.autoIdenticalMin ?? 10;
+    const groups = new Map();
+    for (const s of left) {
+      // Single-item orders belong to the singles rule (and its minimum) when that's on
+      if (settings.autoSingleItem && s.items.length === 1 && s.items[0].quantity === 1) continue;
+      const parts = s.items.map((l) => ({ k: itemKey(l), q: l.quantity, label: lineLabel(l) })).sort((x, y) => x.k.localeCompare(y.k));
+      const key = parts.map((p) => `${p.k}×${p.q}`).join("+");
+      const g = groups.get(key) ?? { key, label: parts.map((p) => `${p.q > 1 ? `${p.q} × ` : ""}${p.label}`).join(" + "), ids: [] };
+      g.ids.push(s.id);
+      groups.set(key, g);
+    }
+    for (const g of groups.values()) {
+      if (g.ids.length < min) continue;
+      await place(shop, made, { source: `${prefix}identical:${shortHash(g.key)}`, name: `${clip(g.label)} identical${tag}`, ids: g.ids, user, from });
+      take(g.ids);
+    }
+  }
+
+  // 3. Multiples: around the most common anchor item
+  if (settings.autoMultiples) {
+    const min = settings.autoMultiMin ?? 20;
+    const maxOther = settings.autoMultiMaxOther ?? 3;
+    const maxItems = settings.autoMultiMaxItems ?? 25;
+    let candidates = left.filter((s) => s.items.reduce((n, l) => n + l.quantity, 0) >= 2);
+    for (let round = 0; round < 200 && candidates.length >= min; round++) {
+      const counts = new Map();
+      for (const s of candidates) for (const k of new Set(s.items.map(itemKey))) counts.set(k, (counts.get(k) ?? 0) + 1);
+      const anchors = [...counts.entries()].filter(([, n]) => n >= min).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      let done = false;
+      for (const [anchor] of anchors) {
+        const chosen = [];
+        const items = new Set([anchor]);
+        let label = null;
+        for (const s of candidates) {
+          const a = s.items.filter((l) => itemKey(l) === anchor);
+          if (!a.length) continue;
+          const units = s.items.reduce((n, l) => n + l.quantity, 0);
+          const anchorUnits = a.reduce((n, l) => n + l.quantity, 0);
+          if (units - anchorUnits > maxOther) continue;
+          const extra = [...new Set(s.items.map(itemKey))].filter((k) => !items.has(k));
+          if (items.size + extra.length > maxItems) continue;
+          extra.forEach((k) => items.add(k));
+          label = label ?? lineLabel(a[0]);
+          chosen.push(s.id);
+        }
+        if (chosen.length < min) continue;
+        await place(shop, made, { source: `${prefix}multi:${anchor}`, name: `${label} multiples${tag}`, ids: chosen, user, from, topUp: false });
+        const gone = new Set(chosen);
+        candidates = candidates.filter((s) => !gone.has(s.id));
+        take(chosen);
+        done = true;
+        break;
       }
-      const parts = chunk(ids, MAX_BATCH);
-      for (const [i, part] of parts.entries()) {
-        const name = `${g.label} singles${parts.length > 1 || open.length ? ` ${open.length + i + 1}` : ""}`;
-        const batch = await newBatch(shop, { name, source, user });
-        const added = await assign(shop, batch, part);
-        made.push({ id: batch.id, tag: batch.tag, name: batch.name, added });
+      if (!done) break;
+    }
+  }
+}
+
+export async function runAutoBatch(shop, user = null, { manual = true } = {}) {
+  const settings = await getShippingSettings(shop);
+  const made = [];
+  const anyRule = settings.autoSingleItem || settings.autoIdentical || settings.autoMultiples;
+  if (anyRule) {
+    // Orders flagged for review wait until the flag is resolved
+    const flagged = new Set((await db.orderFlag.findMany({ where: { shop, status: "open" }, select: { orderId: true } })).map((f) => f.orderId));
+    const pick = { id: true, lines: true, orderId: true, releaseDay: true };
+    const ready = await db.shipment.findMany({ where: { shop, state: "ready", batchId: null }, orderBy: shipmentOrder("oldest"), select: pick });
+    await batchPool(shop, settings, rowsOf(ready.filter((s) => !flagged.has(s.orderId))), made, { user });
+    // Upcoming releases: pre-orders (and nothing else holding them) releasing within N days
+    if (settings.autoRelease) {
+      const today = todayInStore();
+      const until = addDays(today, Math.max(0, settings.autoReleaseDays ?? 3));
+      const soon = await db.shipment.findMany({
+        where: { shop, state: "waiting", batchId: null, releaseDay: { gt: today, lte: until }, waitingReason: { startsWith: "Pre-order" } },
+        orderBy: shipmentOrder("oldest"),
+        select: pick,
+      });
+      const pool = rowsOf(soon.filter((s) => !flagged.has(s.orderId)));
+      // One pass per release day, so a batch is released all at once
+      for (const day of [...new Set(pool.map((s) => s.releaseDay))].sort()) {
+        await batchPool(shop, settings, pool.filter((s) => s.releaseDay === day), made, { user, release: { until: day } });
       }
     }
   }
@@ -559,9 +750,7 @@ export async function runAutoBatch(shop, user = null, { manual = true } = {}) {
   const total = made.reduce((n, b) => n + b.added, 0);
   await logEvent(shop, {
     type: "auto_batch",
-    detail: made.length
-      ? made.map((b) => `${b.tag} "${b.name}": ${b.topUp ? "+" : ""}${b.added}`).join(", ")
-      : `Nothing to batch (no item had more than ${settings.autoSingleMin ?? 50} single-item shipments ready)`,
+    detail: made.length ? made.map((b) => `${b.tag} "${b.name}": ${b.topUp ? "+" : ""}${b.added}`).join(", ") : `Nothing to batch (no group met its minimum)`,
     user: user ?? { name: manual ? null : "Daily schedule" },
   });
   if (made.length) kick(shop);
@@ -586,19 +775,42 @@ export function autoBatchDue(settings, now = new Date()) {
   return !settings.lastAutoBatchAt || dayInStore(settings.lastAutoBatchAt) !== dayInStore(now);
 }
 
-export async function saveAutoBatchSettings(shop, { enabled, time, singles, min }, user) {
+const whole = (v, lo, hi, what) => {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n) || n < lo || n > hi) throw new ShippingError(`${what} must be a number from ${lo} to ${hi}.`);
+  return n;
+};
+
+export async function saveAutoBatchSettings(shop, f, user) {
+  const { enabled, time, singles, min } = f;
   const t = parseTime(time);
   if (t == null || t >= 24 * 60) throw new ShippingError("Pick a time like 07:00.");
-  const n = Math.round(Number(min));
-  if (!Number.isFinite(n) || n < 1 || n > 5000) throw new ShippingError("The minimum must be a number from 1 to 5000.");
   const before = await getShippingSettings(shop);
-  const data = { autoBatchEnabled: Boolean(enabled), autoBatchTime: String(time).padStart(5, "0"), autoSingleItem: Boolean(singles), autoSingleMin: n };
+  const data = {
+    autoBatchEnabled: Boolean(enabled),
+    autoBatchTime: String(time).padStart(5, "0"),
+    autoSingleItem: Boolean(singles),
+    autoSingleMin: whole(min, 1, 5000, "The single items minimum"),
+    autoIdentical: Boolean(f.identical),
+    autoIdenticalMin: whole(f.identicalMin ?? before.autoIdenticalMin ?? 10, 2, 5000, "The identical orders minimum"),
+    autoMultiples: Boolean(f.multiples),
+    autoMultiMin: whole(f.multiMin ?? before.autoMultiMin ?? 20, 2, 5000, "The multiples minimum"),
+    autoMultiMaxOther: whole(f.multiMaxOther ?? before.autoMultiMaxOther ?? 3, 0, 50, "Other items per order"),
+    autoMultiMaxItems: whole(f.multiMaxItems ?? before.autoMultiMaxItems ?? 25, 1, 500, "Different items per batch"),
+    autoRelease: Boolean(f.release),
+    autoReleaseDays: whole(f.releaseDays ?? before.autoReleaseDays ?? 3, 1, 60, "Days before release"),
+  };
   // Turning the schedule on after today's time has passed shouldn't fire straight away
   if (data.autoBatchEnabled && !before.autoBatchEnabled && storeMinutes(new Date()) >= t) data.lastAutoBatchAt = new Date();
   await db.shippingSettings.update({ where: { shop }, data });
+  const rules = [
+    data.autoSingleItem ? `single items (more than ${data.autoSingleMin})` : null,
+    data.autoIdentical ? `identical orders (at least ${data.autoIdenticalMin})` : null,
+    data.autoMultiples ? `multiples (at least ${data.autoMultiMin}; ≤${data.autoMultiMaxOther} other items each; ≤${data.autoMultiMaxItems} different items per batch)` : null,
+  ].filter(Boolean);
   await logEvent(shop, {
     type: "auto_batch_settings",
-    detail: `${data.autoBatchEnabled ? `Daily at ${data.autoBatchTime}` : "Schedule off"}; single items ${data.autoSingleItem ? `on (more than ${n})` : "off"}`,
+    detail: `${data.autoBatchEnabled ? `Daily at ${data.autoBatchTime}` : "Schedule off"}; ${rules.length ? rules.join(", ") : "no rules on"}${data.autoRelease ? `; upcoming releases within ${data.autoReleaseDays} day${data.autoReleaseDays === 1 ? "" : "s"}` : ""}`,
     user,
   });
 }

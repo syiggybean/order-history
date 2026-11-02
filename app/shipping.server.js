@@ -364,6 +364,16 @@ export function preorderLines(s, today, products = {}) {
     .filter(Boolean);
 }
 
+// The latest release date still to come among its items ("YYYY-MM-DD"), or null
+export function releaseDayOf(s, today, products = {}) {
+  let day = null;
+  for (const l of linesOf(s)) {
+    const r = products[l.productId]?.release;
+    if (r && r > today && (!day || r > day)) day = r;
+  }
+  return day;
+}
+
 const PRODUCT_INFO = `#graphql
   query ($ids: [ID!]!) {
     nodes(ids: $ids) {
@@ -391,7 +401,9 @@ export async function loadProductInfo(admin, productIds) {
 
 // Works out which shipments are ready, oldest orders first, and flags batched
 // shipments whose stock has gone. Pure: takes shipments and stock, returns changes.
-export function allocate(shipments, stock, now = new Date(), products = {}) {
+// aheadBatchIds: batches made ahead of a release (auto-batching upcoming releases):
+// "not released yet" is expected there, so it isn't flagged
+export function allocate(shipments, stock, now = new Date(), products = {}, { aheadBatchIds = new Set() } = {}) {
   const free = { ...stock };
   const key = (l, s) => `${l.inventoryItemId}|${s.locationId}`;
   const take = (s) => {
@@ -416,8 +428,12 @@ export function allocate(shipments, stock, now = new Date(), products = {}) {
   // Batched work keeps its claim on stock; if the stock isn't there, flag it
   // (Boxes whose label is already bought were fulfilled in Shopify: their stock has left)
   for (const s of shipments.filter((x) => ["batched", "packed", "labeling"].includes(x.state) && x.labelStatus !== "bought").sort(byAge)) {
-    const short = take(s);
-    const pre = preorderLines(s, today, products);
+    const releaseDay = releaseDayOf(s, today, products);
+    const pre = releaseDay && aheadBatchIds.has(s.batchId) ? [] : preorderLines(s, today, products);
+    // Batched ahead of its release (auto-batching upcoming releases): it claims stock from
+    // its release date, so it doesn't hold back orders that can ship now
+    const short = releaseDay && s.state === "batched" ? null : take(s);
+    if (releaseDay !== (s.releaseDay ?? null)) changes.set(s.id, { ...(changes.get(s.id) ?? {}), releaseDay });
     const flag =
       [
         pre.length ? `Not released yet: ${pre.join(", ")}` : null,
@@ -427,7 +443,7 @@ export function allocate(shipments, stock, now = new Date(), products = {}) {
         .join(". ") || null;
     const ours = (f) => !f || f.startsWith("Not enough stock") || f.startsWith("Not released yet");
     // Packed boxes have their items already; only flag work not yet packed
-    if (s.state === "batched" && flag !== s.flag && ours(s.flag)) changes.set(s.id, { flag });
+    if (s.state === "batched" && flag !== s.flag && ours(s.flag)) changes.set(s.id, { ...(changes.get(s.id) ?? {}), flag });
   }
 
   for (const s of shipments.filter((x) => x.state === "waiting" || x.state === "ready").sort(byAge)) {
@@ -441,11 +457,13 @@ export function allocate(shipments, stock, now = new Date(), products = {}) {
       if (short) reason = `Needs ${short.map((x) => `${x.need} more × ${lineLabel(x.line)}`).join(", ")}`;
     }
     const state = reason ? "waiting" : "ready";
-    if (state !== s.state || reason !== s.waitingReason) {
+    const releaseDay = releaseDayOf(s, today, products);
+    if (state !== s.state || reason !== s.waitingReason || releaseDay !== (s.releaseDay ?? null)) {
       changes.set(s.id, {
         state,
         waitingReason: reason,
         readyAt: state === "ready" ? (s.readyAt ?? now) : null,
+        releaseDay,
       });
     }
   }
@@ -457,7 +475,8 @@ export async function refreshReadiness(shop, admin) {
   const items = shipments.flatMap((s) => linesOf(s).filter((l) => l.tracked && l.inventoryItemId).map((l) => l.inventoryItemId));
   const stock = items.length ? await loadStock(admin, items) : {};
   const products = await loadProductInfo(admin, shipments.flatMap((s) => linesOf(s).map((l) => l.productId)));
-  const { changes } = allocate(shipments, stock, new Date(), products);
+  const ahead = new Set((await db.batch.findMany({ where: { shop, source: { startsWith: "auto:release:" } }, select: { id: true } })).map((b) => b.id));
+  const { changes } = allocate(shipments, stock, new Date(), products, { aheadBatchIds: ahead });
   for (const [id, data] of changes) await db.shipment.update({ where: { id }, data });
   await db.shippingSettings.update({ where: { shop }, data: { lastReadyRunAt: new Date() } });
   return { checked: shipments.length, changed: changes.size, stock };
@@ -634,7 +653,11 @@ export async function withFlags(shop, shipments) {
   return shipments.map((s) => ({ ...s, review: byOrder.get(s.orderId) ?? [] }));
 }
 
-// filter: { state, q, product, variant, method, country, batchId, singles, doubles, pair, sort: oldest | newest }
+// Product ids for "also contains" (combinations), cleaned: Shopify product GIDs only, up to 5
+export const comboIds = (ids) =>
+  [...new Set((Array.isArray(ids) ? ids : String(ids ?? "").split(",")).map((x) => String(x).trim()).filter((x) => /^gid:\/\/shopify\/Product\/\d+$/.test(x)))].slice(0, 5);
+
+// filter: { state, q, product, variant, with (more product ids: all of them too), method, country, batchId, singles, doubles, pair, sort: oldest | newest }
 //   singles: one unit in the box; doubles: two units (pair: "variantA|variantB", or "variantA" for two of one item)
 export function shipmentWhere(shop, filter = {}) {
   const where = { shop, state: filter.state ?? "ready" };
@@ -655,6 +678,8 @@ export function shipmentWhere(shop, filter = {}) {
   }
   const and = [];
   if (filter.product) and.push({ lines: { contains: `"productId":"${filter.product}"` } });
+  // Combinations: shipments that also contain every one of these products
+  for (const id of comboIds(filter.with)) and.push({ lines: { contains: `"productId":"${id}"` } });
   if (filter.variant) and.push({ lines: { contains: `"variantId":"${filter.variant}"` } });
   if (filter.singles) where.units = 1;
   else if (filter.doubles) {
@@ -670,14 +695,17 @@ export function shipmentWhere(shop, filter = {}) {
 
 // Products in shipments of one state, for the product filter's suggestions.
 // Matches the title, variant or SKU; titles that start with the text come first.
-export async function suggestProducts(shop, { q = "", state = "ready", singles = false, doubles = false, limit = 10 } = {}) {
+// withIds: only shipments that contain all of these products (building a combination),
+// and those products aren't suggested again
+export async function suggestProducts(shop, { q = "", state = "ready", singles = false, doubles = false, withIds = [], limit = 10 } = {}) {
   const text = String(q ?? "").trim().toLowerCase();
+  const already = comboIds(withIds);
   const rows = await db.shipment.findMany({
     where: {
       shop,
       state: ["ready", "waiting"].includes(state) ? state : "ready",
       ...(singles ? { units: 1 } : doubles ? { units: 2 } : {}),
-      ...(text ? { lines: { contains: text, mode: "insensitive" } } : {}),
+      AND: [...(text ? [{ lines: { contains: text, mode: "insensitive" } }] : []), ...already.map((id) => ({ lines: { contains: `"productId":"${id}"` } }))],
     },
     select: { lines: true },
     take: 5000,
@@ -686,7 +714,7 @@ export async function suggestProducts(shop, { q = "", state = "ready", singles =
   for (const r of rows) {
     const seen = new Set();
     for (const l of json(r.lines, [])) {
-      if (!l.productId || seen.has(l.productId)) continue;
+      if (!l.productId || seen.has(l.productId) || already.includes(l.productId)) continue;
       const hay = [l.title, l.variantTitle, l.sku].filter(Boolean).join(" ").toLowerCase();
       if (text && !hay.includes(text)) continue;
       seen.add(l.productId);
@@ -811,6 +839,14 @@ export async function shippingOverview(shop) {
       autoBatchTime: settings.autoBatchTime,
       autoSingleItem: settings.autoSingleItem,
       autoSingleMin: settings.autoSingleMin,
+      autoIdentical: settings.autoIdentical,
+      autoIdenticalMin: settings.autoIdenticalMin,
+      autoMultiples: settings.autoMultiples,
+      autoMultiMin: settings.autoMultiMin,
+      autoMultiMaxOther: settings.autoMultiMaxOther,
+      autoMultiMaxItems: settings.autoMultiMaxItems,
+      autoRelease: settings.autoRelease,
+      autoReleaseDays: settings.autoReleaseDays,
       lastAutoBatchAt: settings.lastAutoBatchAt?.toISOString() ?? null,
       packageStep: settings.packageStep,
       weightUnit: settings.weightUnit,
