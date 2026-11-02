@@ -368,30 +368,50 @@ export async function queueAll() {
 
 const CHUNK = 8 * 256 * 1024; // 2 MB (Google wants multiples of 256 KB)
 
+// One PUT to the upload address; with XMLHttpRequest (in the browser) so the
+// progress bar moves while a piece is on its way. Resolves { status, range, json }.
+function put(url, headers, body, onSent) {
+  if (typeof XMLHttpRequest === "undefined")
+    return fetch(url, { method: "PUT", headers, body }).then((r) => ({ status: r.status, range: r.headers.get("Range"), json: () => r.json() }));
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open("PUT", url);
+    for (const [k, v] of Object.entries(headers)) x.setRequestHeader(k, v);
+    if (onSent && x.upload) x.upload.onprogress = (e) => onSent(e.loaded);
+    x.onload = () => resolve({ status: x.status, range: x.getResponseHeader("Range"), json: async () => JSON.parse(x.responseText || "{}") });
+    x.onerror = () => reject(new Error("Network error"));
+    x.ontimeout = () => reject(new Error("Timed out"));
+    x.send(body ?? null);
+  });
+}
+
 // Sends one queued video to its Drive upload address, resuming where it left off.
 // Returns { done: fileId } or { expired: true } (start a new address) or throws.
-// onProgress(bytesSent, total) after each piece Google accepts.
+// onProgress(bytesSent, total, saved): as it goes; saved = Google has confirmed it
 export async function sendToDrive(item, onProgress) {
   const total = item.blob.size;
   // Where did Google get to?
   let offset = 0;
-  const probe = await fetch(item.uploadUrl, { method: "PUT", headers: { "Content-Range": `bytes */${total}` } });
+  const probe = await put(item.uploadUrl, { "Content-Range": `bytes */${total}` }, null);
   if (probe.status === 200 || probe.status === 201) return { done: (await probe.json()).id };
   if (probe.status === 404 || probe.status === 410) return { expired: true };
   if (probe.status === 308) {
     // (Some browsers can't read Google's Range header; then trust what this queue last sent)
-    const range = probe.headers.get("Range");
-    offset = range ? Number(range.split("-")[1]) + 1 : item.sent ?? 0;
+    offset = probe.range ? Number(probe.range.split("-")[1]) + 1 : item.sent ?? 0;
   }
+  onProgress?.(offset, total, false);
   while (offset < total) {
     const end = Math.min(offset + CHUNK, total);
-    const res = await fetch(item.uploadUrl, { method: "PUT", headers: { "Content-Range": `bytes ${offset}-${end - 1}/${total}` }, body: item.blob.slice(offset, end) });
-    if (res.status === 200 || res.status === 201) return { done: (await res.json()).id };
+    const from = offset;
+    const res = await put(item.uploadUrl, { "Content-Range": `bytes ${offset}-${end - 1}/${total}` }, item.blob.slice(offset, end), (n) => onProgress?.(Math.min(end, from + n), total, false));
+    if (res.status === 200 || res.status === 201) {
+      onProgress?.(total, total, true);
+      return { done: (await res.json()).id };
+    }
     if (res.status === 404 || res.status === 410) return { expired: true };
     if (res.status !== 308) throw new Error(`Google Drive answered ${res.status}`);
-    const range = res.headers.get("Range");
-    offset = range ? Number(range.split("-")[1]) + 1 : end;
-    onProgress?.(offset, total);
+    offset = res.range ? Number(res.range.split("-")[1]) + 1 : end;
+    onProgress?.(offset, total, true);
   }
   throw new Error("Upload didn't finish");
 }

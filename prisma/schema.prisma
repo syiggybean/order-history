@@ -1375,6 +1375,8 @@ model PackVideo {
   driveFileId String?
   status      String    @default("uploading") // uploading | done | failed | replaced (a later packing) | skipped
   sizeBytes   Int?
+  // Uploaded so far (for the progress bar on the pack bench)
+  sentBytes   Int?
   seconds     Int?
   userName    String?
   error       String?

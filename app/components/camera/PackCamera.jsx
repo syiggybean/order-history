@@ -41,7 +41,7 @@ const LAYOUT = `
 }
 `;
 const clock = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-const mb = (n) => `${(n / 1024 / 1024).toFixed(1)} MB`;
+const mb = (n) => (n < 1024 * 1024 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
 
 function beep(ok) {
   try {
@@ -56,6 +56,54 @@ function beep(ok) {
   } catch {
     // no sound
   }
+}
+
+// The video upload: a progress bar while it goes, then "Saved" for a while
+function UploadStatus({ sending, uploads, lastSaved, error }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!lastSaved) return undefined;
+    const t = setTimeout(() => tick((n) => n + 1), 15_000);
+    return () => clearTimeout(t);
+  }, [lastSaved]);
+  const item = sending ? uploads.find((u) => u.id === sending.id) : null;
+  const waiting = uploads.length - (sending ? 1 : 0);
+  const recentlySaved = lastSaved && Date.now() - lastSaved.at < 15_000;
+  if (!item && !recentlySaved && !waiting) return null;
+  const card = { marginTop: "12px", padding: "10px 12px", borderRadius: "10px", border: "1px solid #e3e3e3", background: "#fafafa" };
+  if (item) {
+    const pct = sending.pct ?? 0;
+    return (
+      <div style={card} role="status" aria-live="polite">
+        <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "13px" }}>
+          <strong>
+            Uploading {item.orderName}
+            {item.part ? ` (${item.part})` : ""} to Google Drive
+          </strong>
+          <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>{pct}%</span>
+        </div>
+        <div aria-hidden="true" style={{ height: "10px", borderRadius: "999px", background: "#e3e3e3", overflow: "hidden", margin: "8px 0 6px" }}>
+          <div style={{ height: "100%", width: `${pct}%`, background: "#1a7f37", borderRadius: "999px", transition: "width 0.3s ease" }} />
+        </div>
+        <div style={{ color: "#616161", fontSize: "12px" }}>
+          {sending.total ? `${mb(sending.sent ?? 0)} of ${mb(sending.total)}` : "Starting…"}
+          {waiting > 0 ? ` · ${waiting} more waiting` : ""} · Keep this page open until it's done.
+        </div>
+      </div>
+    );
+  }
+  if (recentlySaved)
+    return (
+      <div style={{ ...card, background: "#f1f8f5", borderColor: "#b4dfc4", color: "#1a5e20" }} role="status">
+        <strong>✓ Video saved to Google Drive</strong>
+        <div style={{ fontSize: "12px" }}>{lastSaved.fileName ?? lastSaved.orderName}</div>
+      </div>
+    );
+  return (
+    <div style={card} role="status">
+      {waiting} video{waiting === 1 ? "" : "s"} waiting to upload{error ? "" : "…"}
+    </div>
+  );
 }
 
 // The batch open at the bench: where packing is, and the boxes left to open
@@ -205,7 +253,7 @@ export function PackCamera({ k, userName }) {
       const r = await api(k, { intent: "scan", code, via });
       if (r?.ok) {
         beep(true);
-        setFlash({ ok: true, text: `Sent ${label ?? code} to the pack bench` });
+        setFlash({ ok: true, text: code.startsWith("seal:") ? "Packing complete ✓ The video uploads now." : `Sent ${label ?? code} to the pack bench` });
       } else {
         beep(false);
         setFlash({ ok: false, text: r?.error ?? "Not sent" });
@@ -298,6 +346,7 @@ export function PackCamera({ k, userName }) {
   // ---- Upload queue ------------------------------------------------------------
   const [sending, setSending] = useState(null); // { id, pct }
   const [uploadError, setUploadError] = useState(null);
+  const [lastSaved, setLastSaved] = useState(null); // { orderName, fileName, at }: shown for a while
   const working = useRef(false); // one upload at a time (not tied to re-renders)
   const mounted = useRef(true);
   useEffect(() => () => (mounted.current = false), []);
@@ -321,6 +370,7 @@ export function PackCamera({ k, userName }) {
               capped: Boolean(it.capped),
               clientNow: Date.now(), // so the app can allow for this computer's clock
               videoId: it.videoId ?? null,
+              sizeBytes: it.blob.size,
             });
             if (s.skip) {
               // Not the finished packing of the box (abandoned, or redone later): not uploaded
@@ -331,16 +381,26 @@ export function PackCamera({ k, userName }) {
             it = { ...it, uploadUrl: s.uploadUrl, videoId: s.videoId, fileName: s.fileName, sent: 0 };
             await queuePut(it);
           }
-          const r = await sendToDrive(it, async (sent, total) => {
-            it = { ...it, sent };
-            await queuePut(it);
-            if (mounted.current) setSending({ id: it.id, pct: Math.round((sent / total) * 100) });
+          let told = 0; // last time the bench was told the progress
+          const r = await sendToDrive(it, async (sent, total, saved) => {
+            if (mounted.current) setSending({ id: it.id, pct: Math.round((sent / total) * 100), sent, total });
+            if (Date.now() - told > 1000 || sent === total) {
+              told = Date.now();
+              api(k, { intent: "uploadProgress", videoId: it.videoId, sentBytes: sent }).catch(() => {});
+            }
+            if (saved) {
+              it = { ...it, sent };
+              await queuePut(it);
+            }
           });
           if (r.done) {
             const d = await api(k, { intent: "uploadDone", videoId: it.videoId, driveFileId: r.done, sizeBytes: it.blob.size });
             if (!d?.ok && !d?.expired) throw new Error(d?.error ?? "The app didn't record the upload");
             await queueDelete(it.id);
-            if (mounted.current) setUploadError(null);
+            if (mounted.current) {
+              setUploadError(null);
+              setLastSaved({ orderName: it.orderName, part: it.part, fileName: it.fileName, at: Date.now() });
+            }
             break;
           }
           // The upload address expired: start again
@@ -427,11 +487,7 @@ export function PackCamera({ k, userName }) {
           </span>
         )}
         <span style={{ color: "#616161", fontSize: "13px" }}>
-          {uploads.length
-            ? sending
-              ? `Uploading ${uploads.find((u) => u.id === sending.id)?.orderName ?? ""} ${sending.pct}% · ${uploads.length} waiting`
-              : `${uploads.length} video${uploads.length === 1 ? "" : "s"} waiting to upload`
-            : "All videos uploaded"}
+          {uploads.length ? (sending ? `Uploading ${sending.pct}%` : `${uploads.length} video${uploads.length === 1 ? "" : "s"} waiting to upload`) : "All videos uploaded"}
         </span>
       </header>
       {(state?.driveProblem || uploadError) && (
@@ -494,7 +550,20 @@ export function PackCamera({ k, userName }) {
                   </li>
                 ))}
               </ul>
-              {box.state === "batched" && (
+              {box.state === "batched" && box.scanned >= box.units && (
+                <div style={{ margin: "0 0 10px", padding: "12px", borderRadius: "10px", background: "#fff4f6", border: `2px solid ${PINK}` }}>
+                  <strong style={{ display: "block", marginBottom: "4px" }}>Every item is scanned.</strong>
+                  <span style={{ color: "#616161", fontSize: "13px" }}>Seal the box in view of the camera, then:</span>
+                  <button
+                    type="button"
+                    onClick={() => send(`seal:${box.id}`, "barcode", "Packing complete")}
+                    style={{ display: "block", width: "100%", marginTop: "8px", padding: "12px", borderRadius: "999px", border: 0, background: "#303030", color: "#fff", fontWeight: 700, font: "inherit", fontSize: "15px", cursor: "pointer" }}
+                  >
+                    Packing complete ✓
+                  </button>
+                </div>
+              )}
+              {box.state === "batched" && box.scanned < box.units && (
                 <button
                   type="button"
                   onClick={matchByPhoto}
@@ -506,6 +575,7 @@ export function PackCamera({ k, userName }) {
               )}
             </>
           )}
+          <UploadStatus sending={sending} uploads={uploads} lastSaved={lastSaved} error={uploadError} />
           {state?.batch && (!box || box.state !== "batched") && <BatchBoxes batch={state.batch} openId={box?.id} onOpen={(b) => send(b.code, "barcode", b.orderName)} />}
         </aside>
       </main>

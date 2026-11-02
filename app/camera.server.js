@@ -77,7 +77,15 @@ export async function benchUnlink(shop, workShop, user) {
 // Videos for a box (shown on the bench)
 export async function videosFor(shop, shipmentId) {
   const rows = await db.packVideo.findMany({ where: { shop, shipmentId: Number(shipmentId), status: { in: ["uploading", "done", "failed"] } }, orderBy: { id: "desc" }, take: 5 });
-  return rows.map((v) => ({ id: v.id, status: v.status, fileName: v.fileName, url: driveFileUrl(v.driveFileId), at: v.createdAt.toISOString(), error: v.error }));
+  return rows.map((v) => ({
+    id: v.id,
+    status: v.status,
+    fileName: v.fileName,
+    url: driveFileUrl(v.driveFileId),
+    at: v.createdAt.toISOString(),
+    error: v.error,
+    pct: v.status === "done" ? 100 : v.sizeBytes ? Math.min(99, Math.round(((v.sentBytes ?? 0) / v.sizeBytes) * 100)) : null,
+  }));
 }
 
 // ---- The camera window (holds the secret link) -----------------------------
@@ -178,7 +186,7 @@ function videoFileName(s, mime) {
   return `${base}${part}.${extOf(mime)}`;
 }
 
-export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds, startedAt, endedAt = null, capped = false, clientNow = null, videoId = null }, origin) {
+export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds, startedAt, endedAt = null, capped = false, clientNow = null, videoId = null, sizeBytes = null }, origin) {
   const link = await linkFor(secret);
   if (isSandboxShop(link.workShop)) throw new CameraError("Sandbox: videos aren't uploaded.");
   const s = await db.shipment.findFirst({ where: { shop: link.workShop, id: Number(shipmentId) } });
@@ -200,7 +208,16 @@ export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds,
   const video = earlier
     ? await db.packVideo.update({ where: { id: earlier.id }, data: { status: "uploading", error: null } })
     : await db.packVideo.create({
-        data: { shop: link.shop, shipmentId: s.id, orderName: s.orderName, fileName, userName: link.userName, seconds: Number.isFinite(Number(seconds)) ? Math.round(Number(seconds)) : null },
+        data: {
+          shop: link.shop,
+          shipmentId: s.id,
+          orderName: s.orderName,
+          fileName,
+          userName: link.userName,
+          seconds: Number.isFinite(Number(seconds)) ? Math.round(Number(seconds)) : null,
+          sizeBytes: Number(sizeBytes) > 0 ? Math.round(Number(sizeBytes)) : null,
+          sentBytes: 0,
+        },
       });
   try {
     const uploadUrl = await startDriveUpload({ name: fileName, mimeType: mime, description, origin, replaceId: saved?.driveFileId ?? null });
@@ -209,6 +226,13 @@ export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds,
     await db.packVideo.update({ where: { id: video.id }, data: { status: "failed", error: String(e.message).slice(0, 300) } });
     throw new CameraError(e.message);
   }
+}
+
+// How far the upload has got (the pack bench shows a progress bar)
+export async function cameraUploadProgress(secret, { videoId, sentBytes }) {
+  const link = await linkFor(secret);
+  await db.packVideo.updateMany({ where: { id: Number(videoId), shop: link.shop, status: "uploading" }, data: { sentBytes: Math.max(0, Math.round(Number(sentBytes) || 0)) } });
+  return { ok: true };
 }
 
 export async function cameraUploadDone(secret, { videoId, driveFileId, sizeBytes, error }) {

@@ -10,28 +10,51 @@ import { SlipPrintButton, ThisComputer } from "./Printing";
 import { PackCameraBar, usePackCamera } from "./PackCameraLink";
 import { PINK, ProductName, box, cell, head, input, muted, pill, small, ProductThumb, useParamSetter } from "./ui";
 
-// The pack camera's video of this box: recording, uploading, saved (with a link), or failed
-function BoxVideo({ boxId, batchId, state }) {
+// The pack camera's video of this box, for its latest packing only (a repacked box
+// starts again): recording, waiting, uploading (with a progress bar), saved, or failed
+function BoxVideo({ boxId, batchId, state, packedAt, connected }) {
   const f = useFetcher();
   const fRef = useRef(f); // the latest fetcher (the interval outlives renders)
   fRef.current = f;
+  const data = f.data?.intent === "boxVideos" && f.data.shipmentId === boxId ? f.data : null;
+  const since = packedAt ? Date.parse(packedAt) - 5000 : 0;
+  const v = state === "batched" ? null : (data?.videos ?? []).find((x) => Date.parse(x.at) >= since) ?? null;
+  const settled = state === "batched" || v?.status === "done" || v?.status === "failed";
   useEffect(() => {
+    if (state === "batched") return undefined; // nothing to look up while packing
     const load = () => fRef.current.state === "idle" && fRef.current.submit({ intent: "boxVideos", id: String(batchId), shipmentId: String(boxId) }, { method: "post" });
     load();
-    const t = setInterval(load, 8000);
+    // Quickly while the video is on its way, then now and then
+    const t = setInterval(load, settled ? 15000 : 1500);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [boxId, state]);
-  const v = f.data?.intent === "boxVideos" && f.data.shipmentId === boxId ? f.data.videos?.[0] : null;
-  if (!v) return null; // still recording, or not recorded
+  }, [boxId, state, packedAt, settled]);
+  const tag = { ...small, display: "inline-flex", alignItems: "center", gap: "6px" };
+  if (state === "batched")
+    return connected ? (
+      <span style={{ ...tag, color: "#c70a24", fontWeight: 600 }}>
+        <span aria-hidden="true">●</span> Recording
+      </span>
+    ) : null;
+  // Packed a while ago with no video (e.g. before the camera was linked): nothing to show
+  if (!v) return packedAt && Date.now() - Date.parse(packedAt) < 3 * 60 * 1000 ? <span style={tag}>🎥 Video on its way…</span> : null;
   if (v.status === "done")
     return (
-      <a href={v.url} target="_blank" rel="noreferrer" style={{ ...small, color: "#1a5e20", fontWeight: 600 }}>
+      <a href={v.url} target="_blank" rel="noreferrer" style={{ ...tag, color: "#1a5e20", fontWeight: 600 }}>
         🎥 Video saved ↗
       </a>
     );
-  if (v.status === "failed") return <span style={{ ...small, color: "#b42318" }} title={v.error ?? ""}>⚠ Video upload failed (the camera window retries)</span>;
-  return <span style={small}>🎥 Uploading video…</span>;
+  if (v.status === "failed") return <span style={{ ...tag, color: "#b42318" }} title={v.error ?? ""}>⚠ Video upload failed (the camera retries)</span>;
+  const pct = v.pct ?? 0;
+  return (
+    <span style={tag} role="status" aria-label={`Uploading video ${pct}%`}>
+      🎥 Uploading
+      <span aria-hidden="true" style={{ width: "90px", height: "8px", borderRadius: "999px", background: "#e3e3e3", overflow: "hidden", display: "inline-block" }}>
+        <span style={{ display: "block", height: "100%", width: `${pct}%`, background: "#1a7f37", transition: "width 0.4s ease" }} />
+      </span>
+      <span style={{ fontVariantNumeric: "tabular-nums" }}>{pct}%</span>
+    </span>
+  );
 }
 
 // Short beeps so packers can scan without looking at the screen
@@ -431,7 +454,15 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
     const next = queue.current.shift();
     const c = typeof next === "string" ? next : next.code;
     const via = typeof next === "string" ? "barcode" : next.via;
-    if (current && current.state === "batched") scanner.submit({ intent: "packScan", id: String(batch.id), shipmentId: String(current.id), code: c, via }, { method: "post" });
+    // "Packing complete" (from the button here, or the camera window)
+    if (c.startsWith("seal:")) {
+      if (current && current.state === "batched" && c === `seal:${current.id}`) scanner.submit({ intent: "sealBox", id: String(batch.id), shipmentId: String(current.id) }, { method: "post" });
+      else pump();
+      return;
+    }
+    // With the pack camera recording, the last scan waits for "Packing complete" (so the video shows the box sealed)
+    const holdForSeal = camRef.current?.cameras?.some((x) => x.connected) ? "1" : "";
+    if (current && current.state === "batched") scanner.submit({ intent: "packScan", id: String(batch.id), shipmentId: String(current.id), code: c, via, holdForSeal }, { method: "post" });
     else if (!c.startsWith("line:")) scanner.submit({ intent: "findBox", id: String(batch.id), code: c }, { method: "post" });
     else pump();
   };
@@ -446,6 +477,8 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
       pump();
     },
   });
+  const camRef = useRef(cam);
+  camRef.current = cam;
   useEffect(pump, [scanner.state]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const r = scanner.data;
@@ -457,7 +490,7 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
         beep(false);
       }
     }
-    if (r.intent === "packScan") {
+    if (r.intent === "packScan" || r.intent === "sealBox") {
       if (r.switchTo) {
         openBox(r.switchTo);
         return;
@@ -469,8 +502,29 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
       }
       if (r.ok) {
         beep(true);
-        setCurrent((b) => (b ? { ...b, lines: b.lines.map((l) => (l.key === r.key ? { ...l, scanned: r.scanned } : l)), scanned: b.scanned + 1, state: r.complete ? "packed" : b.state } : b));
-        setLast({ ok: true, key: r.key, text: r.complete ? "Packed ✓ Every item scanned. Scan the next packing slip." : `${r.title}: ${r.scanned} of ${r.qty}` });
+        const sealed = r.intent === "sealBox";
+        setCurrent((b) =>
+          b
+            ? {
+                ...b,
+                lines: sealed ? b.lines : b.lines.map((l) => (l.key === r.key ? { ...l, scanned: r.scanned } : l)),
+                scanned: sealed ? b.scanned : b.scanned + 1,
+                state: r.complete ? "packed" : b.state,
+                packedAt: r.complete ? r.packedAt ?? new Date().toISOString() : b.packedAt,
+              }
+            : b,
+        );
+        setLast({
+          ok: true,
+          key: r.key,
+          text: sealed
+            ? "Packed ✓ Scan the next packing slip."
+            : r.readyToSeal
+              ? "Every item scanned. Seal the box on camera, then press Packing complete."
+              : r.complete
+                ? "Packed ✓ Every item scanned. Scan the next packing slip."
+                : `${r.title}: ${r.scanned} of ${r.qty}`,
+        });
         if (r.complete) {
           revalidator.revalidate();
           // Label already bought (before packing): packed = shipped, nothing more to do
@@ -603,6 +657,19 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
               >
                 {last ? last.text : b ? "Scan each item as it goes in the box." : "Scan a packing slip, or pick an order from the list."}
               </div>
+              {b && b.state === "batched" && b.scanned >= b.units && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    queue.current.push(`seal:${b.id}`);
+                    pump();
+                  }}
+                  disabled={scanner.state !== "idle"}
+                  style={{ appearance: "none", border: 0, borderRadius: "999px", padding: "11px 20px", background: "#303030", color: "#fff", font: "inherit", fontSize: "15px", fontWeight: 700, cursor: "pointer" }}
+                >
+                  Packing complete ✓
+                </button>
+              )}
             </form>
           )}
 
@@ -677,7 +744,7 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
                       {b.orderName}
                       {b.part ? <span style={{ ...muted, fontSize: "14px" }}> · part {b.part}</span> : null}
                     </h3>
-                    {cam.linked && <BoxVideo boxId={b.id} batchId={batch.id} state={b.state} />}
+                    {cam.linked && <BoxVideo boxId={b.id} batchId={batch.id} state={b.state} packedAt={b.packedAt} connected={cam.cameras.some((c) => c.connected)} />}
                     {b.state === "shipped" ? (
                       <span style={pill("#f1f1f1", "#1a5e20")}>Shipped ✓</span>
                     ) : b.state !== "batched" ? (

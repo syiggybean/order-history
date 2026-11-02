@@ -38,7 +38,7 @@ import { FlagMarker, ReviewTab } from "../components/shipping/Review";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "../components/shipping/Notice";
 import { PackStation } from "../components/shipping/Pack";
 import { Slips } from "../components/shipping/Slips";
-import { findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, savePackageSettings, unpack } from "../pack.server";
+import { findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
 import { createPortal } from "react-dom";
 import { assertInBatch, batchLabelFile, bulkStatus, buyLabel, labelFile, startBulkLabels } from "../labels.server";
 import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "../flags.server";
@@ -251,6 +251,7 @@ const NEEDS = {
   cameraScans: "pack",
   cameraUnlink: "pack",
   boxVideos: "pack",
+  sealBox: "pack",
   unpack: "pack",
   labelCheck: "pack",
   // In-app labels: buying needs Ship; printing a bought label, Pack or Ship
@@ -348,7 +349,14 @@ export const action = async ({ request }) => {
     if (intent === "ackNotice") return { intent, ok: true, ...(await ackNotice(shop, id, String(form.get("context") ?? "view"), user)) };
     if (intent === "findBox") return { intent, ...(await findBox(shop, id, String(form.get("code") ?? ""))) };
     if (intent === "packScan")
-      return { intent, ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user, { via: form.get("via") === "visual" ? "visual" : "barcode" })) };
+      return {
+        intent,
+        ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user, {
+          via: form.get("via") === "visual" ? "visual" : "barcode",
+          holdForSeal: form.get("holdForSeal") === "1",
+        })),
+      };
+    if (intent === "sealBox") return { intent, ...(await sealBox(shop, id, Number(form.get("shipmentId")), user)) };
     if (intent === "cameraLink")
       return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request), { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null })) };
     if (intent === "cameraContext") {

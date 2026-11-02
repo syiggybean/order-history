@@ -355,7 +355,9 @@ async function markPacked(shop, b, s, user, override = null) {
 
 // A scan at the bench: one unit of an item in this box
 // via: "barcode" (scanner or camera) or "visual" (the pack camera matched a photo; code is "line:<item key>")
-export async function packScan(shop, batchId, shipmentId, code, user, { via = "barcode" } = {}) {
+// holdForSeal: the pack camera is recording, so the last scan doesn't finish the
+// box; the packer seals it on camera and then presses "Packing complete" (sealBox)
+export async function packScan(shop, batchId, shipmentId, code, user, { via = "barcode", holdForSeal = false } = {}) {
   const { b, s } = await loadBox(shop, batchId, shipmentId);
   if (s.state !== "batched") return { ok: false, error: `${s.orderName} is already packed.` };
   if (s.noticeKey && s.packAckKey !== s.noticeKey) return { ok: false, needsAck: true, error: "Read and acknowledge the note / address change first." };
@@ -393,8 +395,24 @@ export async function packScan(shop, batchId, shipmentId, code, user, { via = "b
   const complete = lines.every((l) => (saved[itemKey(l)] ?? 0) >= l.quantity);
   if (via === "visual")
     await logEvent(shop, { shipmentId: s.id, batchId: b.id, orderName: s.orderName, type: "pack_visual", detail: `${label(line)}: matched by photo on the pack camera (no barcode)`, user });
+  if (complete && holdForSeal) return { ok: true, code, key, scanned: saved[key], qty: line.quantity, title: label(line), complete: false, readyToSeal: true, via };
   if (complete) await markPacked(shop, b, s, user);
-  return { ok: true, code, key, scanned: saved[key], qty: line.quantity, title: label(line), complete, via };
+  const packedAt = complete ? (await db.shipment.findUnique({ where: { id: s.id }, select: { packedAt: true } }))?.packedAt : null;
+  return { ok: true, code, key, scanned: saved[key], qty: line.quantity, title: label(line), complete, via, packedAt: packedAt?.toISOString() ?? null };
+}
+
+// "Packing complete": every item is scanned and the box is sealed (on camera)
+export async function sealBox(shop, batchId, shipmentId, user) {
+  const { b, s } = await loadBox(shop, batchId, shipmentId);
+  if (s.state !== "batched") return { ok: false, error: `${s.orderName} is already packed.` };
+  if (s.noticeKey && s.packAckKey !== s.noticeKey) return { ok: false, needsAck: true, error: "Read and acknowledge the note / address change first." };
+  const counts = json(s.packed, {});
+  const missing = linesOf(s).filter((l) => (counts[itemKey(l)] ?? 0) < l.quantity);
+  if (missing.length) return { ok: false, error: `Scan every item first: ${missing.map(label).join(", ")} still to scan.` };
+  await startPackingBatch(b);
+  await markPacked(shop, b, s, user);
+  const fresh = await db.shipment.findUnique({ where: { id: s.id }, select: { packedAt: true } });
+  return { ok: true, complete: true, sealed: true, packedAt: fresh?.packedAt?.toISOString() ?? null };
 }
 
 // Pack without a full scan (damaged barcode, item swapped with the customer's OK...)
