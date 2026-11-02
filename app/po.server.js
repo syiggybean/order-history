@@ -1,7 +1,5 @@
-import { randomUUID } from "node:crypto";
 import db from "./db.server";
 import { errorMessage, gql } from "./preorders.server";
-import { RECEIVE_ADDS_STOCK } from "./po-template";
 
 // ---------------------------------------------------------------------------
 // Purchase orders
@@ -527,18 +525,11 @@ async function receivedStatus(poId) {
 }
 
 // ---------------------------------------------------------------------------
-// Receiving: adds stock in Shopify at the PO's location
+// Receiving: records what arrived against the PO. By leadership's decision this
+// never changes stock in Shopify; it only verifies that shipments came in.
 // ---------------------------------------------------------------------------
 
-const ADJUST = `#graphql
-  mutation PoReceive($input: InventoryAdjustQuantitiesInput!, $key: String!) {
-    inventoryAdjustQuantities(input: $input) @idempotent(key: $key) {
-      inventoryAdjustmentGroup { id }
-      userErrors { field message code }
-    }
-  }`;
-
-// counts: { [lineId]: units received now }
+// counts: { [lineId]: units received now }. `admin` is unused (kept for callers).
 export async function receive(shop, admin, id, counts, user) {
   const po = await getPo(shop, id);
   if (!["open", "partial", "pending"].includes(po.status)) throw new PoError(`A ${STATUS_LABELS[po.status].toLowerCase()} PO can't be received into.`);
@@ -555,21 +546,6 @@ export async function receive(shop, admin, id, counts, user) {
     todo.push({ l, n });
   }
   if (!todo.length) throw new PoError("Enter how many of each item arrived.");
-  const toStock = RECEIVE_ADDS_STOCK ? todo.filter((x) => x.l.inventoryItemId) : [];
-  if (toStock.length && !po.locationId) throw new PoError("Choose the location this PO is received at first.");
-  if (toStock.length) {
-    const data = await gql(admin, ADJUST, {
-      key: randomUUID(),
-      input: {
-        name: "available",
-        reason: "received",
-        referenceDocumentUri: `${PO_URI_PREFIX}${po.id}`,
-        changes: toStock.map(({ l, n }) => ({ delta: n, inventoryItemId: l.inventoryItemId, locationId: po.locationId, changeFromQuantity: null })),
-      },
-    });
-    const errs = data?.inventoryAdjustQuantities?.userErrors ?? [];
-    if (errs.length) throw new PoError(`Shopify didn't add the stock: ${errs.map((e) => e.message).join("; ")}`);
-  }
   for (const { l, n } of todo) await db.purchaseOrderLine.update({ where: { id: l.id }, data: { received: { increment: n } } });
   const status = await receivedStatus(po.id);
   const now = new Date();
@@ -578,18 +554,9 @@ export async function receive(shop, admin, id, counts, user) {
     data: { status, ...(po.status === "pending" ? { openedAt: now } : {}), ...(status === "received" ? { receivedAt: now } : {}) },
   });
   const units = todo.reduce((t, x) => t + x.n, 0);
-  const off = RECEIVE_ADDS_STOCK ? todo.filter((x) => !x.l.inventoryItemId).reduce((t, x) => t + x.n, 0) : 0;
-  await logPo(
-    shop,
-    po.id,
-    "received",
-    `${units} unit${units === 1 ? "" : "s"} at ${po.locationName ?? "the location"}${
-      !RECEIVE_ADDS_STOCK ? " (recorded only: stock in Shopify not changed)" : off ? ` (${off} not in Shopify, so not added to stock)` : ""
-    }`,
-    user,
-  );
+  await logPo(shop, po.id, "received", `${units} unit${units === 1 ? "" : "s"} arrived (verified only: stock in Shopify not changed)`, user);
   if (status !== po.status) await logPo(shop, po.id, "status", `${STATUS_LABELS[po.status]} → ${STATUS_LABELS[status]}`, user);
-  return { status, units, notStocked: off, stockChanged: RECEIVE_ADDS_STOCK };
+  return { status, units };
 }
 
 // A scan while receiving: which line is it? (SKU, supplier barcode or code)

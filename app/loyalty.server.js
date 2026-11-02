@@ -606,6 +606,31 @@ export async function memberView(shop, customerId) {
   };
 }
 
+// The header flyout: balance, tier progress, rewards to choose from, unused codes
+export async function memberPanel(shop, customerId) {
+  const program = await getProgram(shop);
+  if (!program.enabled) return { member: false };
+  const view = await memberView(shop, customerId);
+  if (!view) return { member: false };
+  const { member, tier, next } = view;
+  const span = next ? next.threshold - tier.threshold : 0;
+  return {
+    member: true,
+    programName: program.programName,
+    pointsName: program.pointsName,
+    pointName: program.pointName,
+    firstName: member.firstName ?? null,
+    points: member.points,
+    pending: member.pending,
+    tier: { name: tier.name, perks: tier.perks || null },
+    next: next ? { name: next.name, toGo: next.toGo, perks: next.perks || null } : null,
+    // Share of the way from this tier's threshold to the next one's
+    progress: next && span > 0 ? Math.max(0, Math.min(1, (member.tierSpend - tier.threshold) / span)) : 1,
+    rewards: program.rewards.map((r) => ({ id: r.id, name: r.name, points: r.points, amount: r.amount, minSubtotal: r.minSubtotal ?? null })),
+    codes: view.codes.filter((c) => c.status === "issued").slice(0, 5).map((c) => ({ code: c.code, name: c.name, minSubtotal: c.minSubtotal ?? null })),
+  };
+}
+
 // The small payload for the header badge and "earn X points" line
 export async function memberBadge(shop, customerId) {
   const m = await getMember(shop, customerId);

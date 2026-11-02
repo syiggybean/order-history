@@ -1,6 +1,42 @@
-.ohlp-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;margin:0 4px;border-radius:999px;background:var(--ohlp-accent,#e0245e);color:#fff!important;font-size:12px;font-weight:700;line-height:1.4;text-decoration:none!important;white-space:nowrap;align-self:center}
+.ohlp-badge{display:inline-flex;border:0;cursor:pointer;font-family:inherit;align-items:center;gap:4px;padding:3px 9px;margin:0 4px;border-radius:999px;background:var(--ohlp-accent,#e0245e);color:#fff!important;font-size:12px;font-weight:700;line-height:1.4;text-decoration:none!important;white-space:nowrap;align-self:center}
 .ohlp-badge svg{width:12px;height:12px;fill:currentColor}
 .ohlp-earn{display:flex;align-items:center;gap:6px;margin:6px 0 10px;font-size:.92em}
 .ohlp-earn svg{width:16px;height:16px;fill:var(--ohlp-accent,#e0245e);flex:none}
 .ohlp-earn b{font-weight:700}
 .ohlp-earn a{color:inherit}
+
+/* Members: Smile.io's floating button and panel are replaced by the Yiggybeans flyout */
+html.ohlp-member [id^="smile-ui"],html.ohlp-member .smile-launcher-frame-container,html.ohlp-member .smile-panel-frame-container,html.ohlp-member iframe[id^="smile-ui"],html.ohlp-member #smile-ui-lite-launcher-frame-container{display:none!important}
+html.ohlp-fly-open{overflow:hidden}
+.ohlp-fly-wrap{position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,0);transition:background .2s ease;display:flex;justify-content:flex-end}
+.ohlp-fly-wrap.is-open{background:rgba(0,0,0,.35)}
+.ohlp-fly{width:min(380px,100%);height:100%;background:#fff;color:#1a1a1a;box-shadow:-6px 0 24px rgba(0,0,0,.18);display:flex;flex-direction:column;transform:translateX(100%);transition:transform .22s cubic-bezier(.2,.8,.2,1);font-size:15px;line-height:1.45}
+.ohlp-fly-wrap.is-open .ohlp-fly{transform:none}
+.ohlp-fly__head{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:var(--ohlp-accent,#e0245e);color:#fff}
+.ohlp-fly__head strong{font-size:17px}
+.ohlp-fly__close{appearance:none;border:0;background:none;color:#fff;font-size:26px;line-height:1;cursor:pointer;padding:0 4px}
+.ohlp-fly__body{padding:16px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:14px}
+.ohlp-fly__muted{color:#616161;font-size:13px}
+.ohlp-fly__balance{display:flex;flex-direction:column;align-items:flex-start;gap:2px}
+.ohlp-fly__points{font-size:34px;font-weight:800;line-height:1.1;color:var(--ohlp-accent,#e0245e)}
+.ohlp-fly__tier{padding:12px;border:1px solid #ececec;border-radius:10px;display:flex;flex-direction:column;gap:6px}
+.ohlp-fly__row{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.ohlp-fly__bar{height:8px;border-radius:999px;background:#f0f0f0;overflow:hidden}
+.ohlp-fly__bar span{display:block;height:100%;border-radius:999px;background:var(--ohlp-accent,#e0245e)}
+.ohlp-fly__tier p{margin:0}
+.ohlp-fly__h{margin:4px 0 -6px;font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.ohlp-fly__rewards{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.ohlp-fly__rewards li{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border:1px solid #ececec;border-radius:10px}
+.ohlp-fly__rewards li>span{display:flex;flex-direction:column}
+.ohlp-fly__redeem{appearance:none;border:0;border-radius:999px;padding:7px 14px;font:inherit;font-size:13px;font-weight:700;background:var(--ohlp-accent,#e0245e);color:#fff;cursor:pointer;white-space:nowrap}
+.ohlp-fly__redeem[disabled]{background:#ececec;color:#616161;cursor:default}
+.ohlp-fly__code{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border:1px dashed var(--ohlp-accent,#e0245e);border-radius:10px;background:#fff7f9}
+.ohlp-fly__code>span:first-child{display:flex;flex-direction:column}
+.ohlp-fly__code code{font-size:16px;font-weight:800;letter-spacing:.06em}
+.ohlp-fly__code-actions{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:13px}
+.ohlp-fly__code-actions a{color:inherit}
+.ohlp-fly__copy{appearance:none;border:1px solid #d0d0d0;background:#fff;border-radius:999px;padding:3px 10px;font:inherit;font-size:12px;cursor:pointer}
+.ohlp-fly__done{display:flex;flex-direction:column;gap:8px}
+.ohlp-fly__error{color:#b42318;font-size:13px;margin:-2px 0 0}
+.ohlp-fly__page{color:inherit;font-weight:600;margin-top:4px}
+@media (prefers-reduced-motion:reduce){.ohlp-fly,.ohlp-fly-wrap{transition:none}}

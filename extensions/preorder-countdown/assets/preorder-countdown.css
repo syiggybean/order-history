@@ -211,3 +211,6 @@
 @media (max-width: 480px) {
   .ohpc-notify__button { flex-basis: 100%; }
 }
+
+/* Other apps' "email me when available" buttons, while this block shows its own sign-up */
+.ohpc-hidden-notify { display: none !important; }

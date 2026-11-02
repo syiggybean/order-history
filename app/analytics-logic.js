@@ -1,21 +1,24 @@
-// Sell-through analytics: the maths, grouping, sorting and suggestions.
+// Reporting dashboard: the maths, grouping, sorting and suggestions.
 // Shared by the page and the server (no server-only code here).
+
+// Bump when the saved row shape changes: older snapshots are rebuilt on open
+export const ROWS_VERSION = 3;
 
 // When to suggest carrying more or less. Plain numbers so they're easy to tune.
 export const RULES = {
   newDays: 30, // products younger than this are "too new to tell"
-  minUnits: 3, // fewer units than this (sold + on hand + received) is too little to judge
+  minUnits: 3, // fewer units than this (sold + ending count) is too little to judge
   moreSellThrough: 0.7, // sold at least 70% of the stock it had…
   moreWeeksLeft: 4, // …and under 4 weeks of stock left
   moreMinMargin: 0.1, // …and at least 10% margin (when cost is known)
   lessSellThrough: 0.25, // sold under 25% of the stock it had…
-  lessMinOnHand: 5, // …with at least 5 still on hand
+  lessMinOnHand: 5, // …with at least 5 left at the end
   lessWeeksLeft: 26, // or over 6 months of stock at the current pace
   lessMaxMargin: 0.05, // or under 5% margin
 };
 
 export const GROUPS = {
-  type: { label: "Category", empty: "No product type" },
+  category: { label: "Category", empty: "No category" },
   vendor: { label: "Publisher / vendor", empty: "No vendor" },
   supplier: { label: "Supplier", empty: "No purchase orders" },
   item: { label: "Item", empty: "" },
@@ -28,27 +31,31 @@ export const SORTS = {
   profitLeast: { label: "Least profitable", key: "profit", dir: 1 },
   stHigh: { label: "Highest sell-through", key: "sellThrough", dir: -1 },
   stLow: { label: "Lowest sell-through", key: "sellThrough", dir: 1 },
-  gap: { label: "Most received but unsold", key: "gap", dir: -1 },
+  endingHigh: { label: "Most left at the end", key: "ending", dir: -1 },
   marginHigh: { label: "Highest margin", key: "margin", dir: -1 },
   marginLow: { label: "Lowest margin", key: "margin", dir: 1 },
   sales: { label: "Most net sales", key: "netSales", dir: -1 },
   cover: { label: "Most weeks of stock", key: "weeksLeft", dir: -1 },
 };
 
-const sumKeys = ["sold", "received", "netSales", "cost", "profit", "costedSales"];
+const sumKeys = ["sold", "netSales", "cost", "profit", "costedSales"];
 
-// Derived numbers for one product or group
+// Derived numbers for one product or group.
+// starting / ending: stock on hand at the start and end of the period (null = not tracked)
 export function measure(r, days) {
   const weeks = Math.max(1, days) / 7;
-  const onHand = r.onHand ?? null;
+  const ending = r.ending ?? null;
   const perWeek = r.sold / weeks;
-  const sellThrough = r.received > 0 ? r.sold / r.received : null;
-  // Of the stock it had during the period (sold + what's left), how much sold
-  const stockBase = r.sold + Math.max(0, onHand ?? 0);
-  const stockSellThrough = stockBase > 0 ? r.sold / stockBase : null;
-  const weeksLeft = onHand === null ? null : perWeek > 0 ? Math.max(0, onHand) / perWeek : onHand > 0 ? Infinity : 0;
+  // Of the stock it had in the period (sold + what was left at the end), how much sold
+  const stockBase = r.sold + Math.max(0, ending ?? 0);
+  const sellThrough = stockBase > 0 ? r.sold / stockBase : null;
+  const weeksLeft = ending === null ? null : perWeek > 0 ? Math.max(0, ending) / perWeek : ending > 0 ? Infinity : 0;
   const margin = r.costedSales > 0 ? r.profit / r.costedSales : null;
-  return { ...r, perWeek, sellThrough, stockSellThrough, weeksLeft, margin, gap: r.received - r.sold };
+  // Added: what came in (received, returned, adjusted) so that starting + added − sold = ending.
+  // Groups pass their own (summed over tracked items only).
+  const added = r.added !== undefined ? r.added : r.starting !== null && r.starting !== undefined && ending !== null ? ending - r.starting + r.sold : null;
+  // onHand / stockSellThrough: the names the suggestions use
+  return { ...r, added, perWeek, sellThrough, stockSellThrough: sellThrough, onHand: ending, weeksLeft, margin };
 }
 
 const pct = (x) => `${Math.round(x * 100)}%`;
@@ -60,7 +67,7 @@ export function recommend(m, { endDay, rules = RULES } = {}) {
   if (m.status === "archived") return { action: "none", reason: "Archived" };
   const ageDays = m.createdAt && endDay ? (Date.parse(`${endDay}T23:59:59Z`) - Date.parse(m.createdAt)) / 86400000 : null;
   if (ageDays !== null && ageDays < rules.newDays) return { action: "new", reason: `Added ${Math.max(0, Math.round(ageDays))} days ago` };
-  const units = m.sold + Math.max(0, m.onHand ?? 0) + m.received;
+  const units = m.sold + Math.max(0, m.onHand ?? 0);
   if (units < rules.minUnits) return { action: "new", reason: "Too few units to judge" };
 
   const st = m.stockSellThrough;
@@ -72,17 +79,17 @@ export function recommend(m, { endDay, rules = RULES } = {}) {
     return { action: "less", reason: `Only ${pct(m.margin)} margin` };
   }
   if (st !== null && st < rules.lessSellThrough && (m.onHand ?? 0) >= rules.lessMinOnHand) {
-    return { action: "less", reason: `Sold ${pct(st)} of its stock; ${m.onHand} still on hand` };
+    return { action: "less", reason: `Sold ${pct(st)} of its stock; ${m.onHand} left at the end` };
   }
   if (m.weeksLeft !== null && m.weeksLeft > rules.lessWeeksLeft && (m.onHand ?? 0) >= rules.lessMinOnHand) {
-    return { action: "less", reason: m.weeksLeft === Infinity ? `No sales; ${m.onHand} on hand` : `${weeksText(m.weeksLeft)} at this pace` };
+    return { action: "less", reason: m.weeksLeft === Infinity ? `No sales; ${m.onHand} left at the end` : `${weeksText(m.weeksLeft)} at this pace` };
   }
   if (st !== null && st >= rules.moreSellThrough && !marginOk) return { action: "keep", reason: `Sells well (${pct(st)}) but margin is ${pct(m.margin)}` };
   return { action: "keep", reason: st !== null ? `Sold ${pct(st)} of its stock` : "Steady" };
 }
 
 // Rows → groups (or items), each measured and with a suggestion
-export function buildGroups(rows, { by = "type", days, endDay, rules = RULES } = {}) {
+export function buildGroups(rows, { by = "category", days, endDay, rules = RULES } = {}) {
   const items = rows.map((r) => {
     const m = measure(r, days);
     return { ...m, name: r.title, key: r.id, rec: recommend(m, { endDay, rules }) };
@@ -92,17 +99,21 @@ export function buildGroups(rows, { by = "type", days, endDay, rules = RULES } =
   const groups = new Map();
   for (const m of items) {
     const name = (m[by] && String(m[by]).trim()) || empty;
-    const g = groups.get(name) ?? { key: name, name, items: [], onHand: 0, hasStock: false, ...Object.fromEntries(sumKeys.map((k) => [k, 0])) };
+    const g =
+      groups.get(name) ??
+      { key: name, name, path: by === "category" ? m.categoryPath ?? null : null, items: [], starting: 0, ending: 0, added: 0, hasStock: false, ...Object.fromEntries(sumKeys.map((k) => [k, 0])) };
     for (const k of sumKeys) g[k] += m[k] ?? 0;
-    if (m.onHand !== null) {
-      g.onHand += Math.max(0, m.onHand);
+    if (m.ending !== null && m.ending !== undefined) {
+      g.starting += Math.max(0, m.starting ?? 0);
+      g.ending += Math.max(0, m.ending);
+      g.added += m.added ?? 0;
       g.hasStock = true;
     }
     g.items.push(m);
     groups.set(name, g);
   }
   return [...groups.values()].map((g) => {
-    const m = measure({ ...g, onHand: g.hasStock ? g.onHand : null }, days);
+    const m = measure({ ...g, starting: g.hasStock ? g.starting : null, ending: g.hasStock ? g.ending : null, added: g.hasStock ? g.added : null }, days);
     const more = g.items.filter((i) => i.rec.action === "more").length;
     const less = g.items.filter((i) => i.rec.action === "less").length;
     const rec = recommend({ ...m, status: null, createdAt: null }, { endDay, rules });
@@ -152,7 +163,7 @@ export function sortGroups(list, sortKey, dir) {
 // "Worst selling" means the worst of things you actually stock or bought,
 // not the thousands of old products with nothing at all
 export function relevant(list, sortKey) {
-  if (sortKey === "worst" || sortKey === "stLow") return list.filter((g) => g.received > 0 || (g.onHand ?? 0) > 0);
+  if (sortKey === "worst" || sortKey === "stLow") return list.filter((g) => (g.starting ?? 0) > 0 || (g.ending ?? 0) > 0);
   if (sortKey === "marginLow" || sortKey === "marginHigh") return list.filter((g) => g.margin !== null);
   return list;
 }
@@ -164,22 +175,22 @@ const csvCell = (v) => {
 const fixed = (n, d = 2) => (n === null || n === undefined || !Number.isFinite(n) ? (n === Infinity ? "∞" : "") : n.toFixed(d));
 
 export function toCsv(list, by) {
-  const head = [GROUPS[by]?.label ?? "Name", ...(by === "item" ? ["Category", "Publisher / vendor", "Supplier", "SKU", "Status"] : ["Items"]), "Received", "Sold", "Sell-through %", "Sold of stock %", "Net sales", "Cost", "Gross profit", "Margin %", "On hand", "Weeks of stock", "Suggestion", "Why"];
+  const head = [GROUPS[by]?.label ?? "Name", ...(by === "item" ? ["Category", "Publisher / vendor", "Supplier", "SKU", "Status"] : ["Items"]), "Starting count", "Added", "Sold", "Ending count", "Sell-through %", "Net sales", "Cost", "Gross profit", "Margin %", "Weeks of stock", "Suggestion", "Why"];
   const lines = [head.map(csvCell).join(",")];
   for (const g of list) {
     lines.push(
       [
         g.name,
-        ...(by === "item" ? [g.type, g.vendor, g.supplier, g.sku, g.status] : [g.count]),
-        g.received,
+        ...(by === "item" ? [g.categoryPath ?? g.category, g.vendor, g.supplier, g.sku, g.status] : [g.count]),
+        g.starting ?? "",
+        g.added ?? "",
         g.sold,
+        g.ending ?? "",
         g.sellThrough === null ? "" : fixed(g.sellThrough * 100, 1),
-        g.stockSellThrough === null ? "" : fixed(g.stockSellThrough * 100, 1),
         fixed(g.netSales),
         fixed(g.cost),
         fixed(g.profit),
         g.margin === null ? "" : fixed(g.margin * 100, 1),
-        g.onHand ?? "",
         fixed(g.weeksLeft, 1),
         { more: "Carry more", less: "Carry less", keep: "Keep", new: "Too new", none: "—" }[g.rec.action],
         g.rec.reason,

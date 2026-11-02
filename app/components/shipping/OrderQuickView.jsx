@@ -3,6 +3,7 @@ import { MethodBadge } from "./MethodBadge";
 import { useFetcher } from "react-router";
 import { FlagForm, ResolveFlag } from "./Review";
 import { ProductName, fmtDate, muted, pill, small, ProductThumb } from "./ui";
+import { Flyout } from "../Flyout";
 
 const linkBtn = {
   appearance: "none",
@@ -46,38 +47,13 @@ export function OrderQuickView({ orderId, onClose, onOpenBatch, canReview = fals
     load();
     onChanged?.();
   };
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const d = fetcher.data?.intent === "order" && fetcher.data.orderId === orderId ? fetcher.data : null;
   const openFlags = d?.order?.flags?.filter((f) => f.status === "open") ?? [];
   const pastFlags = d?.order?.flags?.filter((f) => f.status !== "open") ?? [];
   const o = d?.order;
 
   return (
-    <div
-      role="presentation"
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", zIndex: 999, display: "flex", justifyContent: "flex-end" }}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Order quick view"
-        onClick={(e) => e.stopPropagation()}
-        style={{ width: "min(480px, 100%)", height: "100%", background: "#fff", boxShadow: "-4px 0 24px rgba(0,0,0,0.15)", display: "flex", flexDirection: "column" }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", borderBottom: "1px solid #e3e3e3" }}>
-          <strong style={{ fontSize: "15px" }}>{o ? `Order ${o.name}` : "Order"}</strong>
-          <button type="button" onClick={onClose} aria-label="Close" style={{ ...linkBtn, color: "#303030", fontWeight: 400, fontSize: "20px", lineHeight: 1 }}>
-            ×
-          </button>
-        </div>
-
-        <div style={{ padding: "16px", overflowY: "auto", flexGrow: 1, fontSize: "13px" }}>
+    <Flyout onClose={onClose} label="Order quick view" title={o ? `Order ${o.name}` : "Order"} width={480} zIndex={999} bodyStyle={{ fontSize: "13px" }}>
           {!d && <s-paragraph>Loading…</s-paragraph>}
           {d?.error && (
             <s-banner tone="critical">
@@ -254,8 +230,6 @@ export function OrderQuickView({ orderId, onClose, onOpenBatch, canReview = fals
               )}
             </>
           )}
-        </div>
-      </div>
-    </div>
+    </Flyout>
   );
 }

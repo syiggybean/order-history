@@ -24,6 +24,13 @@ function parseAccess(json) {
     for (const [f, d] of Object.entries(CAPABILITY_FEATURES)) {
       if (Array.isArray(saved[f])) base[f] = saved[f].filter((c) => c in d.caps);
     }
+    // Stock (bins moved out of Shipping): until someone sets it, people keep what they had.
+    // Anyone in Shipping could see bins; "Manage bins and shipping settings" could edit them.
+    // Submitting counts is never on by default.
+    if (!Array.isArray(saved.stock)) {
+      const ship = base.shipping ?? [];
+      base.stock = ship.length ? ["view", ...(ship.includes("settings") ? ["bins"] : [])] : [];
+    }
   } catch {
     // fall back to Hidden everywhere
   }
@@ -90,7 +97,24 @@ async function resolveUser(shop, who) {
     isOwner: owner,
     isAdmin: owner || member.isAdmin,
     access: owner ? fullAccess() : parseAccess(member.access),
+    views: parseViews(member.views),
   };
+}
+
+// My Views: starred view ids, in order
+export const parseViews = (json) => {
+  try {
+    const v = json ? JSON.parse(json) : [];
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string").slice(0, 40) : [];
+  } catch {
+    return [];
+  }
+};
+
+export async function saveViews(shop, user, views) {
+  const clean = [...new Set((views ?? []).filter((x) => typeof x === "string" && /^[a-z0-9-]{1,60}$/.test(x)))].slice(0, 40);
+  await db.staffMember.update({ where: { id: user.id }, data: { views: JSON.stringify(clean) } });
+  return clean;
 }
 
 export const can = (user, feature, level) => Boolean(user) && allows(user, feature, level);
@@ -111,7 +135,7 @@ export async function getStaff(request) {
 
 // What the browser needs to show or hide things
 export const publicUser = (user) =>
-  user ? { name: user.name, isAdmin: user.isAdmin, isOwner: user.isOwner, access: user.access } : null;
+  user ? { name: user.name, isAdmin: user.isAdmin, isOwner: user.isOwner, access: user.access, views: user.views ?? [] } : null;
 
 // For loaders: returns ctx, or ctx with noAccess set (render <NoAccess />)
 export async function loadWithAccess(request, feature, level = "view") {

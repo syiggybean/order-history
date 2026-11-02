@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import db from "./db.server";
 import { unauthenticated } from "./shopify.server";
-import { KEY, NAMESPACE, TIERS, errorMessage, gql, toDay } from "./preorders.server";
+import { KEY, NAMESPACE, TIERS, errorMessage, gql, syncTemplate, toDay } from "./preorders.server";
 import { createCampaign, getSettings, kickMail, metricsFor, storeUrl } from "./preorder-notify.server";
 
 // ---------------------------------------------------------------------------
@@ -542,6 +542,8 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits }, use
   } finally {
     busy.delete(w.id);
   }
+  // The countdown blocks live on the "preorder" product template
+  await syncTemplate(shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
   return view(await db.preorderWindow.findUnique({ where: { id: w.id } }));
 }
 
@@ -608,6 +610,8 @@ export async function removeProduct(shop, admin, id) {
     if (changes.length) await setPolicies(admin, w.productId, changes);
   }
   await db.preorderWindow.delete({ where: { id: w.id } });
+  // Back to the default template, unless its release date is still to come
+  await syncTemplate(shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
 }
 
 // ---------------------------------------------------------------------------

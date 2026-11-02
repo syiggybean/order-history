@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useFetcher } from "react-router";
+import { Flyout } from "./Flyout";
 
 // The Pre-orders page handles loading and saving for the quick view,
 // so it works the same from any page in the app.
@@ -77,13 +78,6 @@ export function QuickView({ productId, onClose, onSaved, canEdit = true }) {
     }
   }, [fetcher.data]);
 
-  // Close with Escape
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const saving = fetcher.state !== "idle" && fetcher.formData?.get("intent") === "saveRelease";
   const loading = !details && !error;
   const dirty = details && release && release !== (details.release ?? "");
@@ -97,26 +91,8 @@ export function QuickView({ productId, onClose, onSaved, canEdit = true }) {
   const row = { display: "flex", justifyContent: "space-between", gap: "12px", padding: "8px 0", borderBottom: "1px solid #f1f1f1" };
 
   return (
-    <div
-      role="presentation"
-      onClick={onClose}
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", zIndex: 1000, display: "flex", justifyContent: "flex-end" }}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Product quick view"
-        onClick={(e) => e.stopPropagation()}
-        style={{ width: "min(440px, 100%)", height: "100%", background: "#fff", boxShadow: "-4px 0 24px rgba(0,0,0,0.15)", display: "flex", flexDirection: "column" }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px", borderBottom: "1px solid #e3e3e3" }}>
-          <strong style={{ fontSize: "15px" }}>Quick view</strong>
-          <button type="button" onClick={onClose} aria-label="Close" style={{ ...linkButton, color: "#303030", textDecoration: "none", fontSize: "20px", lineHeight: 1 }}>
-            ×
-          </button>
-        </div>
+    <Flyout onClose={onClose} label="Product quick view" title="Quick view">
 
-        <div style={{ padding: "16px", overflowY: "auto", flexGrow: 1 }}>
           {loading && <s-paragraph>Loading…</s-paragraph>}
 
           {error && (
@@ -136,13 +112,27 @@ export function QuickView({ productId, onClose, onSaved, canEdit = true }) {
                 <div>
                   <strong style={{ fontSize: "15px" }}>{details.title}</strong>
                   <div style={{ color: "#616161", marginTop: "4px" }}>{details.status.charAt(0) + details.status.slice(1).toLowerCase()}</div>
-                  <div style={{ marginTop: "6px" }}>
+                  <div style={{ marginTop: "6px", display: "flex", gap: "14px", flexWrap: "wrap" }}>
                     <a href={`shopify:admin/products/${details.legacyId}`} target="_top" style={{ color: "#005bd3" }}>
                       Open in Shopify
                     </a>
+                    {details.storeUrl && (
+                      <a
+                        href={details.storeUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ color: "#005bd3" }}
+                        title={details.storePreview ? "Not on sale yet: opens Shopify's preview of the page" : undefined}
+                      >
+                        {details.storePreview ? "Preview in store ↗" : "View in store ↗"}
+                        <span style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden", clip: "rect(0 0 0 0)" }}> (opens in a new tab)</span>
+                      </a>
+                    )}
                   </div>
                 </div>
               </div>
+
+              <Bins productId={productId} />
 
               <label htmlFor="qv-release" style={{ display: "block", fontWeight: 600, marginBottom: "6px" }}>
                 Release date
@@ -189,6 +179,17 @@ export function QuickView({ productId, onClose, onSaved, canEdit = true }) {
                   <span>Shipping profile</span>
                   <strong style={{ textAlign: "right" }}>{details.profiles.join(", ")}</strong>
                 </div>
+                {details.template && (
+                  <div style={row}>
+                    <span>Product template</span>
+                    <strong style={{ textAlign: "right" }}>
+                      {details.template}
+                      {details.expectedTemplate && details.expectedTemplate !== details.template && (
+                        <span style={{ display: "block", fontWeight: 400, color: "#8a6116" }}>Should be {details.expectedTemplate}</span>
+                      )}
+                    </strong>
+                  </div>
+                )}
                 {details.release && (
                   <div style={{ ...row, color: "#616161" }}>
                     <span>Expected for this date</span>
@@ -215,8 +216,85 @@ export function QuickView({ productId, onClose, onSaved, canEdit = true }) {
               </div>
             </>
           )}
-        </div>
+    </Flyout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Bin locations for the product's variants (also the "Bin location" field in Shopify)
+// ---------------------------------------------------------------------------
+
+const BINS_ACTION = "/app/bins";
+
+function Bins({ productId }) {
+  const f = useFetcher();
+  useEffect(() => {
+    f.submit({ intent: "productBins", productId }, { method: "post", action: BINS_ACTION });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productId]);
+  const d = f.data?.intent === "productBins" ? f.data : null;
+  if (!d) return <div style={{ marginBottom: "18px", color: "#616161", fontSize: "13px" }}>Loading bins…</div>;
+  if (d.error) return null;
+  const many = d.variants.length > 1;
+  return (
+    <div style={{ marginBottom: "18px" }}>
+      <div style={{ fontWeight: 600, marginBottom: "6px" }}>
+        Bin location{many ? "s" : ""}
+        {d.sandbox && <span style={{ fontWeight: 400, color: "#7a4f01", fontSize: "12px" }}> · sandbox copy</span>}
       </div>
+      <div style={{ display: "grid", gap: "6px" }}>
+        {d.variants.map((v) => (
+          <BinRow key={v.variantId} v={v} many={many} canEdit={d.canEdit} />
+        ))}
+      </div>
+      {!d.canEdit && d.variants.some((v) => !v.bin) && (
+        <div style={{ color: "#616161", fontSize: "12px", marginTop: "4px" }}>Changing bins needs the Stock permission “Edit bin locations”.</div>
+      )}
+    </div>
+  );
+}
+
+function BinRow({ v, many, canEdit }) {
+  const f = useFetcher();
+  const [value, setValue] = useState(v.bin ?? "");
+  const [saved, setSaved] = useState(v.bin ?? "");
+  useEffect(() => {
+    if (f.state === "idle" && f.data?.intent === "setBin" && f.data.ok) setSaved(f.data.bin ?? "");
+  }, [f.state, f.data]);
+  const save = () => {
+    if (value.trim() === saved) return;
+    f.submit({ intent: "setBin", item: JSON.stringify(v), bin: value.trim() }, { method: "post", action: BINS_ACTION });
+  };
+  const status =
+    f.state !== "idle" ? { text: "Saving…", color: "#616161" } : f.data?.error ? { text: f.data.error, color: "#b42318" } : f.data?.shopifyError ? { text: "Saved here; not in Shopify yet", color: "#8a6100" } : f.data?.ok && value.trim() === saved ? { text: "✓ Saved", color: "#1a7f37" } : null;
+  return (
+    <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+      {many && (
+        <span style={{ minWidth: "120px", flex: "1 1 120px", fontSize: "13px" }}>
+          {v.variantTitle ?? "Default"}
+          {v.sku && <span style={{ color: "#616161", fontSize: "12px" }}> · {v.sku}</span>}
+        </span>
+      )}
+      {canEdit ? (
+        <input
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onBlur={save}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              save();
+            }
+          }}
+          placeholder="Bin"
+          aria-label={`Bin for ${v.title}${v.variantTitle ? ` – ${v.variantTitle}` : ""}`}
+          style={{ font: "inherit", fontWeight: 600, padding: "6px 8px", border: "1px solid #c9c9c9", borderRadius: "8px", width: "120px" }}
+        />
+      ) : (
+        <strong>{v.bin ?? <span style={{ color: "#616161", fontWeight: 400 }}>No bin</span>}</strong>
+      )}
+      {!many && v.sku && <span style={{ color: "#616161", fontSize: "12px" }}>{v.sku}</span>}
+      {status && <span style={{ fontSize: "12px", color: status.color }}>{status.text}</span>}
     </div>
   );
 }

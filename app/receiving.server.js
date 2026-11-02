@@ -4,9 +4,9 @@ import { PoError, STATUS_LABELS, getPo, viewPo } from "./po.server";
 // ---------------------------------------------------------------------------
 // Receiving: staff check in what arrived against a purchase order.
 //
-// For now this only records counts: it never changes stock in Shopify, and it doesn't
-// change the PO's own "received" numbers or status (those still come from the PO's
-// Receive step). How check-ins should affect inventory is still to be decided.
+// It only verifies what arrived: by leadership's decision it never changes stock in
+// Shopify, and it doesn't change the PO's own "received" numbers or status (those
+// come from the PO's Receive step, which doesn't touch stock either).
 // ---------------------------------------------------------------------------
 
 const MAX_UNITS = 100000;

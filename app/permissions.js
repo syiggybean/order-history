@@ -32,7 +32,7 @@ export const FEATURES = {
     levelLabels: { hidden: "Hidden", view: "View", manage: "View + block and unblock" },
   },
   analytics: {
-    label: "Analytics",
+    label: "Reporting",
     levels: ["hidden", "view"],
     levelLabels: { hidden: "Hidden", view: "View" },
   },
@@ -68,7 +68,15 @@ export const CAPABILITY_FEATURES = {
       shipOutside: "Ship outside a batch",
       review: "Flag/Review orders",
       assignedOnly: "Only their assigned batches (limits what they see)",
-      settings: "Manage bins and shipping settings",
+      settings: "Manage shipping settings",
+    },
+  },
+  stock: {
+    label: "Stock",
+    caps: {
+      view: "View stock and bins",
+      bins: "Edit bin locations (also in Shopify)",
+      count: "Submit counts (overwrites On hand in Shopify)",
     },
   },
   purchaseOrders: {

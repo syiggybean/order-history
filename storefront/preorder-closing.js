@@ -1,7 +1,8 @@
 /* Pre-order closing clock (order-history app)
- * The "Pre-order closing clock" block [data-ohpc-closing], under the buy
+ * The old "Pre-order closing clock" block [data-ohpc-closing], under the buy
  * buttons: counts down to the closing time while pre-orders are open, and
- * hides when the main block reports the product as sold out.
+ * hides when the main block reports the product as sold out, or when the main
+ * block already shows the closing countdown in its own space.
  * Source file: edit here, then run `npm run build:storefront`.
  */
 import { Clock, phaseAt } from "./flipclock.js";
@@ -27,7 +28,9 @@ import { Clock, phaseAt } from "./flipclock.js";
     var now = Date.now();
     var phase = phaseAt(this.opens, this.closes, now);
     var s = (window.OHPC_STATE || {})[this.productId];
-    var show = Boolean(this.closes) && phase === "open" && !(s && s.soldOut);
+    // The main block now shows the closing countdown in its own space: don't show it twice
+    var inline = (s && s.inlineClosing) || Boolean(document.querySelector('[data-ohpc][data-closing-inline="true"][data-product-id="' + this.productId + '"]'));
+    var show = Boolean(this.closes) && phase === "open" && !(s && s.soldOut) && !inline;
     if (this.el.hidden === show) this.el.hidden = !show;
     if (show) this.clock.draw(this.closes - now);
     if (phase === "closed") clearInterval(this.timer);

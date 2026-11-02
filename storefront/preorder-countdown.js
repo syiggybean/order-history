@@ -6,7 +6,8 @@
  *
  * Phases, from the opening/closing times on the product:
  *   scheduled  flip clock + "email me when it opens"; buy controls hidden
- *   open       button reads "Pre-Order"; closing clock under it
+ *   open       button reads "Pre-Order"; the same clock, in the same place,
+ *              counts down to closing (block setting "show_closing")
  *              (with a sales limit, a variant at 0 shows "Pre-Orders Closed" + sign-up)
  *   closed     buy controls greyed out, "Pre-Orders Closed" + sign-up
  *
@@ -22,6 +23,12 @@ import { Clock, phaseAt } from "./flipclock.js";
   var BUTTON = 'button[name="add"], [data-add-to-cart], .add-to-cart, .product-form__submit';
   var BUTTON_TEXT = "[data-add-to-cart-text], .add-to-cart__text, .product-form__submit-text";
   var REF_DAYS = 14;
+  // Other apps' "email me when available" buttons (back-in-stock apps). While this
+  // block shows its own sign-up (before opening, after closing, sold out) they're
+  // hidden, so customers see one sign-up, not two.
+  var OTHER_NOTIFY =
+    '#BIS_trigger, .BIS_trigger, [data-bis-trigger], .klaviyo-bis-trigger, [class*="klaviyo-bis"], .swym-button-bis, [class*="back-in-stock"], [id*="back-in-stock"], [class*="restock-alert"], [class*="notify-me-button"], [id*="notify-me-button"], .product-form__notify, [class*="appikon"]';
+  var OTHER_NOTIFY_TEXT = /^\s*(e-?mail me when (it'?s )?(available|back( in stock)?)|notify me when (it'?s )?(available|back( in stock)?)|get notified when (it'?s )?(available|back( in stock)?))\s*$/i;
   var root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || "/";
 
   var OOPS = "Something went wrong. Please try again.";
@@ -44,6 +51,10 @@ import { Clock, phaseAt } from "./flipclock.js";
     this.opens = Number(el.getAttribute("data-opens")) * 1000 || null;
     this.closes = Number(el.getAttribute("data-closes")) * 1000 || null;
     this.limited = el.getAttribute("data-limited") === "true";
+    this.hideOthers = el.getAttribute("data-hide-other-notify") !== "false";
+    this.otherSelector = el.getAttribute("data-other-notify-selector") || "";
+    // Count down to closing in the panel once open (instead of the old separate block)
+    this.inlineClosing = el.getAttribute("data-closing-inline") === "true" && Boolean(this.closes);
     this.productId = el.getAttribute("data-product-id");
     this.handle = el.getAttribute("data-handle");
     // Wording comes from the block's settings in the theme editor
@@ -65,6 +76,10 @@ import { Clock, phaseAt } from "./flipclock.js";
     this.panel = el.querySelector("[data-ohpc-panel]");
     this.notify = el.querySelector("[data-ohpc-notify]");
     this.clock = this.panel ? new Clock(this.panel, "until pre-orders open") : null;
+    this.heading = el.querySelector("[data-ohpc-heading]");
+    this.whenOpens = el.querySelector('[data-ohpc-when="opens"]');
+    this.whenCloses = el.querySelector('[data-ohpc-when="closes"]');
+    this.mode = null; // what the clock counts down to: "opens", "closes" or nothing
     this.phase = null;
     this.soldOut = false;
     this.available = null; // variant id -> buyable, fetched fresh once open
@@ -82,7 +97,27 @@ import { Clock, phaseAt } from "./flipclock.js";
       this.phase = phase;
       this.apply(phase, first);
     }
-    if (phase === "scheduled" && this.clock) this.clock.draw(this.opens - now);
+    if (this.clock && this.mode === "opens") this.clock.draw(this.opens - now);
+    else if (this.clock && this.mode === "closes") this.clock.draw(this.closes - now);
+  };
+
+  // Switches the panel between counting to opening and counting to closing
+  Countdown.prototype.setMode = function (mode) {
+    if (mode === this.mode) return;
+    this.mode = mode;
+    if (!mode) return;
+    if (this.heading) {
+      var text = this.heading.getAttribute(mode === "closes" ? "data-text-closes" : "data-text-opens") || "";
+      this.heading.textContent = text;
+      this.heading.hidden = !text;
+    }
+    if (this.whenOpens) this.whenOpens.hidden = mode !== "opens";
+    if (this.whenCloses) this.whenCloses.hidden = mode !== "closes";
+    if (this.clock) {
+      this.clock.srSuffix = mode === "closes" ? "until pre-orders close" : "until pre-orders open";
+      if (this.clock.sr) this.clock.sr.textContent = ""; // announce the new countdown
+      this.clock.draw((mode === "closes" ? this.closes : this.opens) - Date.now());
+    }
   };
 
   Countdown.prototype.buttons = function () {
@@ -143,9 +178,43 @@ import { Clock, phaseAt } from "./flipclock.js";
     broadcast(this);
   };
 
+  // Hide (or bring back) other apps' "email me when available" buttons
+  Countdown.prototype.hideOtherNotify = function () {
+    if (!this.hideOthers) return;
+    var self = this;
+    var on = this.phase === "scheduled" || this.phase === "closed" || this.soldOut;
+    var found = [];
+    var add = function (list) {
+      for (var i = 0; i < list.length; i++) if (!self.el.contains(list[i]) && found.indexOf(list[i]) < 0) found.push(list[i]);
+    };
+    try {
+      add(document.querySelectorAll(OTHER_NOTIFY + (this.otherSelector ? ", " + this.otherSelector : "")));
+    } catch (e) {
+      add(document.querySelectorAll(OTHER_NOTIFY)); // a bad custom selector
+    }
+    // By wording, for apps not listed above (only in this product section)
+    var buttons = this.root.querySelectorAll('button, a, input[type="button"], input[type="submit"]');
+    for (var i = 0; i < buttons.length; i++) {
+      var b = buttons[i];
+      var text = b.tagName === "INPUT" ? b.value : b.textContent;
+      if (OTHER_NOTIFY_TEXT.test(text || "")) add([b]);
+    }
+    found.forEach(function (n) {
+      n.classList.toggle("ohpc-hidden-notify", on);
+    });
+    // Put back anything hidden earlier that no longer matches
+    if (!on) {
+      var hidden = document.querySelectorAll(".ohpc-hidden-notify");
+      for (var j = 0; j < hidden.length; j++) hidden[j].classList.remove("ohpc-hidden-notify");
+    }
+  };
+
   // Which parts of the block show
   Countdown.prototype.render = function () {
-    var showPanel = this.phase === "scheduled";
+    var mode =
+      this.phase === "scheduled" ? "opens" : this.phase === "open" && this.inlineClosing && !this.soldOut ? "closes" : null;
+    this.setMode(mode);
+    var showPanel = Boolean(mode);
     var notifyFor = this.phase === "scheduled" ? "scheduled" : this.phase === "closed" ? "closed" : this.soldOut ? "soldOut" : null;
     if (this.panel) this.panel.hidden = !showPanel;
     if (this.notify) {
@@ -157,6 +226,7 @@ import { Clock, phaseAt } from "./flipclock.js";
       }
     }
     this.el.hidden = !showPanel && !notifyFor;
+    this.hideOtherNotify();
   };
 
   Countdown.prototype.watch = function () {
@@ -172,13 +242,17 @@ import { Clock, phaseAt } from "./flipclock.js";
       queued = true;
       requestAnimationFrame(function () {
         queued = false;
-        self.enforceButtons();
+        if (self.phase !== "scheduled") self.enforceButtons();
+        self.hideOtherNotify();
       });
     });
     this.observer.observe(this.root, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["disabled", "value"] });
+    // Back-in-stock apps often add their button to the end of the page (e.g. a sticky bar)
+    if (this.hideOthers && this.root !== document.body) this.observer.observe(document.body, { childList: true });
     this.root.addEventListener("change", function () {
       setTimeout(function () {
-        self.enforceButtons();
+        if (self.phase !== "scheduled") self.enforceButtons();
+        self.hideOtherNotify();
       }, 0);
     });
   };
@@ -224,12 +298,12 @@ import { Clock, phaseAt } from "./flipclock.js";
     }
     if (phase !== "scheduled") {
       clearInterval(this.timer);
-      // Still need to notice closing later on
-      if (phase === "open" && this.closes) this.timer = setInterval(this.tick, 1000);
+      // Still need to notice closing later on (and keep the closing clock moving)
+      if (phase === "open" && this.closes) this.timer = setInterval(this.tick, this.inlineClosing ? 250 : 1000);
     }
     this.render();
     this.enforceButtons();
-    if (phase !== "scheduled") this.watch();
+    this.watch();
     broadcast(this);
   };
 
@@ -293,7 +367,7 @@ import { Clock, phaseAt } from "./flipclock.js";
   function broadcast(cd) {
     if (!cd.productId) return;
     var all = (window.OHPC_STATE = window.OHPC_STATE || {});
-    all[cd.productId] = { phase: cd.phase, soldOut: cd.soldOut };
+    all[cd.productId] = { phase: cd.phase, soldOut: cd.soldOut, inlineClosing: cd.inlineClosing };
     document.dispatchEvent(new CustomEvent("ohpc:state", { detail: { productId: cd.productId } }));
   }
 
@@ -364,6 +438,8 @@ import { Clock, phaseAt } from "./flipclock.js";
       clearInterval(c.timer);
       if (c.observer) c.observer.disconnect();
       if (c.root) c.root.classList.remove("ohpc-locked", "ohpc-closed", "ohpc-reveal", "ohpc-soldout");
+      var hidden = document.querySelectorAll(".ohpc-hidden-notify");
+      for (var j = 0; j < hidden.length; j++) hidden[j].classList.remove("ohpc-hidden-notify");
     }
   });
 

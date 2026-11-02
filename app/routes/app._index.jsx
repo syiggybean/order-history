@@ -75,6 +75,15 @@ const TOOLS = [
     status: "live",
   },
   {
+    title: "Stock",
+    feature: "stock",
+    description:
+      "Bin locations with live Available, Committed and On hand from Shopify. Count by bin or by scanning, review the differences, then update On hand in Shopify.",
+    href: "/app/stock",
+    action: "Open stock",
+    status: "live",
+  },
+  {
     title: "Wishlists",
     feature: "wishlist",
     description:
@@ -113,18 +122,18 @@ const TOOLS = [
   {
     title: "Receiving",
     feature: "receiving",
-    description: "Check in deliveries against their purchase orders by scanning or counting. Records what arrived; doesn't change stock yet.",
+    description: "Check in deliveries against their purchase orders by scanning or counting. Verifies what arrived; never changes stock.",
     href: "/app/receiving",
     action: "Open receiving",
     status: "live",
   },
   {
-    title: "Sell-through analytics",
+    title: "Reporting",
     feature: "analytics",
     description:
-      "Sell-through, sales and profit by category, publisher, supplier or item, with suggestions on what to carry more or less of.",
-    href: "/app/analytics",
-    action: "Open analytics",
+      "Dashboard of stock (starting count, sold, ending count), sales and profit by category, publisher, supplier or item, plus reports for the team to work through.",
+    href: "/app/reporting",
+    action: "Open reporting",
     status: "live",
   },
   {

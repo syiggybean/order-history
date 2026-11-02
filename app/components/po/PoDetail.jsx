@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useFetcher, useLoaderData, useRevalidator, useSearchParams } from "react-router";
 import { Err, StatusPill, box, cell, dayValue, fmtDate, head, input, money, muted, num, pill } from "./ui";
-import { RECEIVE_ADDS_STOCK } from "../../po-template";
 
 const EVENT_TEXT = { created: "Created", edited: "Edited", matched: "Matched to Shopify", status: "Status", emailed: "Emailed", exported: "Exported", received: "Received", checkedIn: "Checked in (Receiving)", checkInUndone: "Check-in undone" };
 
@@ -400,7 +399,7 @@ function Lines({ po, editable, canMatch }) {
           <span style={pill("#fff4d6", "#7a4f01")}>
             {unmatched} line{unmatched === 1 ? "" : "s"} not found in Shopify
           </span>
-          <span style={muted}>Matched by SKU, then barcode.{RECEIVE_ADDS_STOCK ? " Unmatched lines can still be received, but won't add stock." : ""}</span>
+          <span style={muted}>Matched by SKU, then barcode.</span>
           {canMatch && (
             <s-button variant="tertiary" onClick={() => matcher.submit({ intent: "rematch", id: String(po.id) }, { method: "post" })} {...(matcher.state !== "idle" ? { loading: true } : {})}>
               Look again
@@ -546,7 +545,7 @@ function Receive({ po }) {
   const scanRef = useRef(null);
   useDone(fetcher, (d) => {
     setCounts({});
-    setMsg({ ok: true, text: `Received ${d.units} unit${d.units === 1 ? "" : "s"}${d.stockChanged === false ? " (recorded only: stock in Shopify wasn't changed)" : d.notStocked ? ` (${d.notStocked} not in Shopify, so no stock added)` : ""}.` });
+    setMsg({ ok: true, text: `Marked ${d.units} unit${d.units === 1 ? "" : "s"} received (stock in Shopify not changed).` });
   });
   const open = po.lines.filter((l) => l.received < l.quantity);
   const total = Object.values(counts).reduce((t, n) => t + (Number(n) || 0), 0);
@@ -568,9 +567,7 @@ function Receive({ po }) {
     <s-section heading="Receive">
       <div style={{ ...muted, marginBottom: "8px" }}>
         Scan items (SKU or supplier barcode), or type how many arrived.{" "}
-        {RECEIVE_ADDS_STOCK
-          ? `Receiving adds them to stock at ${po.locationName ?? "the PO's location"} in Shopify.`
-          : "For now this only records what arrived: stock in Shopify isn't changed."}
+        This only verifies what arrived: stock in Shopify is never changed.
       </div>
       <form onSubmit={onScan} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap", marginBottom: "10px" }}>
         <input ref={scanRef} value={scan} onChange={(e) => setScan(e.target.value)} placeholder="Scan a barcode" aria-label="Scan" autoComplete="off" style={{ ...input, width: "260px", fontSize: "15px" }} />
@@ -595,7 +592,6 @@ function Receive({ po }) {
                 <td style={cell}>
                   {l.title}
                   <div style={muted}>{[l.sku, l.supplierBarcode].filter(Boolean).join(" · ")}</div>
-                  {RECEIVE_ADDS_STOCK && !l.matched && <div style={{ ...muted, color: "#7a4f01" }}>Not in Shopify: no stock will be added</div>}
                 </td>
                 <td style={num}>{l.quantity}</td>
                 <td style={num}>{l.received}</td>
@@ -622,7 +618,7 @@ function Receive({ po }) {
           {...(fetcher.state !== "idle" ? { loading: true } : {})}
           {...(!total ? { disabled: true } : {})}
         >
-          {RECEIVE_ADDS_STOCK ? `Receive ${total ? `${total} unit${total === 1 ? "" : "s"} ` : ""}into stock` : `Mark ${total ? `${total} unit${total === 1 ? "" : "s"} ` : ""}received`}
+          {`Mark ${total ? `${total} unit${total === 1 ? "" : "s"} ` : ""}received`}
         </s-button>
       </div>
       <Err data={fetcher.data} />

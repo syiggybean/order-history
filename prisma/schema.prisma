@@ -209,6 +209,8 @@ model StaffMember {
   accountOwner Boolean  @default(false)
   isAdmin      Boolean  @default(false)
   access       String   @default("{}")
+  // My Views: the pages and tabs this person starred, in order (JSON list of view ids)
+  views        String?
   lastSeenAt   DateTime @default(now())
   createdAt    DateTime @default(now())
 
@@ -1310,4 +1312,75 @@ model PoCheckIn {
   undoneBy  String?
 
   @@index([shop, poId])
+}
+
+// Stock → counts submitted: each sets On hand in Shopify at one location
+model StockCount {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  locationId String
+  locationName String?
+  userName   String?
+  // [{variantId, inventoryItemId, title, sku, bin, before, counted, status, error}]
+  items      String
+  applied    Int      @default(0)
+  failed     Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+// Pack camera: a webcam window linked to a person's pack bench
+model CameraLink {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  // The shop the bench works on (the sandbox copy in sandbox mode)
+  workShop    String
+  staffKey    String
+  userName    String?
+  // sha256 of the secret in the camera window's link
+  secretHash  String    @unique
+  // What the bench has open: {batchId, shipmentId} (the camera reads the box from it)
+  batchId     Int?
+  shipmentId  Int?
+  contextAt   DateTime?
+  cameraSeenAt DateTime?
+  cameraInfo  String?
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+
+  @@index([shop, staffKey])
+}
+
+// Scans made by a pack camera, waiting for the bench to apply them
+model CameraScan {
+  id        Int       @id @default(autoincrement())
+  linkId    Int
+  code      String
+  // "barcode" or "visual" (picked by matching a photo)
+  via       String    @default("barcode")
+  createdAt DateTime  @default(now())
+  takenAt   DateTime?
+
+  @@index([linkId, takenAt])
+}
+
+// Packing videos uploaded to Google Drive
+model PackVideo {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  shipmentId  Int
+  orderName   String
+  fileName    String
+  driveFileId String?
+  status      String    @default("uploading") // uploading | done | failed
+  sizeBytes   Int?
+  seconds     Int?
+  userName    String?
+  error       String?
+  createdAt   DateTime  @default(now())
+  doneAt      DateTime?
+
+  @@index([shop, shipmentId])
+  @@index([shop, createdAt])
 }

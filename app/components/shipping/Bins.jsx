@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useFetcher, useNavigation } from "react-router";
 import { ProductName, box, cell, head, input, muted, small, ProductThumb, useParamSetter } from "./ui";
 
-function BinCell({ item, canEdit }) {
+export function BinCell({ item, canEdit }) {
   const fetcher = useFetcher();
   const [value, setValue] = useState(item.bin ?? "");
   const [saved, setSaved] = useState(item.bin ?? "");
@@ -52,7 +52,7 @@ function BinCell({ item, canEdit }) {
   );
 }
 
-function Import() {
+export function ImportBins() {
   const fetcher = useFetcher();
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
@@ -107,7 +107,7 @@ function Import() {
   );
 }
 
-function Export() {
+export function ExportBins() {
   const fetcher = useFetcher();
   useEffect(() => {
     const csv = fetcher.data?.intent === "exportBins" ? fetcher.data.csv : null;
@@ -126,7 +126,7 @@ function Export() {
 }
 
 // Bins also live on each variant in Shopify admin ("Bin location"); kept in step both ways
-function ShopifySync({ status, canEdit }) {
+export function ShopifySync({ status, canEdit }) {
   const f = useFetcher();
   const busy = f.state !== "idle" || status?.running;
   const r = f.data?.intent === "syncBins" ? f.data : null;
@@ -197,8 +197,8 @@ export function BinsTab({ items, q, missing, canEdit, sync }) {
         </label>
         {navigation.state === "loading" && <span style={muted}>Loading…</span>}
         <span style={{ flex: 1 }} />
-        {canEdit && <Import />}
-        <Export />
+        {canEdit && <ImportBins />}
+        <ExportBins />
       </div>
       <ShopifySync status={sync} canEdit={canEdit} />
       {!missing && without > 0 && <div style={{ ...small, marginBottom: "8px" }}>{without} of these have no bin yet.</div>}

@@ -1,8 +1,9 @@
 {%- comment -%}
   Rewards (MonkeyBean loyalty). Turn on under Online Store > Themes > Edit theme > App embeds.
-  Only invited members see anything: a Yiggybeans badge next to the account icon and
-  "Earn X Yiggybeans" under the price on product pages. The Rewards page is at
-  /apps/purchase-history/rewards.
+  Only invited members see anything: a Yiggybeans button next to the account icon
+  that opens a rewards flyout, and "Earn X Yiggybeans" under the price on product
+  pages. For members, Smile.io's floating button and panel are hidden (everyone
+  else still sees Smile). The Rewards page is at /apps/purchase-history/rewards.
 {%- endcomment -%}
 {%- if customer -%}
   {%- liquid
@@ -19,6 +20,7 @@
       "accountUrl": {{ routes.account_url | json }},
       "header": {{ block.settings.show_header | json }},
       "earn": {{ block.settings.show_product | json }},
+      "replaceSmile": {{ block.settings.replace_smile | json }},
       "accountSel": {{ block.settings.account_selector | default: "" | json }},
       "priceSel": {{ block.settings.price_selector | default: "" | json }},
       "product": {%- if request.page_type == 'product' and product -%}
@@ -39,7 +41,8 @@
   "stylesheet": "loyalty.css",
   "settings": [
     { "type": "color", "id": "accent", "label": "Accent color", "default": "#e0245e" },
-    { "type": "checkbox", "id": "show_header", "label": "Yiggybeans badge next to the account icon", "default": true },
+    { "type": "checkbox", "id": "show_header", "label": "Yiggybeans button next to the account icon (opens the rewards flyout)", "default": true },
+    { "type": "checkbox", "id": "replace_smile", "label": "For members, hide Smile.io's rewards button and panel", "default": true, "info": "Members use the Yiggybeans button instead. Customers who aren't members still see Smile.io." },
     { "type": "checkbox", "id": "show_product", "label": "\"Earn X Yiggybeans\" under product prices", "default": true },
     { "type": "header", "content": "If something doesn't show up" },
     { "type": "paragraph", "content": "Only invited members see these. If one doesn't appear for a member, enter a CSS selector for where it should go." },

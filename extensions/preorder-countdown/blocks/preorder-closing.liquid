@@ -1,10 +1,14 @@
 {%- comment -%}
   Pre-order closing clock (from the order-history app)
 
-  Place this block just under the buy buttons. While pre-orders are open it
-  shows a flip clock counting down to the closing time. It hides itself
-  before opening, after closing, when sold out, and on products with no
-  closing time.
+  No longer needed: the "Pre-order countdown" block now counts down to closing
+  in the same place (its "count down to closing in the same place" setting).
+  Kept so existing themes don't break. It hides itself whenever that block is
+  showing the closing countdown.
+
+  On its own: while pre-orders are open it shows a flip clock counting down to
+  the closing time. It hides itself before opening, after closing, when sold
+  out, and on products with no closing time.
 {%- endcomment -%}
 {%- assign opens = product.metafields.oh_preorder.opens_at.value -%}
 {%- assign closes = product.metafields.oh_preorder.closes_at.value -%}
@@ -40,7 +44,7 @@
 
 {% schema %}
 {
-  "name": "Pre-order closing clock",
+  "name": "Closing clock (old)",
   "target": "section",
   "enabled_on": { "templates": ["product"] },
   "javascript": "preorder-closing.js",

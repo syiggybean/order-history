@@ -7,8 +7,8 @@ import { PoError } from "../po.server";
 import { receivingDetail, receivingList, saveCheckIn, undoCheckIn } from "../receiving.server";
 import { Err, StatusPill, box, cell, fmtDate, fmtDay, head, input, muted, num, pill } from "../components/po/ui";
 
-// Receiving: check in what arrived against a purchase order. Counts only: stock in
-// Shopify isn't changed (how check-ins should affect inventory is still to be decided).
+// Receiving: check in what arrived against a purchase order. Verification only: stock
+// in Shopify is never changed (leadership's decision).
 // Permission "Receiving": View sees progress; "check in items" can count and save.
 
 export const loader = async ({ request }) => {

@@ -137,7 +137,6 @@ export function sampleValues() {
   return out;
 }
 
-// Receiving a PO adds stock in Shopify at its location. Off for now: receiving only
-// records what arrived, until leadership decides how inventory should be handled.
-// Switch on to add stock again (the code for it is in po.server.js receive()).
+// Receiving a PO never changes stock in Shopify (leadership's decision): it only
+// verifies what arrived. Kept as a constant so older imports keep working.
 export const RECEIVE_ADDS_STOCK = false;

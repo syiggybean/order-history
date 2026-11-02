@@ -7,7 +7,32 @@ import { BulkLabelsButton, PackagePanel, packageText } from "./Packages";
 import { BulkLabelsPanel, LabelActions } from "./Labels";
 import { IN_APP_LABELS } from "./features";
 import { SlipPrintButton, ThisComputer } from "./Printing";
+import { PackCameraBar, usePackCamera } from "./PackCameraLink";
 import { PINK, ProductName, box, cell, head, input, muted, pill, small, ProductThumb, useParamSetter } from "./ui";
+
+// The pack camera's video of this box: recording, uploading, saved (with a link), or failed
+function BoxVideo({ boxId, batchId, state }) {
+  const f = useFetcher();
+  const fRef = useRef(f); // the latest fetcher (the interval outlives renders)
+  fRef.current = f;
+  useEffect(() => {
+    const load = () => fRef.current.state === "idle" && fRef.current.submit({ intent: "boxVideos", id: String(batchId), shipmentId: String(boxId) }, { method: "post" });
+    load();
+    const t = setInterval(load, 8000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boxId, state]);
+  const v = f.data?.intent === "boxVideos" && f.data.shipmentId === boxId ? f.data.videos?.[0] : null;
+  if (!v) return null; // still recording, or not recorded
+  if (v.status === "done")
+    return (
+      <a href={v.url} target="_blank" rel="noreferrer" style={{ ...small, color: "#1a5e20", fontWeight: 600 }}>
+        🎥 Video saved ↗
+      </a>
+    );
+  if (v.status === "failed") return <span style={{ ...small, color: "#b42318" }} title={v.error ?? ""}>⚠ Video upload failed (the camera window retries)</span>;
+  return <span style={small}>🎥 Uploading video…</span>;
+}
 
 // Short beeps so packers can scan without looking at the screen
 let audio;
@@ -402,10 +427,25 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
 
   const pump = () => {
     if (scanner.state !== "idle" || !queue.current.length) return;
-    const c = queue.current.shift();
-    if (current && current.state === "batched") scanner.submit({ intent: "packScan", id: String(batch.id), shipmentId: String(current.id), code: c }, { method: "post" });
-    else scanner.submit({ intent: "findBox", id: String(batch.id), code: c }, { method: "post" });
+    // A typed / scanned code, or { code, via } from the pack camera
+    const next = queue.current.shift();
+    const c = typeof next === "string" ? next : next.code;
+    const via = typeof next === "string" ? "barcode" : next.via;
+    if (current && current.state === "batched") scanner.submit({ intent: "packScan", id: String(batch.id), shipmentId: String(current.id), code: c, via }, { method: "post" });
+    else if (!c.startsWith("line:")) scanner.submit({ intent: "findBox", id: String(batch.id), code: c }, { method: "post" });
+    else pump();
   };
+  // The pack camera's scans go through the same queue as the scanner's
+  const cam = usePackCamera({
+    batchId: batch.id,
+    box: current,
+    enabled: Boolean(can.pack && data.canPack),
+    onScans: (list) => {
+      if (askAck) return;
+      for (const x of list) queue.current.push({ code: x.code, via: x.via });
+      pump();
+    },
+  });
   useEffect(pump, [scanner.state]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const r = scanner.data;
@@ -512,6 +552,7 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
           Print all packing slips
         </SlipPrintButton>
         <ThisComputer />
+        {can.pack && data.canPack && <PackCameraBar cam={cam} />}
       </div>
 
       {/* Every box holds the same items: buy (and print) all the labels at once, before or after packing */}
@@ -636,6 +677,7 @@ export function PackStation({ data, boxData, can, sandbox = false }) {
                       {b.orderName}
                       {b.part ? <span style={{ ...muted, fontSize: "14px" }}> · part {b.part}</span> : null}
                     </h3>
+                    {cam.linked && <BoxVideo boxId={b.id} batchId={batch.id} state={b.state} />}
                     {b.state === "shipped" ? (
                       <span style={pill("#f1f1f1", "#1a5e20")}>Shipped ✓</span>
                     ) : b.state !== "batched" ? (

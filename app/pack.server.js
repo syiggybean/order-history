@@ -354,7 +354,8 @@ async function markPacked(shop, b, s, user, override = null) {
 }
 
 // A scan at the bench: one unit of an item in this box
-export async function packScan(shop, batchId, shipmentId, code, user) {
+// via: "barcode" (scanner or camera) or "visual" (the pack camera matched a photo; code is "line:<item key>")
+export async function packScan(shop, batchId, shipmentId, code, user, { via = "barcode" } = {}) {
   const { b, s } = await loadBox(shop, batchId, shipmentId);
   if (s.state !== "batched") return { ok: false, error: `${s.orderName} is already packed.` };
   if (s.noticeKey && s.packAckKey !== s.noticeKey) return { ok: false, needsAck: true, error: "Read and acknowledge the note / address change first." };
@@ -367,7 +368,10 @@ export async function packScan(shop, batchId, shipmentId, code, user) {
   }
   const lines = linesOf(s);
   const packed = json(s.packed, {});
-  const matches = lines.filter((l) => norm(l.barcode) === c || norm(l.sku) === c);
+  // The pack camera matched a photo to one of the box's items (no barcode)
+  const byKey = c.startsWith("line:") ? String(code).trim().slice(5) : null;
+  const matches = byKey ? lines.filter((l) => itemKey(l) === byKey) : lines.filter((l) => norm(l.barcode) === c || norm(l.sku) === c);
+  if (byKey && !matches.length) return { ok: false, code, error: `That item isn't in ${s.orderName}.` };
   if (!matches.length) return { ok: false, code, error: `${code} isn't in ${s.orderName}. Don't pack it.` };
   const line = matches.find((l) => (packed[itemKey(l)] ?? 0) < l.quantity) ?? matches[0];
   const key = itemKey(line);
@@ -387,8 +391,10 @@ export async function packScan(shop, batchId, shipmentId, code, user) {
   }
   if (!saved) throw new ShippingError("Couldn't save that scan; please scan again.");
   const complete = lines.every((l) => (saved[itemKey(l)] ?? 0) >= l.quantity);
+  if (via === "visual")
+    await logEvent(shop, { shipmentId: s.id, batchId: b.id, orderName: s.orderName, type: "pack_visual", detail: `${label(line)}: matched by photo on the pack camera (no barcode)`, user });
   if (complete) await markPacked(shop, b, s, user);
-  return { ok: true, code, key, scanned: saved[key], qty: line.quantity, title: label(line), complete };
+  return { ok: true, code, key, scanned: saved[key], qty: line.quantity, title: label(line), complete, via };
 }
 
 // Pack without a full scan (damaged barcode, item swapped with the customer's OK...)

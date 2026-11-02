@@ -65,6 +65,35 @@ export function daysUntil(today, day) {
 export const tierFor = (days) => TIERS.find((t) => days >= t.minDays) ?? null;
 
 // ---------------------------------------------------------------------------
+// Product page template: a product whose release date is still to come (or
+// that has a pre-order countdown) uses the theme's "preorder" template, where
+// the countdown blocks live. Released products go back to the default
+// template. Products on any other custom template are left alone.
+// ---------------------------------------------------------------------------
+
+export const PREORDER_TEMPLATE = "preorder";
+export const templateName = (suffix) => (suffix ? `product.${suffix}` : "Default product");
+
+// p: { release, templateSuffix } → null (fine), { conflict } or { from, to }
+export function templatePlan(p, today, inCountdown = false) {
+  const current = p.templateSuffix ?? "";
+  const want = (p.release && p.release > today) || inCountdown ? PREORDER_TEMPLATE : "";
+  if (current === want) return null;
+  if (want === PREORDER_TEMPLATE && current !== "") return { conflict: current };
+  if (want === "" && current !== PREORDER_TEMPLATE) return null;
+  return { from: current, to: want };
+}
+
+// Products with countdown times set (they need the preorder template too)
+export async function countdownProductIds(shop) {
+  const rows = await db.preorderWindow.findMany({
+    where: { shop, OR: [{ opensAt: { not: null } }, { closesAt: { not: null } }] },
+    select: { productId: true },
+  });
+  return new Set(rows.map((r) => r.productId));
+}
+
+// ---------------------------------------------------------------------------
 // GraphQL helpers (retry when Shopify asks us to slow down)
 // ---------------------------------------------------------------------------
 
@@ -141,11 +170,44 @@ export async function loadProfiles(admin) {
 //            variants: [{ id, profileId }] }
 // ---------------------------------------------------------------------------
 
-function planForProduct(p, profiles, today) {
+function planForProduct(p, profiles, today, countdown = new Set()) {
   if (p.status === "ARCHIVED") return { skip: "archived" };
 
+  const t = templatePlan(p, today, countdown.has(p.id));
+  const tpl = t && !t.conflict ? t : null;
+  const templateConflict = t?.conflict ?? null;
+  const templateFields = {
+    templateChange: Boolean(tpl),
+    fromTemplate: tpl ? templateName(tpl.from) : null,
+    toTemplate: tpl ? templateName(tpl.to) : null,
+    templateSuffix: tpl ? tpl.to : null,
+  };
+
   const currentGt = p.tags.filter(isGtTag);
-  if (!p.release) return currentGt.length ? { skip: "noRelease", tags: currentGt } : { skip: "noRelease" };
+  if (!p.release) {
+    const out = currentGt.length ? { skip: "noRelease", tags: currentGt } : { skip: "noRelease" };
+    if (templateConflict) out.templateConflict = templateConflict;
+    if (tpl) {
+      // No release date, but the template still needs changing (e.g. countdown added or removed)
+      out.change = {
+        id: p.id,
+        title: p.title,
+        release: null,
+        days: null,
+        tagChange: false,
+        fromTag: currentGt.length ? currentGt.join(", ") : null,
+        toTag: currentGt.length ? currentGt.join(", ") : null,
+        add: [],
+        remove: [],
+        fromProfile: null,
+        toProfile: null,
+        toProfileId: null,
+        moveVariantIds: [],
+        ...templateFields,
+      };
+    }
+    return out;
+  }
 
   const days = daysUntil(today, p.release);
   const want = tierFor(days)?.tag ?? null;
@@ -167,9 +229,10 @@ function planForProduct(p, profiles, today) {
   }
 
   const moveVariantIds = target ? p.variants.filter((v) => v.profileId !== target.id).map((v) => v.id) : [];
-  if (!add.length && !remove.length && !moveVariantIds.length) return { change: null };
+  if (!add.length && !remove.length && !moveVariantIds.length && !tpl) return { change: null, templateConflict };
 
   return {
+    templateConflict,
     change: {
       id: p.id,
       title: p.title,
@@ -184,6 +247,7 @@ function planForProduct(p, profiles, today) {
       toProfile: moveVariantIds.length ? target.name : null,
       toProfileId: moveVariantIds.length ? target.id : null,
       moveVariantIds,
+      ...templateFields,
     },
   };
 }
@@ -201,6 +265,7 @@ const BULK_QUERY = `
         title
         status
         tags
+        templateSuffix
         metafield(namespace: "${NAMESPACE}", key: "${KEY}") { value }
         variants {
           edges {
@@ -267,6 +332,7 @@ async function downloadProducts(url) {
         title: obj.title,
         status: obj.status,
         tags: obj.tags ?? [],
+        templateSuffix: obj.templateSuffix ?? "",
         release: toDay(obj.metafield?.value),
         variants: [],
       });
@@ -295,23 +361,28 @@ export async function waitForScan(admin, bulkId) {
 }
 
 // Works out what should change across the catalog. Nothing is written here.
-export async function buildPlan(admin, bulkId, profiles) {
+// shop: to include products with pre-order countdowns
+export async function buildPlan(admin, bulkId, profiles, shop = null) {
   const products = await loadCatalog(admin, bulkId);
   const today = todayInStore();
+  const countdown = shop ? await countdownProductIds(shop) : new Set();
 
   const changes = [];
   const noRelease = []; // has a GT tag but no release date, left alone
+  const otherTemplate = []; // should be on the preorder template, but uses its own
   let withRelease = 0;
   let archived = 0;
 
   for (const p of products) {
-    const result = planForProduct(p, profiles, today);
+    const result = planForProduct(p, profiles, today, countdown);
     if (result.skip === "archived") {
       archived++;
       continue;
     }
+    if (result.templateConflict) otherTemplate.push({ id: p.id, title: p.title, template: templateName(result.templateConflict) });
     if (result.skip === "noRelease") {
       if (result.tags) noRelease.push({ id: p.id, title: p.title, tags: result.tags });
+      if (result.change) changes.push(result.change);
       continue;
     }
     withRelease++;
@@ -320,8 +391,9 @@ export async function buildPlan(admin, bulkId, profiles) {
 
   changes.sort((a, b) => a.title.localeCompare(b.title));
   noRelease.sort((a, b) => a.title.localeCompare(b.title));
+  otherTemplate.sort((a, b) => a.title.localeCompare(b.title));
 
-  return { today, scanned: products.length, archived, withRelease, changes, noRelease };
+  return { today, scanned: products.length, archived, withRelease, changes, noRelease, otherTemplate };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +417,11 @@ const PROFILE_ASSOCIATE = `#graphql
     }
   }`;
 
+const TEMPLATE_SET = `#graphql
+  mutation TemplateSet($product: ProductUpdateInput!) {
+    productUpdate(product: $product) { userErrors { field message } }
+  }`;
+
 const newJob = (source) => ({
   source,
   state: "running",
@@ -353,8 +430,12 @@ const newJob = (source) => ({
   total: 0,
   retagged: 0,
   moved: 0,
+  templated: 0,
   byProfile: {}, // profile name -> products moved in
   errors: [],
+  failedIds: [], // products with at least one change that didn't go through
+  onlyIds: null, // a selection, or null for everything
+  templatesOnly: false,
   startedAt: new Date().toISOString(),
   finishedAt: null,
 });
@@ -362,7 +443,7 @@ const newJob = (source) => ({
 // Applies a list of changes, updating `job` as it goes, and writes one
 // activity entry per product. `source` is shown in the activity log.
 async function applyChanges(admin, shop, changes, source, job) {
-  const results = new Map(changes.map((c) => [c.id, { change: c, tagDone: false, moveDone: false }]));
+  const results = new Map(changes.map((c) => [c.id, { change: c, tagDone: false, moveDone: false, templateDone: false }]));
 
   // 1. Tags
   const tagChanges = changes.filter((c) => c.tagChange);
@@ -383,6 +464,7 @@ async function applyChanges(admin, shop, changes, source, job) {
       job.retagged++;
     } catch (e) {
       job.errors.push(`${c.title} (tags): ${errorMessage(e)}`);
+      job.failedIds.push(c.id);
     }
     job.done++;
   }
@@ -414,6 +496,7 @@ async function applyChanges(admin, shop, changes, source, job) {
         job.byProfile[name] = (job.byProfile[name] ?? 0) + batch.length;
       } catch (e) {
         job.errors.push(`${name}: ${errorMessage(e)} (${batch.map((c) => c.title).join(", ")})`);
+        job.failedIds.push(...batch.map((c) => c.id));
       }
       batch = [];
       count = 0;
@@ -427,13 +510,28 @@ async function applyChanges(admin, shop, changes, source, job) {
     await flush();
   }
 
-  // 3. One activity entry per product, describing what actually happened
+  // 3. Product page template
+  job.step = "Updating product templates";
+  for (const c of changes.filter((x) => x.templateChange)) {
+    try {
+      const d = await gql(admin, TEMPLATE_SET, { product: { id: c.id, templateSuffix: c.templateSuffix ?? "" } });
+      checkUserErrors(d.productUpdate, "Changing the template");
+      results.get(c.id).templateDone = true;
+      job.templated++;
+    } catch (e) {
+      job.errors.push(`${c.title} (template): ${errorMessage(e)}`);
+      job.failedIds.push(c.id);
+    }
+  }
+
+  // 4. One activity entry per product, describing what actually happened
   const entries = [];
-  for (const { change: c, tagDone, moveDone } of results.values()) {
-    if (!tagDone && !moveDone) continue;
+  for (const { change: c, tagDone, moveDone, templateDone } of results.values()) {
+    if (!tagDone && !moveDone && !templateDone) continue;
     const parts = [];
     if (c.tagChange) parts.push(`Tag: ${c.fromTag ?? "none"} → ${c.toTag ?? "none"}${tagDone ? "" : " (failed)"}`);
     if (c.moveVariantIds.length) parts.push(`Shipping: ${c.fromProfile} → ${c.toProfile}${moveDone ? "" : " (failed)"}`);
+    if (c.templateChange) parts.push(`Template: ${c.fromTemplate} → ${c.toTemplate}${templateDone ? "" : " (failed)"}`);
     entries.push({
       shop,
       productId: c.id,
@@ -462,8 +560,21 @@ async function runApply(shop, bulkId, job) {
     const profiles = await loadProfiles(admin);
     if (profiles.missing.length) throw new Error(`Missing shipping profiles: ${profiles.missing.join(", ")}`);
 
-    const plan = await buildPlan(admin, bulkId, profiles);
-    await applyChanges(admin, shop, plan.changes, job.source, job);
+    const plan = await buildPlan(admin, bulkId, profiles, shop);
+    let changes = plan.changes;
+    if (job.onlyIds) {
+      const only = new Set(job.onlyIds);
+      changes = changes.filter((c) => only.has(c.id));
+    }
+    // Templates only: leave the tags and shipping profiles for another time
+    if (job.templatesOnly) {
+      changes = changes
+        .filter((c) => c.templateChange)
+        .map((c) => ({ ...c, tagChange: false, add: [], remove: [], moveVariantIds: [], toProfile: null, toProfileId: null }));
+    }
+    job.failedIds = [];
+    await applyChanges(admin, shop, changes, job.source, job);
+    job.failedIds = [...new Set(job.failedIds)];
 
     job.state = "done";
     job.step = "Finished";
@@ -476,10 +587,14 @@ async function runApply(shop, bulkId, job) {
   return job;
 }
 
-// Apply button: starts in the background and returns right away
-export function startApply(shop, bulkId) {
+// Apply buttons: start in the background and return right away.
+// onlyIds: just these products (one row, or a selection); templatesOnly: just the template part
+export function startApply(shop, bulkId, { onlyIds = null, templatesOnly = false } = {}) {
   if (isRunning(shop)) throw new Error("Changes are already being applied.");
-  const job = newJob("Manual");
+  if (onlyIds && !onlyIds.length) throw new Error("Select at least one product.");
+  const job = newJob(onlyIds ? (onlyIds.length === 1 ? "Manual (one product)" : "Manual (selected)") : "Manual");
+  job.onlyIds = onlyIds ? [...new Set(onlyIds.map(String))] : null;
+  job.templatesOnly = Boolean(templatesOnly);
   jobs.set(shop, job);
   runApply(shop, bulkId, job);
   return job;
@@ -496,6 +611,7 @@ const PRODUCT_QUERY = `#graphql
       title
       status
       tags
+      templateSuffix
       metafield(namespace: "${NAMESPACE}", key: "${KEY}") { value }
       variants(first: 250) {
         nodes { id deliveryProfile { id } }
@@ -529,11 +645,12 @@ export async function syncProduct(shop, productId, source = "Product edit") {
       title: p.title,
       status: p.status,
       tags: p.tags ?? [],
+      templateSuffix: p.templateSuffix ?? "",
       release: toDay(p.metafield?.value),
       variants: p.variants.nodes.map((v) => ({ id: v.id, profileId: v.deliveryProfile?.id ?? null })),
     };
 
-    const { change } = planForProduct(product, profiles, todayInStore());
+    const { change } = planForProduct(product, profiles, todayInStore(), await countdownProductIds(shop));
     if (!change) return { status: "unchanged" };
 
     const job = newJob(source);
@@ -543,6 +660,70 @@ export async function syncProduct(shop, productId, source = "Product edit") {
   } finally {
     inFlight.delete(productId);
   }
+}
+
+// Just the template, for a product added to or taken out of the countdown
+// group (works even when the GT shipping profiles aren't set up)
+const TEMPLATE_QUERY = `#graphql
+  query ProductTemplate($id: ID!) {
+    product(id: $id) {
+      id
+      title
+      status
+      templateSuffix
+      metafield(namespace: "${NAMESPACE}", key: "${KEY}") { value }
+    }
+  }`;
+
+export async function syncTemplate(shop, admin, productId, source = "Pre-order countdown") {
+  const p = (await gql(admin, TEMPLATE_QUERY, { id: productId }))?.product;
+  if (!p || p.status === "ARCHIVED") return { status: "missing" };
+  const release = toDay(p.metafield?.value);
+  const t = templatePlan({ release, templateSuffix: p.templateSuffix ?? "" }, todayInStore(), (await countdownProductIds(shop)).has(p.id));
+  if (!t) return { status: "unchanged" };
+  if (t.conflict) return { status: "otherTemplate", template: templateName(t.conflict) };
+  const d = await gql(admin, TEMPLATE_SET, { product: { id: p.id, templateSuffix: t.to } });
+  checkUserErrors(d.productUpdate, "Changing the template");
+  await db.preorderLog.create({
+    data: { shop, productId: p.id, title: p.title, action: source, detail: `Template: ${templateName(t.from)} → ${templateName(t.to)}`, release },
+  });
+  return { status: "updated", template: templateName(t.to) };
+}
+
+// Products on another custom template that should show the countdown: move
+// them to the preorder template on request (one, a selection, or all listed)
+export async function switchToPreorderTemplate(shop, admin, productIds, user = null) {
+  const ids = [...new Set((productIds ?? []).map(String))].filter((id) => /^gid:\/\/shopify\/Product\/\d+$/.test(id));
+  if (!ids.length) throw new Error("Select at least one product.");
+  if (ids.length > 250) throw new Error("Switch up to 250 products at a time.");
+  const switched = [];
+  const failed = [];
+  for (const id of ids) {
+    try {
+      const p = (await gql(admin, TEMPLATE_QUERY, { id }))?.product;
+      if (!p) throw new Error("not found");
+      if ((p.templateSuffix ?? "") === PREORDER_TEMPLATE) {
+        switched.push(id);
+        continue;
+      }
+      const d = await gql(admin, TEMPLATE_SET, { product: { id, templateSuffix: PREORDER_TEMPLATE } });
+      checkUserErrors(d.productUpdate, "Changing the template");
+      await db.preorderLog.create({
+        data: {
+          shop,
+          productId: id,
+          title: p.title,
+          action: user?.name ? `Manual (${user.name})` : "Manual",
+          detail: `Template: ${templateName(p.templateSuffix)} → ${templateName(PREORDER_TEMPLATE)}`,
+          release: toDay(p.metafield?.value),
+        },
+      });
+      switched.push(id);
+    } catch (e) {
+      failed.push({ id, error: errorMessage(e) });
+    }
+  }
+  return { switched, failed };
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +738,9 @@ const DETAILS_QUERY = `#graphql
       title
       status
       tags
+      templateSuffix
+      onlineStoreUrl
+      onlineStorePreviewUrl
       featuredMedia { preview { image { url(transform: { maxWidth: 200 }) } } }
       metafield(namespace: "${NAMESPACE}", key: "${KEY}") { type value }
       variants(first: 250) {
@@ -565,7 +749,7 @@ const DETAILS_QUERY = `#graphql
     }
   }`;
 
-export async function getProductDetails(admin, productId) {
+export async function getProductDetails(admin, productId, shop = null) {
   const data = await gql(admin, DETAILS_QUERY, { id: productId });
   const p = data?.product;
   if (!p) return null;
@@ -573,6 +757,7 @@ export async function getProductDetails(admin, productId) {
   const profiles = await loadProfiles(admin);
   const release = toDay(p.metafield?.value);
   const today = todayInStore();
+  const inCountdown = shop ? (await countdownProductIds(shop)).has(p.id) : false;
   const days = release ? daysUntil(today, release) : null;
   const tier = days === null ? null : tierFor(days);
   const expectedProfile = tier
@@ -593,6 +778,15 @@ export async function getProductDetails(admin, productId) {
     expectedTag: release ? tier?.tag ?? null : undefined,
     expectedProfile: release ? expectedProfile : undefined,
     profiles: [...new Set(p.variants.nodes.map((v) => v.deliveryProfile?.name ?? "No profile"))],
+    // Live page when it's on the online store; otherwise Shopify's preview link
+    storeUrl: p.onlineStoreUrl ?? p.onlineStorePreviewUrl ?? null,
+    storePreview: !p.onlineStoreUrl && Boolean(p.onlineStorePreviewUrl),
+    template: templateName(p.templateSuffix),
+    expectedTemplate: (() => {
+      const t = templatePlan({ release, templateSuffix: p.templateSuffix ?? "" }, today, inCountdown);
+      if (!t) return templateName(p.templateSuffix);
+      return t.conflict ? `${templateName(t.conflict)} (its own template, left alone)` : templateName(t.to);
+    })(),
   };
 }
 
@@ -608,7 +802,7 @@ const METAFIELD_SET = `#graphql
 export async function setReleaseDate(admin, shop, productId, day, source = "Quick view") {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error("Enter a date as YYYY-MM-DD.");
 
-  const before = await getProductDetails(admin, productId);
+  const before = await getProductDetails(admin, productId, shop);
   if (!before) throw new Error("Product not found.");
   if (before.release === day) return { details: before, sync: { status: "unchanged" } };
 
@@ -633,7 +827,7 @@ export async function setReleaseDate(admin, shop, productId, day, source = "Quic
   });
 
   const sync = await syncProduct(shop, productId, source);
-  const details = await getProductDetails(admin, productId);
+  const details = await getProductDetails(admin, productId, shop);
   return { details, sync };
 }
 

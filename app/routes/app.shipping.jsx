@@ -24,10 +24,10 @@ import {
   uninstallCommand,
 } from "../print.server";
 import { slipsPdf } from "../slips-pdf.server";
-import { binSyncStatus, syncAllBins } from "../bins-sync.server";
+import { benchContext, benchLink, benchTakeScans, benchUnlink, videosFor } from "../camera.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
 import { IN_APP_LABELS } from "../components/shipping/features";
-import { useFetcher, useLoaderData, useNavigation, useRevalidator, useSearchParams } from "react-router";
+import { redirect, useFetcher, useLoaderData, useNavigation, useRevalidator, useSearchParams } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { NoAccess } from "../components/NoAccess";
@@ -45,7 +45,6 @@ import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "..
 import { enterSandbox, inSandbox, leaveSandbox, resetSandbox, sandboxAdmin, sandboxShopOf, sandboxSummary } from "../sandbox.server";
 import { EnterSandboxButton, SandboxBanner, SandboxSettings } from "../components/shipping/Sandbox";
 import { BatchHeader, BatchList, RemoveBar, SelectionBar } from "../components/shipping/Batches";
-import { BinsTab } from "../components/shipping/Bins";
 import { PickList } from "../components/shipping/PickList";
 import { PackageSettings } from "../components/shipping/Packages";
 import {
@@ -54,12 +53,9 @@ import {
   assignableStaff,
   batchAllowed,
   cancelBatch,
-  exportBins,
   finishPicking,
   getBatch,
-  importBins,
   listBatches,
-  listBins,
   openBatches,
   pickList,
   removeFromBatch,
@@ -68,7 +64,6 @@ import {
   runAutoBatch,
   saveAutoBatchSettings,
   scanPick,
-  setBin,
   setPicked,
 } from "../batches.server";
 import { Items, MOTION_CSS, PINK, ProductName, QuickViewContext, STORE_TZ, ago, box, cell, fmtDate, head, input, muted, pill, small, thumb, useParamSetter } from "../components/shipping/ui";
@@ -92,11 +87,14 @@ import {
   doublePairs,
   productVariants,
   syncStatus,
+  lookupOrder,
+  resyncOrderByName,
 } from "../shipping.server";
+import { OrderLookupBox } from "../components/shipping/OrderLookup";
 import { ProductPicker } from "../components/shipping/ProductPicker";
 
 const PAGE_SIZE = 50;
-const TABS = ["ready", "waiting", "batches", "review", "stock", "bins", "settings"];
+const TABS = ["ready", "waiting", "batches", "review", "stock", "settings"];
 
 const filterFrom = (params) => ({
   q: params.get("q") || "",
@@ -112,6 +110,16 @@ const filterFrom = (params) => ({
 });
 
 export const loader = async ({ request }) => {
+  // Bins moved to Stock: send old links there
+  {
+    const p = new URL(request.url).searchParams;
+    if (p.get("tab") === "bins") {
+      const next = new URLSearchParams();
+      for (const k of ["q", "missing"]) if (p.get(k)) next.set(k, p.get(k));
+      for (const k of ["shop", "host", "embedded", "id_token", "locale"]) if (p.get(k)) next.set(k, p.get(k));
+      throw redirect(`/app/stock${next.toString() ? `?${next}` : ""}`);
+    }
+  }
   const { session, user, noAccess, admin } = await loadWithAccess(request, "shipping", "view");
   if (noAccess) return { noAccess: true };
   // Sandbox mode: this person works on the practice copy
@@ -142,7 +150,7 @@ export const loader = async ({ request }) => {
       : null,
     batchId && !view ? getBatch(shop, batchId) : null,
     batchId && view === "pick" ? pickList(shop, batchId) : null,
-    tab === "bins" ? listBins(shop, { q: params.get("q") || "", missing: params.get("missing") === "1" }) : null,
+    null, // bins: now on the Stock page
     listBatches(shop, { show: "live", onlyFor: restricted ? user.id : null }),
     tab === "ready" && canBatches ? openBatches(shop) : null,
     tab === "review" ? listFlags(shop, { status: params.get("status") === "resolved" ? "resolved" : "open" }) : null,
@@ -183,7 +191,6 @@ export const loader = async ({ request }) => {
         ? await packingSlips(shop, sandboxOn ? sandboxAdmin(admin, shop) : admin, batchId, (params.get("slips") || "").split(",").filter(Boolean)).catch(() => null)
         : null,
     sync: syncStatus(shop),
-    binSync: tab === "bins" ? await binSyncStatus(shop) : null,
     // Doubles: the most common pairs; product filter: its variants
     pairs: (tab === "ready" || tab === "waiting") && filter.doubles ? await doublePairs(shop, { ...filter, state: tab }) : null,
     variants: (tab === "ready" || tab === "waiting") && filter.product ? await productVariants(shop, { ...filter, state: tab }) : null,
@@ -230,14 +237,20 @@ const NEEDS = {
   setPicked: "pick",
   finishPicking: "pick",
   reopenPicking: "pick",
-  setBin: "settings",
-  syncBins: "settings",
   assignBatch: "batches",
   ackNotice: "view",
   recheckOrder: "view",
+  lookupOrder: "view",
+  resyncOrder: "view",
   keepAddress: "view",
   findBox: "view",
   packScan: "pack",
+  // Pack camera (its own window)
+  cameraLink: "pack",
+  cameraContext: "pack",
+  cameraScans: "pack",
+  cameraUnlink: "pack",
+  boxVideos: "pack",
   unpack: "pack",
   labelCheck: "pack",
   // In-app labels: buying needs Ship; printing a bought label, Pack or Ship
@@ -254,8 +267,6 @@ const NEEDS = {
   flagOrder: "review",
   resolveFlag: "review",
   reopenFlag: "review",
-  importBins: "settings",
-  exportBins: "view",
   // Direct printing (packing computers)
   agentPrint: ["pick", "pack", "ship", "batches"],
   printJobs: "view",
@@ -327,11 +338,25 @@ export const action = async ({ request }) => {
       const order = await orderDetails(shop, admin, orderId);
       return order ? { intent, orderId, order } : { intent, orderId, error: "This order couldn't be found in Shopify." };
     }
+    if (intent === "lookupOrder") return { intent, ...(await lookupOrder(shop, admin, form.get("q"))) };
+    if (intent === "resyncOrder") {
+      if (sandboxOn) return { intent, error: "Reading from Shopify is off in sandbox. Leave sandbox to re-sync an order." };
+      return { intent, resynced: true, ...(await resyncOrderByName(shop, realAdmin, form.get("q"))) };
+    }
     if (intent === "recheckOrder") return { intent, ok: true, ...(await recheckOrder(shop, admin, id)) };
     if (intent === "keepAddress") return { intent, ok: true, ...(await keepAddress(shop, id, user)) };
     if (intent === "ackNotice") return { intent, ok: true, ...(await ackNotice(shop, id, String(form.get("context") ?? "view"), user)) };
     if (intent === "findBox") return { intent, ...(await findBox(shop, id, String(form.get("code") ?? ""))) };
-    if (intent === "packScan") return { intent, ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user)) };
+    if (intent === "packScan")
+      return { intent, ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user, { via: form.get("via") === "visual" ? "visual" : "barcode" })) };
+    if (intent === "cameraLink") return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request))) };
+    if (intent === "cameraContext") {
+      await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null });
+      return { intent, ok: true };
+    }
+    if (intent === "cameraScans") return { intent, ok: true, ...(await benchTakeScans(session.shop, shop, user)) };
+    if (intent === "cameraUnlink") return { intent, ok: true, ...(await benchUnlink(session.shop, shop, user)) };
+    if (intent === "boxVideos") return { intent, ok: true, shipmentId: Number(form.get("shipmentId")), videos: await videosFor(session.shop, form.get("shipmentId")) };
     if (intent === "overridePack") return { intent, ...(await overridePack(shop, id, Number(form.get("shipmentId")), form.get("reason"), user)) };
     if (intent === "labelCheck") return { intent, ...(await labelCheck(shop, admin, id, Number(form.get("shipmentId")))) };
     if (intent === "buyLabel") {
@@ -445,13 +470,6 @@ export const action = async ({ request }) => {
       await reopenPicking(shop, id, user);
       return { intent, ok: true };
     }
-    if (intent === "syncBins") {
-      if (sandboxOn) return { intent, error: "The sandbox copy doesn't sync with Shopify." };
-      return { intent, ok: true, result: await syncAllBins(shop, { admin, force: true }) };
-    }
-    if (intent === "setBin") return { intent, ok: true, ...(await setBin(shop, JSON.parse(String(form.get("item"))), form.get("bin"), user)) };
-    if (intent === "importBins") return { intent, ok: true, ...(await importBins(shop, admin, String(form.get("text") ?? ""), user)) };
-    if (intent === "exportBins") return { intent, ok: true, csv: await exportBins(shop) };
     if (intent === "sync") {
       return { intent, ok: true, ...startFullRead(shop) };
     }
@@ -1447,7 +1465,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, binSync } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1469,8 +1487,7 @@ function Page() {
     { id: "waiting", label: "Waiting", n: c.waiting ?? 0 },
     { id: "batches", label: "Batches", n: liveBatchCount },
     { id: "review", label: "Review", n: flagCount, alert: flagCount > 0 },
-    { id: "stock", label: "Stock" },
-    { id: "bins", label: "Bins" },
+    { id: "stock", label: "Stock vs orders" },
     { id: "settings", label: "Settings and activity" },
   ];
   const tabStyle = (active) => ({
@@ -1527,6 +1544,16 @@ function Page() {
               ))}
           </button>
         ))}
+        <OrderLookupBox
+          onGo={(t, name, batchId) =>
+            go(
+              t === "batches"
+                ? { tab: t, batch: batchId ?? null, view: null, q: null, box: null, slips: null }
+                : { tab: t, q: name, batch: null, view: null, method: null, country: null, product: null, pname: null, variant: null, singles: null, doubles: null, pair: null },
+              { replace: false },
+            )
+          }
+        />
       </div>
 
       {sandbox && <SandboxBanner summary={sandbox} />}
@@ -1598,7 +1625,6 @@ function Page() {
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
       )}
       {tab === "review" && flags && <ReviewTab flags={flags} status={flagStatus} canReview={allowed.review} />}
-      {tab === "bins" && bins && <BinsTab items={bins} q={binQuery.q} missing={binQuery.missing} canEdit={allowed.settings} sync={binSync} />}
       {tab === "stock" && <StockTab overview={overview} />}
       {tab === "settings" && <SettingsTab overview={overview} events={events} sync={sync} canSettings={allowed.settings} sandboxOn={Boolean(sandbox)} printing={printing} canPrint={allowed.pack || allowed.ship} />}
       {orderView && (

@@ -229,3 +229,32 @@ export async function binSyncStatus(shop) {
   const s = await db.shippingSettings.findUnique({ where: { shop } });
   return { syncedAt: s?.binsSyncedAt?.toISOString() ?? null, error: s?.binsSyncError ?? null, running: running.has(shop) };
 }
+
+// A product's variants with their bins, for the product quick view (picks up Shopify edits first)
+export async function productBinsView(shop, productId, { admin = null, workShop = shop } = {}) {
+  const client = admin ?? (await adminFor(shop));
+  const p = (await gql(client, PRODUCT_BINS, { id: productId }))?.product;
+  if (!p) return null;
+  if (!isSandboxShop(workShop)) {
+    try {
+      await pullProductBins(workShop, productId, { admin: client });
+    } catch (e) {
+      console.error(`[bins] quick view ${productId}:`, errorMessage(e));
+    }
+  }
+  const ids = p.variants.nodes.map((v) => v.id);
+  const saved = new Map((await db.productBin.findMany({ where: { shop: workShop, variantId: { in: ids } } })).map((b) => [b.variantId, b]));
+  return {
+    productId: p.id,
+    variants: p.variants.nodes.map((v) => ({
+      variantId: v.id,
+      productId: p.id,
+      title: p.title,
+      variantTitle: v.title && v.title !== "Default Title" ? v.title : null,
+      sku: v.sku ?? null,
+      barcode: v.barcode ?? null,
+      bin: saved.get(v.id)?.bin ?? null,
+      updatedBy: saved.get(v.id)?.updatedBy ?? null,
+    })),
+  };
+}

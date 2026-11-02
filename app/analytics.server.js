@@ -5,18 +5,26 @@ import { runShopifyql } from "./inventory-sync.server";
 import { errorMessage, todayInStore } from "./preorders.server";
 
 // ---------------------------------------------------------------------------
-// Sell-through analytics: one row per product for a period, saved as a
-// snapshot so the page opens instantly. The page groups, sorts and makes
-// suggestions from these rows (see analytics-logic.js).
+// Reporting dashboard: one row per product for a period, saved as a snapshot
+// so the page opens instantly. The page groups, sorts and makes suggestions
+// from these rows (see analytics-logic.js).
 //
 //   sold, net sales, cost, profit  ← Shopify's sales report (ShopifyQL)
-//   received                       ← the app's copy of Shopify's stock history:
-//                                    stock received from suppliers ("Received",
-//                                    transfers received, POs received in the app),
-//                                    minus moves out to another of your locations
-//   on hand, type, vendor, status  ← one bulk read of the catalog
+//   ending count                   ← on hand (all locations) now, minus stock
+//                                    changes after the period ended
+//   starting count                 ← ending count minus stock changes during the
+//                                    period (the app's copy of Shopify's stock
+//                                    history). Shopify's history doesn't record
+//                                    "On hand" itself, so its change is added up
+//                                    from the states it's made of (available,
+//                                    committed, reserved, damaged, safety stock,
+//                                    quality control). "Incoming" isn't on hand.
+//   category, vendor, status       ← one bulk read of the catalog
 //   supplier                       ← the most recent purchase order in the app
 // ---------------------------------------------------------------------------
+
+import { ROWS_VERSION } from "./analytics-logic";
+export { ROWS_VERSION };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PRODUCT = "gid://shopify/Product/";
@@ -140,17 +148,31 @@ async function shopifyqlPatiently(admin, query, step) {
 
 const SALES_PAGE = 5000;
 const salesQuery = (from, to, offset) =>
-  `FROM sales SHOW net_items_sold, net_sales, cost_of_goods_sold, gross_profit, net_sales_with_cost_recorded GROUP BY product_id, product_title, product_type, product_vendor SINCE ${from} UNTIL ${to} ORDER BY net_items_sold DESC LIMIT ${SALES_PAGE} OFFSET ${offset}`;
+  `FROM sales SHOW net_items_sold, net_sales, cost_of_goods_sold, gross_profit, net_sales_with_cost_recorded GROUP BY product_id, product_title, product_vendor SINCE ${from} UNTIL ${to} ORDER BY net_items_sold DESC LIMIT ${SALES_PAGE} OFFSET ${offset}`;
 
-const CATALOG = `{
+// Each variant, with its on-hand count at every location (child rows)
+// On hand = these states added together (Shopify's definition)
+export const ON_HAND_STATES = ["available", "committed", "reserved", "damaged", "safety_stock", "quality_control"];
+
+export const CATALOG = `{
   productVariants {
     edges {
       node {
         id
         sku
-        inventoryQuantity
-        inventoryItem { id tracked }
-        product { id title handle productType vendor status createdAt }
+        inventoryItem {
+          id
+          tracked
+          inventoryLevels {
+            edges {
+              node {
+                id
+                quantities(names: ["on_hand"]) { name quantity }
+              }
+            }
+          }
+        }
+        product { id title handle vendor status createdAt category { name fullName } }
       }
     }
   }
@@ -159,11 +181,13 @@ const CATALOG = `{
 export async function buildRows(shop, admin, period, step) {
   // 1. Catalog: every variant with its stock and product details
   await step?.("Reading your catalog from Shopify");
-  const variants = await runBulkQuery(admin, CATALOG, { label: "Catalog read", onProgress: (t) => step?.(t) });
+  const lines = await runBulkQuery(admin, CATALOG, { label: "Catalog read", onProgress: (t) => step?.(t) });
   const products = new Map();
   const productOfItem = new Map();
   const productOfVariant = new Map();
-  for (const v of variants) {
+  const trackedVariant = new Map(); // variant id -> product row, for stock-tracked variants
+  for (const v of lines) {
+    if (v.__parentId) continue;
     const p = v.product;
     if (!p?.id) continue;
     if (!products.has(p.id)) {
@@ -171,7 +195,8 @@ export async function buildRows(shop, admin, period, step) {
         id: p.id,
         title: p.title,
         handle: p.handle ?? null,
-        type: p.productType || null,
+        category: p.category?.name || null,
+        categoryPath: p.category?.fullName || null,
         vendor: p.vendor || null,
         status: String(p.status ?? "").toLowerCase() || null,
         createdAt: p.createdAt ?? null,
@@ -184,12 +209,19 @@ export async function buildRows(shop, admin, period, step) {
     const row = products.get(p.id);
     row.variants++;
     if (v.sku) row.skus.push(v.sku);
-    if (v.inventoryItem?.tracked !== false && Number.isFinite(Number(v.inventoryQuantity))) {
-      row.onHand += Number(v.inventoryQuantity);
+    if (v.inventoryItem?.tracked !== false) {
       row.tracked = true;
+      trackedVariant.set(v.id, row);
     }
     if (v.inventoryItem?.id) productOfItem.set(v.inventoryItem.id, p.id);
     productOfVariant.set(v.id, p.id);
+  }
+  // On hand at each location (child rows of the variant)
+  for (const l of lines) {
+    if (!l.__parentId || !Array.isArray(l.quantities)) continue;
+    const row = trackedVariant.get(l.__parentId);
+    if (!row) continue;
+    row.onHand += num(l.quantities.find((q) => q.name === "on_hand")?.quantity);
   }
 
   // 2. Sales, cost and profit for the period
@@ -200,14 +232,13 @@ export async function buildRows(shop, admin, period, step) {
     for (const r of rows) {
       const id = gid(PRODUCT, r.product_id);
       if (!id) continue;
-      const s = sales.get(id) ?? { sold: 0, netSales: 0, cost: 0, profit: 0, costedSales: 0, title: null, type: null, vendor: null };
+      const s = sales.get(id) ?? { sold: 0, netSales: 0, cost: 0, profit: 0, costedSales: 0, title: null, vendor: null };
       s.sold += num(r.net_items_sold);
       s.netSales += num(r.net_sales);
       s.cost += num(r.cost_of_goods_sold);
       s.profit += num(r.gross_profit);
       s.costedSales += num(r.net_sales_with_cost_recorded);
       s.title ??= r.product_title ?? null;
-      s.type ??= r.product_type || null;
       s.vendor ??= r.product_vendor || null;
       sales.set(id, s);
     }
@@ -215,30 +246,23 @@ export async function buildRows(shop, admin, period, step) {
     await step?.(`Reading sales: ${(offset + rows.length).toLocaleString()} products so far`);
   }
 
-  // 3. Units received in the period, from the stored stock history
-  await step?.("Adding up stock received");
+  // 3. Starting and ending counts: work back from on hand now through the
+  // stored stock history, first to the end of the period, then to its start
+  await step?.("Working out starting and ending counts");
   const start = storeDayStartUtc(period.from);
   const end = storeDayStartUtc(addDays(period.to, 1));
-  const received = new Map();
-  const moves = await db.inventoryAdjustment.groupBy({
-    by: ["inventoryItemId", "productId", "reason"],
-    where: {
-      shop,
-      state: "available",
-      occurredAt: { gte: start, lt: end },
-      reason: { in: ["received", "movement_received", "movement_created", "movement_updated"] },
-    },
-    _sum: { change: true },
-  });
-  // Receiving at one of your locations from another isn't new stock: the
-  // matching move out (movement_created/updated) cancels it out
-  for (const m of moves) {
-    const pid = productOfItem.get(m.inventoryItemId) ?? m.productId ?? null;
-    if (!pid) continue;
-    const change = m._sum.change ?? 0;
-    const counts = m.reason === "received" || m.reason === "movement_received" ? change : Math.min(0, change);
-    received.set(pid, (received.get(pid) ?? 0) + counts);
-  }
+  const changeSums = async (where) => {
+    const out = new Map();
+    const rows = await db.inventoryAdjustment.groupBy({ by: ["inventoryItemId", "productId"], where: { shop, state: { in: ON_HAND_STATES }, ...where }, _sum: { change: true } });
+    for (const m of rows) {
+      const pid = productOfItem.get(m.inventoryItemId) ?? m.productId ?? null;
+      if (pid) out.set(pid, (out.get(pid) ?? 0) + (m._sum.change ?? 0));
+    }
+    return out;
+  };
+  const after = await changeSums({ occurredAt: { gte: end } });
+  const during = await changeSums({ occurredAt: { gte: start, lt: end } });
+  const history = await historyCoverage(shop);
 
   // 4. Supplier: from the most recent purchase order with this product
   const pos = await db.purchaseOrder.findMany({ where: { shop, supplierName: { not: null } }, select: { id: true, supplierName: true, createdAt: true }, orderBy: { createdAt: "asc" } });
@@ -252,29 +276,32 @@ export async function buildRows(shop, admin, period, step) {
     if (pid) supplier.set(pid, poById.get(l.poId).supplierName);
   }
 
-  // 5. One row per product with any activity or stock
-  const ids = new Set([...products.keys(), ...sales.keys(), ...received.keys()]);
+  // 5. One row per product with any sales or stock in the period
+  const ids = new Set([...products.keys(), ...sales.keys(), ...during.keys()]);
   const rows = [];
   for (const id of ids) {
     const p = products.get(id);
     const s = sales.get(id);
-    const got = Math.max(0, received.get(id) ?? 0);
-    if (!s && !got && !(p && p.onHand > 0)) continue;
+    // Stock-tracked products only; deleted ones have no count to work back from
+    const ending = p?.tracked ? p.onHand - (after.get(id) ?? 0) : null;
+    const starting = ending === null ? null : ending - (during.get(id) ?? 0);
+    if (!s && !(starting > 0) && !(ending > 0)) continue;
     let copy = null;
     if (!p) copy = await db.catalogProduct.findUnique({ where: { shop_productId: { shop, productId: id } } }).catch(() => null);
     rows.push({
       id,
       title: p?.title ?? s?.title ?? copy?.title ?? "Unknown product",
-      type: p?.type ?? s?.type ?? copy?.productType ?? null,
+      category: p?.category ?? null,
+      categoryPath: p?.categoryPath ?? null,
       vendor: p?.vendor ?? s?.vendor ?? copy?.vendor ?? null,
       supplier: supplier.get(id) ?? null,
       status: p ? p.status : "deleted",
       createdAt: p?.createdAt ?? null,
       variants: p?.variants ?? 0,
       sku: p?.skus?.length === 1 ? p.skus[0] : null,
+      starting,
       sold: s?.sold ?? 0,
-      received: got,
-      onHand: p?.tracked ? p.onHand : null,
+      ending,
       netSales: round2(s?.netSales ?? 0),
       cost: round2(s?.cost ?? 0),
       profit: round2(s?.profit ?? 0),
@@ -284,7 +311,8 @@ export async function buildRows(shop, admin, period, step) {
   const totals = rows.reduce(
     (t, r) => {
       t.sold += r.sold;
-      t.received += r.received;
+      t.starting += Math.max(0, r.starting ?? 0);
+      t.ending += Math.max(0, r.ending ?? 0);
       t.netSales += r.netSales;
       t.cost += r.cost;
       t.profit += r.profit;
@@ -292,10 +320,41 @@ export async function buildRows(shop, admin, period, step) {
       t.products++;
       return t;
     },
-    { sold: 0, received: 0, netSales: 0, cost: 0, profit: 0, costedSales: 0, products: 0, days: period.days, from: period.from, to: period.to },
+    {
+      version: ROWS_VERSION,
+      sold: 0,
+      starting: 0,
+      ending: 0,
+      netSales: 0,
+      cost: 0,
+      profit: 0,
+      costedSales: 0,
+      products: 0,
+      days: period.days,
+      from: period.from,
+      to: period.to,
+      // Starting counts need stock history back to the period's start
+      historyFrom: history.from,
+      historyComplete: history.complete || (history.from !== null && history.from <= period.from),
+    },
   );
   for (const k of ["netSales", "cost", "profit", "costedSales"]) totals[k] = round2(totals[k]);
   return { rows, totals };
+}
+
+// How far back the app's copy of the stock history goes
+async function historyCoverage(shop) {
+  const s = await db.inventorySync.findUnique({ where: { shop } }).catch(() => null);
+  if (s?.backfillDone) return { complete: true, from: null };
+  // Loading runs newest month first: every month before the one being loaded now is complete
+  let plan = [];
+  try {
+    plan = s?.backfillPlan ? JSON.parse(s.backfillPlan) : [];
+  } catch {
+    plan = [];
+  }
+  const done = s && s.backfillIndex > 0 ? plan[s.backfillIndex - 1] : null;
+  return { complete: false, from: done?.month ? `${done.month}-01` : null };
 }
 
 // Midnight in the store's time zone (Pacific) for a "YYYY-MM-DD" day

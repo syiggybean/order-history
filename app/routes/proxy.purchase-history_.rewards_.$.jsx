@@ -8,6 +8,7 @@ import {
   getProgram,
   joinWithInvite,
   memberBadge,
+  memberPanel,
   memberView,
   redeem,
   setBirthday,
@@ -17,6 +18,7 @@ import { liquid } from "../wishlist-page.server";
 
 // Rewards requests from the storefront, through the app proxy:
 //   GET  /apps/purchase-history/rewards/me            points for the header badge (members only)
+//   GET  /apps/purchase-history/rewards/panel         the header flyout: balance, tier, rewards, codes
 //   GET  /apps/purchase-history/rewards/join/<token>  private join link
 //   POST /apps/purchase-history/rewards/redeem        { rewardId }
 //   POST /apps/purchase-history/rewards/birthday      { date: "MM-DD" }
@@ -34,6 +36,7 @@ export const loader = async ({ request, params }) => {
   const customerId = customerKey(url.searchParams.get("logged_in_customer_id"));
 
   if (path === "me") return json(customerId ? await memberBadge(shop, customerId) : { member: false });
+  if (path === "panel") return json(customerId ? await memberPanel(shop, customerId) : { member: false });
 
   const join = path.match(/^join\/([A-Za-z0-9_-]{6,40})$/);
   if (join) {

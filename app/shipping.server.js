@@ -141,8 +141,11 @@ const ORDER_FOS = `#graphql
 
 const ONE_FO = `#graphql
   query ($id: ID!) {
-    fulfillmentOrder(id: $id) { id status fulfillments(first: 1) { nodes { id } } }
+    fulfillmentOrder(id: $id) { ${FO_FIELDS} fulfillments(first: 1) { nodes { id } } }
   }`;
+
+// Fulfillment order statuses that still have something to send
+export const OPEN_FO = ["OPEN", "ON_HOLD", "IN_PROGRESS", "SCHEDULED"];
 
 // GT tags mark pre-orders: "GT30Days", "GT 30 Days", "GT30" and so on
 export const isGtTag = (tag) => /^gt\s*\d+/i.test(String(tag).trim());
@@ -231,6 +234,14 @@ async function upsertShipment(shop, data) {
 async function closeMissing(shop, admin, shipment) {
   const data = await gql(admin, ONE_FO, { id: shipment.fulfillmentOrderId }).catch(() => null);
   const fo = data?.fulfillmentOrder;
+  // Still open in Shopify (the list just didn't include it): keep it, refreshed
+  if (fo && OPEN_FO.includes(fo.status)) {
+    const s = toShipment(fo);
+    if (s) {
+      await upsertShipment(shop, s);
+      return "kept";
+    }
+  }
   const shipped = fo?.status === "CLOSED" && fo.fulfillments.nodes.length > 0;
   // Label bought in the app before the box was packed: Shopify sees it as
   // fulfilled, but it stays on the pack bench until it's packed
@@ -263,15 +274,21 @@ export async function syncAll(shop, admin, onProgress = () => {}) {
       pages++;
       onProgress({ read: seen.size, pages });
     } while (after && pages < 500);
+    // Stopped early (very large store): don't close out what wasn't reached
+    if (after) {
+      await db.shippingSettings.update({ where: { shop }, data: { lastFullSyncAt: new Date(), lastSyncError: null } });
+      return { open: seen.size, closed: 0 };
+    }
 
     const missing = await db.shipment.findMany({
       where: { shop, state: { in: ACTIVE_STATES }, fulfillmentOrderId: { notIn: [...seen] } },
     });
     onProgress({ read: seen.size, pages, phase: `Closing out ${missing.length} shipped or cancelled elsewhere` });
-    for (const m of missing) await closeMissing(shop, admin, m);
+    let closed = 0;
+    for (const m of missing) if ((await closeMissing(shop, admin, m)) !== "kept") closed++;
 
     await db.shippingSettings.update({ where: { shop }, data: { lastFullSyncAt: new Date(), lastSyncError: null } });
-    return { open: seen.size, closed: missing.length };
+    return { open: seen.size, closed };
   } catch (e) {
     await db.shippingSettings.update({ where: { shop }, data: { lastSyncError: errorMessage(e).slice(0, 500) } });
     throw e;
@@ -284,7 +301,7 @@ export async function syncOrder(shop, admin, orderId) {
   const fos = data?.order?.fulfillmentOrders?.nodes ?? [];
   const seen = new Set();
   for (const fo of fos) {
-    if (!["OPEN", "ON_HOLD", "IN_PROGRESS", "SCHEDULED"].includes(fo.status)) continue;
+    if (!OPEN_FO.includes(fo.status)) continue;
     const s = toShipment(fo);
     if (!s) continue;
     seen.add(s.fulfillmentOrderId);
@@ -1273,4 +1290,160 @@ if (!globalThis.__shippingTimer && process.env.NODE_ENV !== "test") {
   const t = () => tick().catch((e) => console.error("[shipping] tick:", errorMessage(e)));
   globalThis.__shippingTimer = setInterval(t, 2 * 60 * 1000);
   setTimeout(t, 45 * 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Order lookup: where an order is in Shipping, or why it isn't there
+// ---------------------------------------------------------------------------
+
+const FIND_ORDER = `#graphql
+  query FindOrder($q: String!) {
+    orders(first: 5, query: $q, sortKey: CREATED_AT, reverse: true) { nodes { id name } }
+  }`;
+
+const LOOKUP_ORDER = `#graphql
+  query LookupOrder($id: ID!) {
+    order(id: $id) {
+      id
+      name
+      createdAt
+      cancelledAt
+      closed
+      displayFinancialStatus
+      displayFulfillmentStatus
+      lineItems(first: 100) {
+        nodes { id title variantTitle quantity currentQuantity unfulfilledQuantity requiresShipping }
+      }
+      fulfillmentOrders(first: 20) { nodes { ${FO_FIELDS} } }
+    }
+  }`;
+
+const STORE_TZ_SERVER = "America/Los_Angeles";
+const TAB_OF = { ready: "Ready to ship", waiting: "Waiting", batched: "Batches", packed: "Batches", labeling: "Batches" };
+const lineName = (l) => `${l.title}${l.variantTitle && l.variantTitle !== "Default Title" ? ` (${l.variantTitle})` : ""}`;
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+// "35968", "#35968", " #35968 " → "#35968"
+export const orderNameOf = (text) => {
+  const t = String(text ?? "").trim().replace(/^#+/, "");
+  return t ? `#${t}` : "";
+};
+
+export async function lookupOrder(shop, admin, text) {
+  const name = orderNameOf(text);
+  if (!name) throw new ShippingError("Enter an order number.");
+  const found = (await gql(admin, FIND_ORDER, { q: `name:${JSON.stringify(name)}` }))?.orders?.nodes ?? [];
+  const hit = found.find((o) => o.name.toLowerCase() === name.toLowerCase());
+  if (!hit) return { name, found: false };
+  const o = (await gql(admin, LOOKUP_ORDER, { id: hit.id }))?.order;
+  if (!o) return { name, found: false };
+
+  const [shipments, events] = await Promise.all([
+    db.shipment.findMany({ where: { shop, orderId: o.id }, orderBy: [{ partIndex: "asc" }, { id: "asc" }] }),
+    db.shippingEvent.findMany({ where: { shop, orderName: o.name }, orderBy: { id: "desc" }, take: 15 }),
+  ]);
+  const byFo = new Map(shipments.map((s) => [s.fulfillmentOrderId, s]));
+  const fos = o.fulfillmentOrders.nodes;
+
+  // Each fulfillment order Shopify shows us, and what the app made of it
+  const parts = fos.map((fo) => {
+    const s = byFo.get(fo.id) ?? null;
+    const remaining = fo.lineItems.nodes.filter((li) => li.remainingQuantity > 0);
+    const base = {
+      fulfillmentOrderId: fo.id,
+      status: fo.status,
+      location: fo.assignedLocation?.name ?? null,
+      method: fo.deliveryMethod?.methodType ?? null,
+      holds: (fo.fulfillmentHolds ?? []).map((h) => h.displayReason).filter(Boolean),
+      lines: remaining.map((li) => ({ name: lineName({ title: li.productTitle, variantTitle: li.variantTitle }), quantity: li.remainingQuantity, requiresShipping: li.requiresShipping })),
+      shipment: s
+        ? { id: s.id, state: s.state, waitingReason: s.waitingReason, flag: s.flag, batchId: s.batchId, closedAt: s.closedAt?.toISOString() ?? null, syncedAt: s.syncedAt?.toISOString() ?? null }
+        : null,
+    };
+    let verdict;
+    let problem = false;
+    if (!OPEN_FO.includes(fo.status)) {
+      verdict =
+        fo.status === "CLOSED"
+          ? "Done in Shopify (fulfilled or nothing left to send)."
+          : fo.status === "CANCELLED"
+            ? "Cancelled in Shopify."
+            : `Shopify marks this part ${fo.status.toLowerCase().replace(/_/g, " ")}, so there's nothing to ship from it.`;
+    } else if (fo.deliveryMethod?.methodType && fo.deliveryMethod.methodType !== "SHIPPING") {
+      verdict = `Not shipped: the delivery method is ${fo.deliveryMethod.methodType.toLowerCase().replace(/_/g, " ")}. Shipping only lists orders that go in the post.`;
+    } else if (!remaining.length) {
+      verdict = "Nothing left to send on this part.";
+    } else if (!remaining.some((li) => li.requiresShipping)) {
+      verdict = "Not shipped: none of the items left are set to need shipping in Shopify (e.g. digital or gift cards).";
+    } else if (!s) {
+      problem = true;
+      verdict = "Open in Shopify but missing from the app. Re-sync below should bring it in.";
+    } else if (TAB_OF[s.state]) {
+      verdict =
+        s.state === "waiting"
+          ? `On the Waiting tab: ${s.waitingReason ?? "waiting"}.`
+          : s.state === "ready"
+            ? "On the Ready to ship tab."
+            : `In batch ${s.batchId ?? "?"} (${s.state}) on the Batches tab.`;
+    } else {
+      problem = true;
+      const when = s.closedAt ? ` on ${new Date(s.closedAt).toLocaleString("en-US", { timeZone: STORE_TZ_SERVER, dateStyle: "medium", timeStyle: "short" })}` : "";
+      verdict = `Shopify still has this open, but the app marked it ${s.state}${when}${s.waitingReason ? ` (${s.waitingReason})` : ""}. Re-sync below should put it back.`;
+    }
+    return { ...base, verdict, problem };
+  });
+
+  // Items still to send that sit in fulfillment orders this app can't see
+  // (for example, assigned to a fulfillment service or another app's location)
+  const visible = new Map();
+  for (const fo of fos) {
+    if (!OPEN_FO.includes(fo.status)) continue;
+    for (const li of fo.lineItems.nodes) {
+      const id = li.lineItem?.id;
+      if (id) visible.set(id, (visible.get(id) ?? 0) + li.remainingQuantity);
+    }
+  }
+  const unseen = o.lineItems.nodes
+    .filter((l) => l.requiresShipping && l.unfulfilledQuantity > (visible.get(l.id) ?? 0))
+    .map((l) => ({ name: lineName(l), quantity: l.unfulfilledQuantity - (visible.get(l.id) ?? 0) }));
+
+  const unfulfilled = o.lineItems.nodes.filter((l) => l.requiresShipping).reduce((n, l) => n + l.unfulfilledQuantity, 0);
+  const listed = parts.filter((p) => p.shipment && TAB_OF[p.shipment.state]);
+  let summary;
+  if (o.cancelledAt) summary = "This order is cancelled, so it isn't shipped.";
+  else if (unseen.length) {
+    const n = unseen.reduce((t, x) => t + x.quantity, 0);
+    summary = `${plural(n, "item")} still to send ${n === 1 ? "is" : "are"} in a part of the order this app can't see. In Shopify, check which location those items are assigned to: a fulfillment service or another app's location hides them from MonkeyBean.`;
+  } else if (parts.some((p) => p.problem)) summary = parts.find((p) => p.problem).verdict;
+  else if (listed.length) summary = listed.map((p) => p.verdict).join(" ");
+  else if (!unfulfilled) summary = "Nothing left to ship: every item that needs shipping has been fulfilled.";
+  else summary = parts.filter((p) => OPEN_FO.includes(p.status)).map((p) => p.verdict).join(" ") || "Shopify shows nothing open to ship for this order.";
+
+  return {
+    name: o.name,
+    found: true,
+    orderId: o.id,
+    number: o.id.split("/").pop(),
+    createdAt: o.createdAt,
+    cancelledAt: o.cancelledAt,
+    payment: tidy(o.displayFinancialStatus),
+    fulfillment: tidy(o.displayFulfillmentStatus),
+    unfulfilled,
+    summary,
+    canResync: parts.some((p) => p.problem) || Boolean(unseen.length),
+    unseen,
+    parts,
+    events: events.map((e) => ({ id: e.id, type: e.type, detail: e.detail, userName: e.userName, at: e.createdAt.toISOString() })),
+  };
+}
+
+// Re-read one order from Shopify now, then look it up again
+export async function resyncOrderByName(shop, admin, text) {
+  if (isSandboxShop(shop)) throw new ShippingError("Reading from Shopify is off in sandbox.");
+  const first = await lookupOrder(shop, admin, text);
+  if (!first.found) return first;
+  await syncOrder(shop, admin, first.orderId);
+  await refreshNow(shop).catch(() => {});
+  await logEvent(shop, { orderName: first.name, type: "order_resync", detail: "Re-read from Shopify (order lookup)" });
+  return lookupOrder(shop, admin, text);
 }
