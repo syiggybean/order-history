@@ -15,20 +15,17 @@
  * so the product can't be bought anywhere outside the window. This script is
  * the product page's side of it.
  */
-import { Clock, phaseAt } from "./flipclock.js";
+// The flip clock and a few helpers are in their own file (preorder-countdown-lib.js,
+// loaded by the block) to keep this one under Shopify's 10 KB app block limit.
 
 (function () {
   "use strict";
 
   var BUTTON = 'button[name="add"], [data-add-to-cart], .add-to-cart, .product-form__submit';
   var BUTTON_TEXT = "[data-add-to-cart-text], .add-to-cart__text, .product-form__submit-text";
-  var REF_DAYS = 14;
   // Other apps' "email me when available" buttons (back-in-stock apps). While this
   // block shows its own sign-up (before opening, after closing, sold out) they're
   // hidden, so customers see one sign-up, not two.
-  var OTHER_NOTIFY =
-    '#BIS_trigger, .BIS_trigger, [data-bis-trigger], .klaviyo-bis-trigger, [class*="klaviyo-bis"], .swym-button-bis, [class*="back-in-stock"], [id*="back-in-stock"], [class*="restock-alert"], [class*="notify-me-button"], [id*="notify-me-button"], .product-form__notify, [class*="appikon"]';
-  var OTHER_NOTIFY_TEXT = /^\s*(e-?mail me when (it'?s )?(available|back( in stock)?)|notify me when (it'?s )?(available|back( in stock)?)|get notified when (it'?s )?(available|back( in stock)?))\s*$/i;
   var root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || "/";
 
   var OOPS = "Something went wrong. Please try again.";
@@ -75,7 +72,7 @@ import { Clock, phaseAt } from "./flipclock.js";
       el.closest('[data-section-type="product"], [data-product-section], .shopify-section, section') || document.body;
     this.panel = el.querySelector("[data-ohpc-panel]");
     this.notify = el.querySelector("[data-ohpc-notify]");
-    this.clock = this.panel ? new Clock(this.panel, "until pre-orders open") : null;
+    this.clock = this.panel ? new clockLib().Clock(this.panel, "until pre-orders open") : null;
     this.heading = el.querySelector("[data-ohpc-heading]");
     this.whenOpens = el.querySelector('[data-ohpc-when="opens"]');
     this.whenCloses = el.querySelector('[data-ohpc-when="closes"]');
@@ -91,7 +88,7 @@ import { Clock, phaseAt } from "./flipclock.js";
 
   Countdown.prototype.tick = function () {
     var now = Date.now();
-    var phase = phaseAt(this.opens, this.closes, now);
+    var phase = clockLib().phaseAt(this.opens, this.closes, now);
     if (phase !== this.phase) {
       var first = this.phase === null;
       this.phase = phase;
@@ -179,37 +176,12 @@ import { Clock, phaseAt } from "./flipclock.js";
   };
 
   // Hide (or bring back) other apps' "email me when available" buttons
-  Countdown.prototype.hideOtherNotify = function () {
-    if (!this.hideOthers) return;
-    var self = this;
-    var on = this.phase === "scheduled" || this.phase === "closed" || this.soldOut;
-    var found = [];
-    var add = function (list) {
-      for (var i = 0; i < list.length; i++) if (!self.el.contains(list[i]) && found.indexOf(list[i]) < 0) found.push(list[i]);
-    };
-    try {
-      add(document.querySelectorAll(OTHER_NOTIFY + (this.otherSelector ? ", " + this.otherSelector : "")));
-    } catch (e) {
-      add(document.querySelectorAll(OTHER_NOTIFY)); // a bad custom selector
-    }
-    // By wording, for apps not listed above (only in this product section)
-    var buttons = this.root.querySelectorAll('button, a, input[type="button"], input[type="submit"]');
-    for (var i = 0; i < buttons.length; i++) {
-      var b = buttons[i];
-      var text = b.tagName === "INPUT" ? b.value : b.textContent;
-      if (OTHER_NOTIFY_TEXT.test(text || "")) add([b]);
-    }
-    found.forEach(function (n) {
-      n.classList.toggle("ohpc-hidden-notify", on);
-    });
-    // Put back anything hidden earlier that no longer matches
-    if (!on) {
-      var hidden = document.querySelectorAll(".ohpc-hidden-notify");
-      for (var j = 0; j < hidden.length; j++) hidden[j].classList.remove("ohpc-hidden-notify");
-    }
-  };
 
   // Which parts of the block show
+  Countdown.prototype.hideOtherNotify = function () {
+    if (this.hideOthers) clockLib().hideOtherNotify(this);
+  };
+
   Countdown.prototype.render = function () {
     var mode =
       this.phase === "scheduled" ? "opens" : this.phase === "open" && this.inlineClosing && !this.soldOut ? "closes" : null;
@@ -376,38 +348,6 @@ import { Clock, phaseAt } from "./flipclock.js";
   // credited to the email
   // ---------------------------------------------------------------------------
 
-  function rememberRef() {
-    var token = null;
-    try {
-      token = new URL(window.location.href).searchParams.get("oh_ref");
-    } catch (e) {
-      return;
-    }
-    var saved = null;
-    try {
-      saved = JSON.parse(store("ohpc_ref") || "null");
-    } catch (e) {
-      saved = null;
-    }
-    if (token) {
-      saved = { t: token, at: Date.now() };
-      store("ohpc_ref", JSON.stringify(saved));
-    }
-    if (!saved || Date.now() - saved.at > REF_DAYS * 86400000 || !window.fetch) return;
-    if (saved.sent === saved.t) return;
-    fetch(root + "cart/update.js", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ attributes: { _oh_ref: saved.t } }),
-    })
-      .then(function (r) {
-        if (r.ok) {
-          saved.sent = saved.t;
-          store("ohpc_ref", JSON.stringify(saved));
-        }
-      })
-      .catch(function () {});
-  }
 
   // ---------------------------------------------------------------------------
   // Start-up (and the theme editor, which reloads sections in place)
@@ -419,16 +359,49 @@ import { Clock, phaseAt } from "./flipclock.js";
     for (var i = 0; i < els.length; i++) if (!els[i]._ohpc) els[i]._ohpc = new Countdown(els[i]);
   }
 
+  function clockLib() {
+    return window.OHPCLib;
+  }
+  // Runs cb once the clock file has loaded (the block loads it; if it hasn't run
+  // yet, e.g. a block just added in the theme editor, load it now)
+  var waiting = [];
+  function withClock(cb) {
+    if (clockLib()) return cb();
+    waiting.push(cb);
+    if (waiting.length > 1) return;
+    var el = document.querySelector("[data-ohpc-lib-src]");
+    var tag = document.querySelector("script[data-ohpc-lib]");
+    var s = tag || document.createElement("script");
+    var done = function () {
+      if (!clockLib()) return;
+      var list = waiting;
+      waiting = [];
+      list.forEach(function (f) {
+        f();
+      });
+    };
+    s.addEventListener("load", done);
+    if (!tag && el) {
+      s.src = el.getAttribute("data-ohpc-lib-src");
+      document.head.appendChild(s);
+    }
+    setTimeout(done, 0); // it may have loaded in the meantime
+  }
+
   function start() {
-    init();
-    rememberRef();
+    withClock(function () {
+      init();
+      clockLib().rememberRef();
+    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
   else start();
 
   document.addEventListener("shopify:section:load", function (e) {
-    init(e.target);
+    withClock(function () {
+      init(e.target);
+    });
   });
   document.addEventListener("shopify:section:unload", function (e) {
     var els = e.target.querySelectorAll("[data-ohpc]");
@@ -443,5 +416,11 @@ import { Clock, phaseAt } from "./flipclock.js";
     }
   });
 
-  window.OHPreorderCountdown = { init: init };
+  window.OHPreorderCountdown = {
+    init: function (scope) {
+      withClock(function () {
+        init(scope);
+      });
+    },
+  };
 })();

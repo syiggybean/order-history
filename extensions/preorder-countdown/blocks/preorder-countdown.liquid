@@ -17,9 +17,11 @@
 {%- assign closes = product.metafields.oh_preorder.closes_at.value -%}
 {%- assign limited = product.metafields.oh_preorder.limited.value -%}
 {%- if opens != blank or closes != blank -%}
+  <script src="{{ 'preorder-countdown-lib.js' | asset_url }}" defer data-ohpc-lib></script>
   <div
     class="ohpc-wrap"
     data-ohpc
+    data-ohpc-lib-src="{{ 'preorder-countdown-lib.js' | asset_url }}"
     data-product-id="{{ product.id }}"
     data-handle="{{ product.handle }}"
     data-opens="{% if opens != blank %}{{ opens | date: '%s' }}{% endif %}"
@@ -117,7 +119,7 @@
     { "type": "text", "id": "notify_closed", "label": "After closing", "default": "Get an email if pre-orders re-open" },
     { "type": "text", "id": "notify_button", "label": "Button", "default": "Notify me" },
     { "type": "text", "id": "notify_thanks", "label": "After signing up", "default": "You're on the list. We'll email you." },
-    { "type": "checkbox", "id": "hide_other_notify", "label": "Hide other apps' \"Email me when available\" buttons while this sign-up shows", "default": true, "info": "Before opening, after closing and when sold out, customers see this sign-up only. Back in stock buttons come back once pre-orders are open." },
+    { "type": "checkbox", "id": "hide_other_notify", "label": "Hide other apps' \"Email me when available\" buttons", "default": true, "info": "Before opening, after closing and when sold out, customers see this sign-up only. Back in stock buttons come back once pre-orders are open." },
     { "type": "text", "id": "other_notify_selector", "label": "Another button to hide (CSS selector, optional)", "info": "Only needed if a back in stock button still shows. Example: .my-notify-button" },
     { "type": "header", "content": "Colours" },
     { "type": "color", "id": "panel_color", "label": "Background", "default": "#FBACBB" },
