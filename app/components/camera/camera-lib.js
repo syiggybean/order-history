@@ -58,24 +58,51 @@ export function pickCamera(devices, saved) {
 }
 
 // ---------------------------------------------------------------------------
-// Barcodes: the browser's own reader where there is one (Chrome on Mac), else ZXing
+// Barcodes: the browser's own reader where there is one (Chrome on Mac and
+// Android), else ZXing C++ (WebAssembly), else ZXing JS. ZXing JS misreads
+// slightly blurry EAN/UPC codes (a 7 read as a 1, an 8 as a 2), so it's only
+// a last resort if the WebAssembly reader can't load.
 // ---------------------------------------------------------------------------
 
 const FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "code_93", "itf", "qr_code", "data_matrix"];
+const WASM_URL = "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.5/dist/iife/reader/index.js";
+const WASM_BIN = "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.5/dist/reader/zxing_reader.wasm";
+const WASM_FORMATS = ["EAN13", "EAN8", "UPCA", "UPCE", "Code128", "Code39", "Code93", "ITF", "QRCode", "DataMatrix"];
 
-export async function makeBarcodeReader() {
-  if (typeof window !== "undefined" && "BarcodeDetector" in window) {
-    try {
-      const supported = await window.BarcodeDetector.getSupportedFormats();
-      const formats = FORMATS.filter((f) => supported.includes(f));
-      if (formats.length) {
-        const d = new window.BarcodeDetector({ formats });
-        return { kind: "native", read: async (source) => (await d.detect(source)).map((x) => x.rawValue).filter(Boolean) };
-      }
-    } catch {
-      // fall through to ZXing
-    }
-  }
+// The camera frame, at full size (up to 1920 wide)
+function frameCanvas(video, canvas) {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return null;
+  const scale = Math.min(1, 1920 / w);
+  canvas.width = Math.round(w * scale);
+  canvas.height = Math.round(h * scale);
+  canvas.getContext("2d", { willReadFrequently: true }).drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+async function wasmReader() {
+  await loadScript(WASM_URL);
+  const Z = window.ZXingWASM;
+  await Z.prepareZXingModule({
+    overrides: { locateFile: (path, prefix) => (path.endsWith(".wasm") ? WASM_BIN : prefix + path) },
+    fireImmediately: true,
+  });
+  const canvas = document.createElement("canvas");
+  const options = { formats: WASM_FORMATS, tryHarder: true, tryRotate: true, tryInvert: false, maxNumberOfSymbols: 4 };
+  return {
+    kind: "zxing-wasm",
+    read: async (video) => {
+      const c = frameCanvas(video, canvas);
+      if (!c) return [];
+      const image = c.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, c.width, c.height);
+      const found = await Z.readBarcodes(image, options);
+      return found.filter((r) => r.isValid && r.text).map((r) => r.text);
+    },
+  };
+}
+
+async function jsReader() {
   await loadScript(ZXING_URL);
   const Z = window.ZXing;
   const hints = new Map();
@@ -96,16 +123,10 @@ export async function makeBarcodeReader() {
   return {
     kind: "zxing",
     read: async (video) => {
-      const w = video.videoWidth;
-      const h = video.videoHeight;
-      if (!w || !h) return [];
-      const scale = Math.min(1, 960 / w);
-      canvas.width = Math.round(w * scale);
-      canvas.height = Math.round(h * scale);
-      canvas.getContext("2d", { willReadFrequently: true }).drawImage(video, 0, 0, canvas.width, canvas.height);
+      const c = frameCanvas(video, canvas);
+      if (!c) return [];
       try {
-        const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(canvas)));
-        const r = reader.decodeWithState(bmp);
+        const r = reader.decodeWithState(new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(c))));
         return r ? [r.getText()] : [];
       } catch {
         return []; // nothing found in this frame
@@ -113,6 +134,43 @@ export async function makeBarcodeReader() {
         reader.reset();
       }
     },
+  };
+}
+
+export async function makeBarcodeReader() {
+  if (typeof window !== "undefined" && "BarcodeDetector" in window) {
+    try {
+      const supported = await window.BarcodeDetector.getSupportedFormats();
+      const formats = FORMATS.filter((f) => supported.includes(f));
+      if (formats.length) {
+        const d = new window.BarcodeDetector({ formats });
+        return { kind: "native", read: async (source) => (await d.detect(source)).map((x) => x.rawValue).filter(Boolean) };
+      }
+    } catch {
+      // fall through to ZXing
+    }
+  }
+  try {
+    return await wasmReader();
+  } catch {
+    return jsReader();
+  }
+}
+
+// A code counts only once it's been read the same way in two frames in a row
+// (a misread rarely repeats), so one bad frame can't scan the wrong item
+export function makeConfirmer({ frames = 2, windowMs = 900 } = {}) {
+  const seen = new Map(); // code -> { n, last }
+  return (codes, now = Date.now()) => {
+    const out = [];
+    for (const c of codes) {
+      const s = seen.get(c);
+      const n = s && now - s.last <= windowMs ? s.n + 1 : 1;
+      seen.set(c, { n, last: now });
+      if (n >= frames) out.push(c);
+    }
+    for (const [c, s] of seen) if (now - s.last > 10_000) seen.delete(c);
+    return out;
   };
 }
 

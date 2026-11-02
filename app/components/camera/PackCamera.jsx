@@ -3,6 +3,7 @@ import {
   largerImage,
   loadMatcher,
   makeBarcodeReader,
+  makeConfirmer,
   makeDebouncer,
   matchConfidence,
   pickCamera,
@@ -95,7 +96,15 @@ export function PackCamera({ k, userName }) {
     let cancelled = false;
     (async () => {
       try {
-        live = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        // Full HD where the camera has it: more detail for barcodes
+        live = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+        // Keep refocusing (webcams that support it), so a barcode held close stays sharp
+        try {
+          const track = live.getVideoTracks()[0];
+          if (track?.getCapabilities?.().focusMode?.includes("continuous")) await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        } catch {
+          // not supported
+        }
         if (cancelled) return live.getTracks().forEach((t) => t.stop());
         setStream(live);
         setCamError(null);
@@ -163,6 +172,8 @@ export function PackCamera({ k, userName }) {
   const [paused, setPaused] = useState(false); // while matching a photo
   const fresh = useRef(null); // remembers codes across pauses, so an item still in view isn't counted again
   if (!fresh.current) fresh.current = makeDebouncer();
+  const confirm = useRef(null);
+  if (!confirm.current) confirm.current = makeConfirmer();
   useEffect(() => {
     if (!reader || !stream || paused || reader.kind === "none") return undefined;
     fresh.current.hold();
@@ -173,7 +184,7 @@ export function PackCamera({ k, userName }) {
       if (stop || busy || !v || v.readyState < 2) return;
       busy = true;
       try {
-        const codes = fresh.current(await reader.read(v));
+        const codes = fresh.current(confirm.current(await reader.read(v)));
         for (const c of codes) send(c);
       } catch {
         // this frame couldn't be read

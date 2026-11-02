@@ -119,51 +119,65 @@ export function PackCameraBar({ cam }) {
 
   const connected = cam.cameras.filter((c) => c.connected);
   const btn = { appearance: "none", border: "1px solid #c9c9c9", background: "#fff", borderRadius: "8px", padding: "5px 10px", font: "inherit", fontSize: "13px", cursor: "pointer" };
+  // The QR code panel sits in the page (a full-width row under the toolbar) rather
+  // than floating, so it's never cut off on a short page
   return (
-    <div style={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "8px", position: "relative" }}>
-      <button type="button" style={btn} onClick={() => open(false)} disabled={busy}>
-        📷 {cam.linked ? "Camera window" : "Open pack camera"}
-      </button>
-      {cam.linked && (
-        <span style={{ ...small, color: connected.length ? "#1a7f37" : "#8a6116" }} title={connected.map((c) => c.info).filter(Boolean).join(", ")}>
-          {connected.length ? `● Camera connected${connected.length > 1 ? ` (${connected.length})` : ""}` : "○ Waiting for the camera…"}
-        </span>
-      )}
-      <button type="button" style={{ ...btn, border: 0, color: "#005bd3", padding: 0 }} onClick={() => open(true)} disabled={busy}>
-        Use another device
-      </button>
-      {cam.linked && (
-        <button type="button" style={{ ...btn, border: 0, color: "#005bd3", padding: 0 }} onClick={() => unlink.submit({ intent: "cameraUnlink" }, { method: "post" })}>
-          Unlink
+    <>
+      <div style={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "8px" }}>
+        <button type="button" style={btn} onClick={() => open(false)} disabled={busy}>
+          📷 {cam.linked ? "Camera window" : "Open pack camera"}
         </button>
-      )}
-      {link.data?.error && <span style={{ ...small, color: "#b42318" }}>{link.data.error}</span>}
+        {cam.linked && (
+          <span style={{ ...small, color: connected.length ? "#1a7f37" : "#8a6116" }} title={connected.map((c) => c.info).filter(Boolean).join(", ")}>
+            {connected.length ? `● Camera connected${connected.length > 1 ? ` (${connected.length})` : ""}` : "○ Waiting for the camera…"}
+          </span>
+        )}
+        <button type="button" style={{ ...btn, border: 0, color: "#005bd3", padding: 0 }} onClick={() => open(true)} disabled={busy}>
+          Use another device
+        </button>
+        {cam.linked && (
+          <button type="button" style={{ ...btn, border: 0, color: "#005bd3", padding: 0 }} onClick={() => unlink.submit({ intent: "cameraUnlink" }, { method: "post" })}>
+            Unlink
+          </button>
+        )}
+        {link.data?.error && <span style={{ ...small, color: "#b42318" }}>{link.data.error}</span>}
+      </div>
       {other && (
-        <div role="dialog" aria-label="Camera on another device" style={{ position: "absolute", top: "100%", right: 0, zIndex: 20, marginTop: "6px", background: "#fff", border: "1px solid #e3e3e3", borderRadius: "10px", padding: "12px", width: "280px", boxShadow: "0 8px 24px rgba(0,0,0,0.15)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <strong>{other.blocked ? "Open the camera window" : "Camera on another device"}</strong>
-            <button type="button" onClick={() => setOther(null)} aria-label="Close" style={{ border: 0, background: "none", fontSize: "18px", cursor: "pointer" }}>
-              ×
-            </button>
+        <div
+          role="region"
+          aria-label="Camera on another device"
+          style={{ flexBasis: "100%", display: "flex", flexWrap: "wrap", gap: "16px", alignItems: "center", background: "#fff", border: "1px solid #e3e3e3", borderRadius: "10px", padding: "12px 14px", boxSizing: "border-box" }}
+        >
+          {other.qr ? (
+            <div style={{ width: "168px", flexShrink: 0 }} dangerouslySetInnerHTML={{ __html: other.qr }} />
+          ) : (
+            <div style={{ ...small, width: "168px", height: "168px", display: "grid", placeItems: "center", background: "#f6f6f7", borderRadius: "8px" }}>Loading QR code…</div>
+          )}
+          <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+              <strong>{other.blocked ? "Open the camera window" : "Camera on another device"}</strong>
+              <button type="button" onClick={() => setOther(null)} aria-label="Close" style={{ border: 0, background: "none", fontSize: "18px", cursor: "pointer", lineHeight: 1 }}>
+                ×
+              </button>
+            </div>
+            <p style={{ ...muted, fontSize: "12px", margin: "6px 0" }}>
+              {other.blocked ? (
+                <>
+                  The browser blocked the window.{" "}
+                  <a href={other.url} target={WIN} rel="opener">
+                    Open the pack camera
+                  </a>
+                  , or allow pop-ups for this site. Or scan the code with another device.
+                </>
+              ) : (
+                "Scan the code with the device's camera app, or open the link on it."
+              )}{" "}
+              It's linked to you: anyone with the link can scan into your bench, so don't share it.
+            </p>
+            <input readOnly value={other.url} onFocus={(e) => e.target.select()} aria-label="Camera link" style={{ width: "100%", boxSizing: "border-box", fontSize: "11px", padding: "4px 6px" }} />
           </div>
-          <p style={{ ...muted, fontSize: "12px", margin: "6px 0" }}>
-            {other.blocked ? (
-              <>
-                The browser blocked the window.{" "}
-                <a href={other.url} target={WIN} rel="opener">
-                  Open the pack camera
-                </a>
-                , or allow pop-ups for this site. Or scan this on another device:
-              </>
-            ) : (
-              "Scan this with the device's camera app, or open the link on it."
-            )}{" "}
-            It's linked to you; anyone with the link can scan into your bench, so don't share it.
-          </p>
-          {other.qr ? <div style={{ width: "200px", margin: "0 auto" }} dangerouslySetInnerHTML={{ __html: other.qr }} /> : <p style={small}>Loading QR code…</p>}
-          <input readOnly value={other.url} onFocus={(e) => e.target.select()} aria-label="Camera link" style={{ width: "100%", boxSizing: "border-box", fontSize: "11px", marginTop: "6px", padding: "4px 6px" }} />
         </div>
       )}
-    </div>
+    </>
   );
 }
