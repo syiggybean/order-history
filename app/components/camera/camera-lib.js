@@ -54,7 +54,10 @@ export function pickCamera(devices, saved) {
     const byLabel = saved.label && devices.find((d) => d.label === saved.label);
     if (byLabel) return byLabel;
   }
-  return devices[0];
+  // Phones and tablets: the main back camera (not the selfie camera, nor the
+  // ultra wide or zoom lenses), which is the one that suits barcodes
+  const back = devices.filter((d) => /back|rear|environment/i.test(d.label));
+  return back.find((d) => !/ultra|tele|dual|triple|wide|macro|depth/i.test(d.label)) ?? back[0] ?? devices[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +314,8 @@ export function startRecording(stream, { onStop }) {
   rec.ondataavailable = (e) => e.data?.size && chunks.push(e.data);
   rec.onstop = () => {
     const mime = (rec.mimeType || type || "video/webm").split(";")[0];
-    onStop({ blob: new Blob(chunks, { type: mime }), mime, startedAt, seconds: Math.round((Date.now() - startedAt) / 1000) });
+    const endedAt = Date.now();
+    onStop({ blob: new Blob(chunks, { type: mime }), mime, startedAt, endedAt, seconds: Math.round((endedAt - startedAt) / 1000) });
   };
   rec.start(1000);
   return { stop: () => rec.state !== "inactive" && rec.stop(), startedAt };

@@ -69,19 +69,33 @@ async function token() {
 
 // Starts a resumable upload. origin: the camera window's origin, so Google lets
 // that page send the file (CORS). Returns the upload address.
-export async function startDriveUpload({ name, mimeType, description, origin }) {
+// replaceId: an existing file to replace (same file and link, new video); if it's
+// gone (deleted in Drive), a new file is made instead
+export async function startDriveUpload({ name, mimeType, description, origin, replaceId = null }) {
   const problem = driveSetupProblem();
   if (problem) throw new Error(problem);
-  const res = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,webViewLink", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${await token()}`,
-      "Content-Type": "application/json; charset=UTF-8",
-      "X-Upload-Content-Type": mimeType,
-      ...(origin ? { Origin: origin } : {}),
-    },
-    body: JSON.stringify({ name, mimeType, parents: [driveFolderId()], description }),
-  });
+  const headers = {
+    Authorization: `Bearer ${await token()}`,
+    "Content-Type": "application/json; charset=UTF-8",
+    "X-Upload-Content-Type": mimeType,
+    ...(origin ? { Origin: origin } : {}),
+  };
+  const opts = "uploadType=resumable&supportsAllDrives=true&fields=id,name,webViewLink";
+  let res = null;
+  if (replaceId) {
+    res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(replaceId)}?${opts}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ name, mimeType, description }),
+    });
+    if (res.status === 404) res = null; // deleted in Drive: make a new one
+  }
+  if (!res)
+    res = await fetch(`https://www.googleapis.com/upload/drive/v3/files?${opts}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name, mimeType, parents: [driveFolderId()], description }),
+    });
   const uploadUrl = res.headers.get("location");
   if (!res.ok || !uploadUrl) {
     const body = await res.json().catch(() => ({}));

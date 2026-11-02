@@ -1373,7 +1373,7 @@ model PackVideo {
   orderName   String
   fileName    String
   driveFileId String?
-  status      String    @default("uploading") // uploading | done | failed
+  status      String    @default("uploading") // uploading | done | failed | replaced (a later packing) | skipped
   sizeBytes   Int?
   seconds     Int?
   userName    String?

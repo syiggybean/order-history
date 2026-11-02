@@ -65,7 +65,9 @@ export function usePackCamera({ batchId, box, onScans, enabled = true }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boxKey, polling, enabled, batchId]);
 
-  return { cameras, linked: polling, startPolling: () => setPolling(true), stopPolling: () => setPolling(false) };
+  // What's open now, for a new camera link to start from
+  const context = { batchId: batchId ? String(batchId) : "", shipmentId: box ? String(box.id) : "" };
+  return { cameras, linked: polling, context, startPolling: () => setPolling(true), stopPolling: () => setPolling(false) };
 }
 
 export function PackCameraBar({ cam }) {
@@ -80,7 +82,7 @@ export function PackCameraBar({ cam }) {
     // Open the window straight away (browsers block windows opened later), then send it to the link
     wanted.current = !forOther;
     if (!forOther) pending.current = window.open("", WIN, FEATURES);
-    link.submit({ intent: "cameraLink", other: forOther ? "1" : "" }, { method: "post" });
+    link.submit({ intent: "cameraLink", other: forOther ? "1" : "", ...cam.context }, { method: "post" });
   };
   useEffect(() => {
     const d = link.data;

@@ -349,7 +349,8 @@ export const action = async ({ request }) => {
     if (intent === "findBox") return { intent, ...(await findBox(shop, id, String(form.get("code") ?? ""))) };
     if (intent === "packScan")
       return { intent, ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user, { via: form.get("via") === "visual" ? "visual" : "barcode" })) };
-    if (intent === "cameraLink") return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request))) };
+    if (intent === "cameraLink")
+      return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request), { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null })) };
     if (intent === "cameraContext") {
       await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null });
       return { intent, ok: true };

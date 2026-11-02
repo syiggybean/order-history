@@ -29,6 +29,17 @@ const api = async (k, body) => {
   const r = await fetch("/pack-camera/api", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ k, ...body }) });
   return r.json().catch(() => ({ ok: false, error: "No answer from the app." }));
 };
+// Side by side on a computer; stacked on a phone, with the camera on top
+const LAYOUT = `
+.mbpc-main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(280px, 2fr); gap: 16px; padding: 16px; align-items: start; }
+.mbpc-video { position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 16 / 9; }
+.mbpc-feed { width: 100%; height: 100%; object-fit: contain; display: block; }
+@media (max-width: 760px) {
+  .mbpc-main { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 10px; }
+  .mbpc-video { aspect-ratio: auto; min-height: 200px; }
+  .mbpc-feed { height: auto; max-height: 58vh; margin: 0 auto; }
+}
+`;
 const clock = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 const mb = (n) => `${(n / 1024 / 1024).toFixed(1)} MB`;
 
@@ -45,6 +56,39 @@ function beep(ok) {
   } catch {
     // no sound
   }
+}
+
+// The batch open at the bench: where packing is, and the boxes left to open
+function BatchBoxes({ batch, openId, onOpen }) {
+  const left = batch.boxes.filter((b) => !b.packed);
+  return (
+    <div style={{ marginTop: "14px", borderTop: "1px solid #eee", paddingTop: "12px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px", marginBottom: "8px" }}>
+        <strong>{batch.title}</strong>
+        <span style={{ fontVariantNumeric: "tabular-nums", color: batch.packed === batch.total ? "#1a7f37" : "#616161", fontWeight: 600 }}>
+          {batch.packed} / {batch.total} packed
+        </span>
+      </div>
+      {left.length === 0 ? (
+        <p style={{ margin: 0, color: "#1a7f37", fontWeight: 600 }}>Every box is packed ✓</p>
+      ) : (
+        <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: "6px", maxHeight: "50vh", overflow: "auto" }}>
+          {left.map((b) => (
+            <li key={b.id} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 8px", borderRadius: "8px", background: b.id === openId ? "#fff4f6" : "#fafafa" }}>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <strong>{b.orderName}</strong>
+                {b.part ? <span style={{ color: "#616161" }}> ({b.part})</span> : null}
+                <span style={{ color: "#616161", fontSize: "12px" }}> · {b.units} {b.units === 1 ? "item" : "items"}</span>
+              </span>
+              <button type="button" onClick={() => onOpen(b)} style={{ padding: "6px 12px", borderRadius: "999px", border: "1px solid #c9c9c9", background: "#fff", font: "inherit", fontSize: "13px", cursor: "pointer" }}>
+                Open
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 export function PackCamera({ k, userName }) {
@@ -75,7 +119,7 @@ export function PackCamera({ k, userName }) {
       }
       try {
         // Ask once (labels are hidden until allowed), then pick the remembered camera
-        const first = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        const first = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
         first.getTracks().forEach((t) => t.stop());
         const all = await listCameras();
         if (!cancelled) setDeviceId(pickCamera(all, savedCamera())?.deviceId ?? null);
@@ -217,8 +261,9 @@ export function PackCamera({ k, userName }) {
     return () => clearInterval(t);
   }, []);
 
-  const finish = useCallback(() => {
+  const finish = useCallback((capped = false) => {
     if (rec.current) {
+      rec.current.target.capped = capped;
       rec.current.stop();
       rec.current = null;
       setRecFor(null);
@@ -230,21 +275,23 @@ export function PackCamera({ k, userName }) {
     // Box changed, packed, or recording not possible: finish the current video
     if (rec.current && (!packing || !canRecord || rec.current.boxId !== box.id)) finish();
     if (!rec.current && packing && canRecord) {
-      const target = { boxId: box.id, orderName: box.orderName, part: box.part };
+      const target = { boxId: box.id, orderName: box.orderName, part: box.part, capped: false };
       const r = startRecording(stream, {
-        onStop: async ({ blob, mime, startedAt, seconds }) => {
+        // Every recording waits here; the app only keeps the one during which the box was
+        // packed (an attempt that was abandoned, or redone, is dropped when it's sent)
+        onStop: async ({ blob, mime, startedAt, endedAt, seconds }) => {
           if (!blob.size) return;
-          await queuePut({ id: `${target.boxId}-${startedAt}`, shipmentId: target.boxId, orderName: target.orderName, part: target.part, mime, blob, seconds, startedAt, createdAt: Date.now() });
+          await queuePut({ id: `${target.boxId}-${startedAt}`, shipmentId: target.boxId, orderName: target.orderName, part: target.part, mime, blob, seconds, startedAt, endedAt, capped: target.capped, createdAt: Date.now() });
           refreshUploads();
         },
       });
       if (r) {
-        rec.current = { ...target, stop: r.stop, startedAt: r.startedAt };
+        rec.current = { ...target, target, stop: r.stop, startedAt: r.startedAt };
         setRecFor({ ...target, startedAt: r.startedAt });
       }
     }
     // Very long boxes: cap each video at 30 minutes
-    if (rec.current && Date.now() - rec.current.startedAt > 30 * 60 * 1000) finish();
+    if (rec.current && Date.now() - rec.current.startedAt > 30 * 60 * 1000) finish(true);
   }, [box?.id, box?.state, state?.recording, stream, now, finish, refreshUploads]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => rec.current?.stop(), []);
 
@@ -264,7 +311,22 @@ export function PackCamera({ k, userName }) {
         let it = item;
         for (let attempt = 0; attempt < 2; attempt++) {
           if (!it.uploadUrl) {
-            const s = await api(k, { intent: "uploadStart", shipmentId: it.shipmentId, mimeType: it.mime, seconds: it.seconds, startedAt: it.startedAt, videoId: it.videoId ?? null });
+            const s = await api(k, {
+              intent: "uploadStart",
+              shipmentId: it.shipmentId,
+              mimeType: it.mime,
+              seconds: it.seconds,
+              startedAt: it.startedAt,
+              endedAt: it.endedAt ?? null,
+              capped: Boolean(it.capped),
+              clientNow: Date.now(), // so the app can allow for this computer's clock
+              videoId: it.videoId ?? null,
+            });
+            if (s.skip) {
+              // Not the finished packing of the box (abandoned, or redone later): not uploaded
+              await queueDelete(it.id);
+              break;
+            }
             if (!s.ok) throw new Error(s.error);
             it = { ...it, uploadUrl: s.uploadUrl, videoId: s.videoId, fileName: s.fileName, sent: 0 };
             await queuePut(it);
@@ -338,6 +400,7 @@ export function PackCamera({ k, userName }) {
   const recSeconds = recFor ? Math.round((now - recFor.startedAt) / 1000) : 0;
   return (
     <div style={{ fontFamily: FONT, color: "#1a1a1a", background: "#f6f6f7", minHeight: "100vh", fontSize: "14px" }}>
+      <style>{LAYOUT}</style>
       <header style={{ display: "flex", flexWrap: "wrap", gap: "12px", alignItems: "center", padding: "10px 16px", background: "#fff", borderBottom: "1px solid #e3e3e3" }}>
         <strong style={{ fontSize: "16px" }}>Pack camera</strong>
         <span style={{ color: linkError ? "#b42318" : "#1a7f37", fontSize: "13px" }}>{linkError ?? `● Linked to ${userName ?? "the"} pack bench`}</span>
@@ -375,9 +438,9 @@ export function PackCamera({ k, userName }) {
         <div style={{ margin: "10px 16px 0", padding: "10px 12px", borderRadius: "8px", background: "#fff4d6", fontSize: "13px" }}>{uploadError ?? state.driveProblem}</div>
       )}
 
-      <main style={{ display: "grid", gridTemplateColumns: "minmax(0, 3fr) minmax(280px, 2fr)", gap: "16px", padding: "16px", alignItems: "start" }}>
-        <section style={{ position: "relative", background: "#000", borderRadius: "12px", overflow: "hidden", aspectRatio: "16 / 9" }}>
-          <video ref={videoRef} muted playsInline autoPlay style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }} />
+      <main className="mbpc-main">
+        <section className="mbpc-video">
+          <video ref={videoRef} muted playsInline autoPlay className="mbpc-feed" />
           {/* Aim here */}
           <div aria-hidden="true" style={{ position: "absolute", inset: "18% 22%", border: "2px dashed rgba(255,255,255,0.55)", borderRadius: "12px", pointerEvents: "none" }} />
           {camError && (
@@ -394,7 +457,17 @@ export function PackCamera({ k, userName }) {
         <aside style={{ background: "#fff", borderRadius: "12px", padding: "14px", border: "1px solid #e3e3e3" }}>
           {!box ? (
             <div style={{ color: "#616161" }}>
-              <strong style={{ color: "#1a1a1a" }}>No box open.</strong> Open a box on the pack bench, or hold its packing slip barcode up to the camera.
+              {state?.batch ? (
+                <>
+                  <strong style={{ color: "#1a1a1a" }}>No box open.</strong> Hold a packing slip barcode up to the camera, or pick an order below.
+                </>
+              ) : state ? (
+                <>
+                  <strong style={{ color: "#1a1a1a" }}>No batch open.</strong> Open a batch's Pack page on the pack bench.
+                </>
+              ) : (
+                "Connecting to the pack bench…"
+              )}
             </div>
           ) : (
             <>
@@ -433,6 +506,7 @@ export function PackCamera({ k, userName }) {
               )}
             </>
           )}
+          {state?.batch && (!box || box.state !== "batched") && <BatchBoxes batch={state.batch} openId={box?.id} onOpen={(b) => send(b.code, "barcode", b.orderName)} />}
         </aside>
       </main>
 
