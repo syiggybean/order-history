@@ -71,6 +71,7 @@ export const CAPABILITY_FEATURES = {
       priority: "Set batch priority",
       pickEarly: "Pick and pack pre-release batches early (stock arrived before the release date)",
       understock: "See understocked badges (more on order than in stock)",
+      merge: "Merge orders (ship a customer's orders in one box)",
       settings: "Manage shipping settings",
     },
   },

@@ -24,6 +24,8 @@ import {
   uninstallCommand,
 } from "../print.server";
 import { slipsPdf } from "../slips-pdf.server";
+import { createMerge, listMerges, mergeCandidates, undoMerge } from "../merge.server";
+import { MergeTab } from "../components/shipping/Merge";
 import { benchContext, benchLink, benchTakeScans, benchUnlink, pickPhoneLink, videosFor } from "../camera.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
 import { IN_APP_LABELS } from "../components/shipping/features";
@@ -108,7 +110,7 @@ async function batchLocksFor(shop, list, user, early) {
 const releaseDayLabel = (day) => new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
 
 const PAGE_SIZE = 50;
-const TABS = ["ready", "waiting", "batches", "review", "stock", "settings"];
+const TABS = ["ready", "waiting", "batches", "review", "merge", "stock", "settings"];
 
 const filterFrom = (params) => ({
   q: params.get("q") || "",
@@ -177,7 +179,10 @@ export const loader = async ({ request }) => {
   const early = can(user, "shipping", "pickEarly");
   const lockBatches = batchId ? [{ id: batchId }] : (batches ?? []);
   const lockMap = lockBatches.length ? await batchLocksFor(shop, lockBatches, user, early) : new Map();
+  const canMerge = can(user, "shipping", "merge");
+  const merge = tab === "merge" && canMerge ? { ...(await mergeCandidates(shop, sandboxOn ? sandboxAdmin(admin, shop) : admin)), merges: await listMerges(shop) } : null;
   return {
+    merge,
     batchLockList: Object.fromEntries(lockMap),
     lock: batchId ? (lockMap.get(batchId) ?? null) : null,
     tab,
@@ -239,6 +244,7 @@ export const loader = async ({ request }) => {
       priority: can(user, "shipping", "priority"),
       pickEarly: can(user, "shipping", "pickEarly"),
       understock: can(user, "shipping", "understock"),
+      merge: can(user, "shipping", "merge"),
       // Release dates can be changed from the quick view by people who manage pre-orders
       editRelease: !sandboxOn && (can(user, "preorders", "manage") || can(user, "releaseReview", "manage")),
     },
@@ -278,6 +284,8 @@ const NEEDS = {
   // Pack camera (its own window)
   cameraLink: "pack",
   pickPhoneLink: "pick",
+  mergeOrders: "merge",
+  undoMerge: "merge",
   cameraContext: "pack",
   cameraScans: "pack",
   cameraUnlink: "pack",
@@ -411,6 +419,14 @@ export const action = async ({ request }) => {
     if (intent === "sealBox") return { intent, ...(await sealBox(shop, id, Number(form.get("shipmentId")), user)) };
     if (intent === "cameraLink")
       return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request), { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null })) };
+    if (intent === "mergeOrders") {
+      const riders = JSON.parse(String(form.get("riders") ?? "[]"));
+      return { intent, ok: true, ...(await createMerge(shop, { mainShipmentId: form.get("main"), riders, method: form.get("method") || null }, user)) };
+    }
+    if (intent === "undoMerge") {
+      await undoMerge(shop, id, user);
+      return { intent, ok: true };
+    }
     if (intent === "pickPhoneLink") return { intent, ok: true, ...(await pickPhoneLink(session.shop, shop, user, appUrl(request), id)) };
     if (intent === "cameraContext") {
       await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null });
@@ -830,6 +846,20 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
             <span style={pill("#e3f1df", "#1a5e20")}>Ready</span>
             <div style={small}>since {fmtDate(s.readyAt, true)}</div>
           </>
+        )}
+        {s.merge?.role === "box" && (
+          <div style={{ marginTop: "4px" }}>
+            <span style={pill("#eef3ff", "#1c4a9c")}>Merged box</span>
+            <div style={small}>
+              + {s.merge.items.map((i) => `${i.quantity} × ${i.title}${i.variantTitle ? ` – ${i.variantTitle}` : ""} (${i.from})`).join(", ")}
+            </div>
+          </div>
+        )}
+        {s.merge?.role === "part" && (
+          <div style={{ marginTop: "4px" }}>
+            <span style={pill("#eef3ff", "#1c4a9c")}>In {s.merge.into}'s box</span>
+            <div style={small}>Merged: this order isn't batched on its own until that box ships.</div>
+          </div>
         )}
         {s.understocked?.length > 0 && (
           <div style={{ marginTop: "4px" }}>
@@ -1300,6 +1330,9 @@ const EVENT_LABEL = {
   batch_cancelled: "Batch cancelled",
   batch_done: "Batch shipped",
   batch_priority: "Batch priority",
+  orders_merged: "Orders merged",
+  orders_unmerged: "Merge undone",
+  merged_shipped: "Shipped in a merged box",
   ready_before_release: "Pre-order timing",
   batch_renamed: "Batch renamed",
   batch_assigned: "Batch assigned",
@@ -1535,7 +1568,8 @@ function AutoBatchSettings({ st, canSettings }) {
       <s-paragraph>
         <span style={muted}>
           Builds batches on its own, oldest orders first, up to 250 per batch. The rules run in this order and each order goes into one batch at most. Runs from
-          the Batches tab whenever you like, and once a day if the schedule is on. Shipments already in a batch are never moved; orders flagged for review wait.
+          the Batches tab whenever you like, and once a day if the schedule is on. Shipments already in a batch are never moved; orders flagged for review wait. New orders that fit an auto-batch that's still open (not being picked yet) join it,
+          even when there aren't enough of them to make a new batch.
         </span>
       </s-paragraph>
       <div style={{ display: "flex", flexDirection: "column", gap: "14px", marginTop: "10px" }}>
@@ -1726,7 +1760,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock, merge } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1748,6 +1782,7 @@ function Page() {
     { id: "waiting", label: "Waiting", n: c.waiting ?? 0 },
     { id: "batches", label: "Batches", n: liveBatchCount },
     { id: "review", label: "Review", n: flagCount, alert: flagCount > 0 },
+    ...(allowed.merge ? [{ id: "merge", label: "Order Merge" }] : []),
     { id: "stock", label: "Stock vs orders" },
     { id: "settings", label: "Settings and activity" },
   ];
@@ -1892,6 +1927,7 @@ function Page() {
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
       )}
       {tab === "review" && flags && <ReviewTab flags={flags} status={flagStatus} canReview={allowed.review} />}
+      {tab === "merge" && (allowed.merge ? <MergeTab data={merge} /> : <s-paragraph>Order Merge needs the "Merge orders" permission.</s-paragraph>)}
       {tab === "stock" && <StockTab overview={overview} />}
       {tab === "settings" && <SettingsTab overview={overview} events={events} sync={sync} canSettings={allowed.settings} sandboxOn={Boolean(sandbox)} printing={printing} canPrint={allowed.pack || allowed.ship} />}
       {orderView && (

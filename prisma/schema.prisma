@@ -434,6 +434,16 @@ model Shipment {
   releaseDay         String?
   // Items on it that more open orders want than there's stock for: [{title, ordered, inStock}] (JSON), else null
   understocked       String?
+  // Shopify customer (for Order Merge: same customer and address)
+  customerId         String?
+  // Order Merge: the merge it belongs to. The main shipment carries the other orders'
+  // chosen items in mergedLines (JSON lines with fromOrderName); the others have mergedInto
+  // (the main order's name) and stay out of batches until the box ships
+  mergeGroupId       Int?
+  mergedLines        String?
+  mergedInto         String?
+  // The shipping method chosen for a merged box
+  mergeMethod        String?
   readyAt            DateTime?
   otherHold          String?
   appHoldId          String?
@@ -1409,4 +1419,25 @@ model PackVideo {
 
   @@index([shop, shipmentId])
   @@index([shop, createdAt])
+}
+
+// Order Merge: several orders for the same customer and address shipped in one box.
+// The main order's label is bought in Shopify; the app then fulfills the chosen items
+// of the other orders with the same tracking (Shopify emails each customer).
+model MergeGroup {
+  id             Int       @id @default(autoincrement())
+  shop           String
+  mainShipmentId Int
+  mainOrderName  String
+  // Shipping method chosen for the box
+  method         String?
+  // [{shipmentId, orderId, orderName, fulfillmentOrderId, lines: [{foLineItemId, title, variantTitle, quantity, ...}]}]
+  riders         String
+  status         String    @default("open") // open | shipped | undone | cancelled
+  error          String?
+  createdBy      String?
+  createdAt      DateTime  @default(now())
+  shippedAt      DateTime?
+
+  @@index([shop, status])
 }

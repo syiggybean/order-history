@@ -757,6 +757,12 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                       <span style={pill("#eef3ff", "#1c4a9c")}>To pack</span>
                     )}
                     <NoticeTag notice={b.notice} />
+                    {b.mergedWith?.length > 0 && (
+                      <span style={pill("#eef3ff", "#1c4a9c")} title="Order Merge: these orders' items go in this box too">
+                        + {b.mergedWith.join(", ")}
+                        {b.mergeMethod ? ` · ${b.mergeMethod}` : ""}
+                      </span>
+                    )}
                     <span style={{ flex: 1 }} />
                     <SlipPrintButton key={b.id} variant="tertiary" batchId={batch.id} ids={[b.id]} onBrowser={() => go({ view: "slips", slips: String(b.id) }, { replace: false })}>
                       Print slip
@@ -847,6 +853,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                                       <ProductName id={l.productId}>{label(l)}</ProductName>
                                     </div>
                                     <div style={small}>{[l.sku && `SKU ${l.sku}`, l.barcode && l.barcode !== l.sku && l.barcode].filter(Boolean).join(" · ")}</div>
+                                    {l.from?.length > 0 && <div style={{ ...small, color: "#1c4a9c", fontWeight: 600 }}>From order {l.from.join(", ")}</div>}
                                   </div>
                                 </div>
                               </td>

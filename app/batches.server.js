@@ -7,6 +7,7 @@ import {
   ShippingError,
   getShippingSettings,
   kick,
+  boxLinesOf,
   linesOf,
   logEvent,
   onAfterRun,
@@ -68,7 +69,7 @@ async function batchCount(batchId) {
 async function assign(shop, batch, ids, { from = ["ready"] } = {}) {
   if (!ids.length) return 0;
   const r = await db.shipment.updateMany({
-    where: { shop, id: { in: ids }, state: { in: from }, batchId: null },
+    where: { shop, id: { in: ids }, state: { in: from }, batchId: null, mergedInto: null },
     data: { state: "batched", batchId: batch.id, flag: null },
   });
   return r.count;
@@ -307,13 +308,13 @@ async function statsFor(batchIds) {
   if (!batchIds.length) return new Map();
   const rows = await db.shipment.findMany({
     where: { batchId: { in: batchIds }, state: { in: ["batched", "packed", "labeling", "shipped"] } },
-    select: { batchId: true, units: true, flag: true, orderCreatedAt: true },
+    select: { batchId: true, units: true, flag: true, orderCreatedAt: true, mergedLines: true },
   });
   const m = new Map();
   for (const r of rows) {
     const s = m.get(r.batchId) ?? { shipments: 0, units: 0, flagged: 0, oldest: null };
     s.shipments++;
-    s.units += r.units;
+    s.units += r.units + json(r.mergedLines, []).reduce((n, l) => n + (l.quantity ?? 0), 0);
     if (r.flag) s.flagged++;
     const at = r.orderCreatedAt.toISOString();
     if (!s.oldest || at < s.oldest) s.oldest = at;
@@ -389,7 +390,7 @@ export async function pickList(shop, batchId) {
   });
   const items = new Map();
   for (const s of shipments) {
-    for (const l of linesOf(s)) {
+    for (const l of boxLinesOf(s)) {
       const k = itemKey(l);
       const it = items.get(k) ?? {
         key: k,
@@ -608,28 +609,38 @@ const clip = (t, n = 60) => (t.length > n ? `${t.slice(0, n - 1)}…` : t);
 
 // Puts a group into batches: tops up an open batch of the same kind first (if allowed),
 // then new batches of up to 250
-async function place(shop, made, { source, name, ids, user, topUp = true, from }) {
+// newOk: false = only top up an open batch (the group is under its minimum).
+// Returns the ids it placed.
+async function place(shop, made, { source, name, ids, user, topUp = true, from, newOk = true }) {
   let rest = ids;
+  const placed = [];
   const open = topUp ? await db.batch.findMany({ where: { shop, source, status: "open" }, orderBy: { number: "asc" } }) : [];
   for (const b of open) {
     if (!rest.length) break;
     const room = MAX_BATCH - (await batchCount(b.id));
     if (room <= 0) continue;
-    const added = await assign(shop, b, rest.slice(0, room), { from });
+    const part = rest.slice(0, room);
+    const added = await assign(shop, b, part, { from });
+    placed.push(...part);
     rest = rest.slice(room);
     if (added) made.push({ id: b.id, tag: b.tag, name: b.name, added, topUp: true });
   }
+  if (!newOk) return placed;
   const parts = chunk(rest, MAX_BATCH);
   const earlier = topUp ? open.length : await db.batch.count({ where: { shop, source } });
   for (const [i, part] of parts.entries()) {
     const n = earlier + i + 1;
     const batch = await newBatch(shop, { name: `${name}${parts.length > 1 || earlier ? ` ${n}` : ""}`, source, user });
     const added = await assign(shop, batch, part, { from });
+    placed.push(...part);
     made.push({ id: batch.id, tag: batch.tag, name: batch.name, added });
   }
+  return placed;
 }
 
-const rowsOf = (list) => list.map((s) => ({ ...s, items: json(s.lines, []) }));
+// A merged box (Order Merge) is grouped by everything in it; the orders merged into
+// another box aren't batched on their own
+const rowsOf = (list) => list.filter((s) => !s.mergedInto).map((s) => ({ ...s, items: boxLinesOf(s) }));
 
 // Groups one pool of shipments by the rules that are on. release: the release day
 // (for names), and the shipments come from the Waiting list.
@@ -655,9 +666,9 @@ async function batchPool(shop, settings, pool, made, { user, release = null }) {
       groups.set(k, g);
     }
     for (const g of groups.values()) {
-      if (g.ids.length <= min) continue;
-      await place(shop, made, { source: `${prefix}singles:${g.key}`, name: `${g.label} singles${tag}`, ids: g.ids, user, from });
-      take(g.ids);
+      // Under the minimum: still joins this item's open singles batch, if there is one
+      const placed = await place(shop, made, { source: `${prefix}singles:${g.key}`, name: `${g.label} singles${tag}`, ids: g.ids, user, from, newOk: g.ids.length > min });
+      take(placed);
     }
   }
 
@@ -675,9 +686,8 @@ async function batchPool(shop, settings, pool, made, { user, release = null }) {
       groups.set(key, g);
     }
     for (const g of groups.values()) {
-      if (g.ids.length < min) continue;
-      await place(shop, made, { source: `${prefix}identical:${shortHash(g.key)}`, name: `${clip(g.label)} identical${tag}`, ids: g.ids, user, from });
-      take(g.ids);
+      const placed = await place(shop, made, { source: `${prefix}identical:${shortHash(g.key)}`, name: `${clip(g.label)} identical${tag}`, ids: g.ids, user, from, newOk: g.ids.length >= min });
+      take(placed);
     }
   }
 
@@ -687,6 +697,33 @@ async function batchPool(shop, settings, pool, made, { user, release = null }) {
     const maxOther = settings.autoMultiMaxOther ?? 3;
     const maxItems = settings.autoMultiMaxItems ?? 25;
     let candidates = left.filter((s) => s.items.reduce((n, l) => n + l.quantity, 0) >= 2);
+    // First, orders that fit an open multiples batch (same anchor, within its limits)
+    const openMulti = await db.batch.findMany({ where: { shop, status: "open", source: { startsWith: `${prefix}multi:` } }, orderBy: { number: "asc" } });
+    for (const b of openMulti) {
+      const anchor = b.source.slice(`${prefix}multi:`.length);
+      const inside = await db.shipment.findMany({ where: { batchId: b.id, state: { in: ["batched", "packed", "labeling"] } }, select: { lines: true } });
+      const items = new Set(inside.flatMap((x) => json(x.lines, []).map(itemKey)));
+      let room = MAX_BATCH - inside.length;
+      const chosen = [];
+      for (const s of candidates) {
+        if (room <= 0) break;
+        const a = s.items.filter((l) => itemKey(l) === anchor);
+        if (!a.length) continue;
+        const units = s.items.reduce((n, l) => n + l.quantity, 0);
+        if (units - a.reduce((n, l) => n + l.quantity, 0) > maxOther) continue;
+        const extra = [...new Set(s.items.map(itemKey))].filter((k) => !items.has(k));
+        if (items.size + extra.length > maxItems) continue;
+        extra.forEach((k) => items.add(k));
+        chosen.push(s.id);
+        room--;
+      }
+      if (!chosen.length) continue;
+      const added = await assign(shop, b, chosen, { from });
+      if (added) made.push({ id: b.id, tag: b.tag, name: b.name, added, topUp: true });
+      const gone = new Set(chosen);
+      candidates = candidates.filter((s) => !gone.has(s.id));
+      take(chosen);
+    }
     for (let round = 0; round < 200 && candidates.length >= min; round++) {
       const counts = new Map();
       for (const s of candidates) for (const k of new Set(s.items.map(itemKey))) counts.set(k, (counts.get(k) ?? 0) + 1);
@@ -728,7 +765,7 @@ export async function runAutoBatch(shop, user = null, { manual = true } = {}) {
   if (anyRule) {
     // Orders flagged for review wait until the flag is resolved
     const flagged = new Set((await db.orderFlag.findMany({ where: { shop, status: "open" }, select: { orderId: true } })).map((f) => f.orderId));
-    const pick = { id: true, lines: true, orderId: true, releaseDay: true };
+    const pick = { id: true, lines: true, orderId: true, releaseDay: true, mergedLines: true, mergedInto: true };
     const ready = await db.shipment.findMany({ where: { shop, state: "ready", batchId: null }, orderBy: shipmentOrder("oldest"), select: pick });
     await batchPool(shop, settings, rowsOf(ready.filter((s) => !flagged.has(s.orderId))), made, { user });
     // Upcoming releases: pre-orders (and nothing else holding them) releasing within N days

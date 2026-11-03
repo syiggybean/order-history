@@ -72,6 +72,24 @@ const json = (s, fallback) => {
 };
 export const linesOf = (s) => json(s.lines, []);
 
+// What goes in this box: its own items plus, for a merged box (Order Merge), the
+// items chosen from the other orders (from: their order names). Same item: one line.
+const boxKey = (l) => l.variantId ?? `title:${l.title}|${l.variantTitle ?? ""}`;
+export function boxLinesOf(s) {
+  const own = linesOf(s);
+  const extra = json(s.mergedLines, []);
+  if (!extra.length) return own;
+  const out = own.map((l) => ({ ...l }));
+  for (const m of extra) {
+    const hit = out.find((l) => boxKey(l) === boxKey(m));
+    if (hit) {
+      hit.quantity += m.quantity;
+      hit.from = [...(hit.from ?? []), m.fromOrderName];
+    } else out.push({ ...m, from: [m.fromOrderName] });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Settings and audit trail
 // ---------------------------------------------------------------------------
@@ -103,7 +121,7 @@ const FO_FIELDS = `
     cancelledAt
     updatedAt
     displayFinancialStatus
-    customer { displayName }
+    customer { id displayName }
     fulfillmentOrders(first: 6) { nodes { id createdAt deliveryMethod { methodType } } }
   }
   lineItems(first: 25) {
@@ -189,6 +207,7 @@ function toShipment(fo) {
     orderName: fo.order.name,
     orderCreatedAt: new Date(fo.order.createdAt),
     customerName: fo.order.customer?.displayName ?? null,
+    customerId: fo.order.customer?.id ?? null,
     shippingMethod: method,
     country: fo.destination?.countryCode ?? null,
     province: fo.destination?.province ?? null,
@@ -561,7 +580,7 @@ async function placeHold(admin, s, mode) {
   return r?.fulfillmentHold?.id ?? null;
 }
 
-async function releaseHold(admin, s) {
+export async function releaseHold(admin, s) {
   const data = await gql(admin, RELEASE, { id: s.fulfillmentOrderId, holdIds: [s.appHoldId] });
   const r = data?.fulfillmentOrderReleaseHold;
   if (r?.userErrors?.length) throw new Error(r.userErrors.map((e) => e.message).join("; "));
@@ -673,6 +692,12 @@ const viewShipment = (s) => ({
   waitingReason: s.waitingReason,
   releaseDay: s.releaseDay ?? null,
   understocked: json(s.understocked, null),
+  // Order Merge: a merged box (the other orders' items), or part of one
+  merge: s.mergeGroupId
+    ? s.mergedInto
+      ? { role: "part", into: s.mergedInto, groupId: s.mergeGroupId }
+      : { role: "box", groupId: s.mergeGroupId, items: json(s.mergedLines, []).map((l) => ({ title: l.title, variantTitle: l.variantTitle, quantity: l.quantity, from: l.fromOrderName })) }
+    : null,
   readyAt: s.readyAt?.toISOString() ?? null,
   units: s.units,
   lines: linesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, quantity: l.quantity, sku: l.sku, imageUrl: l.imageUrl, productId: l.productId })),

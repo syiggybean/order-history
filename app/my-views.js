@@ -10,6 +10,7 @@ export const VIEWS = [
   { id: "shipping-waiting", page: "shipping", param: ["tab", "waiting"], label: "Waiting", group: "Shipping", need: ["shipping", "view"] },
   { id: "shipping-batches", page: "shipping", param: ["tab", "batches"], label: "Batches", group: "Shipping", need: ["shipping", "view"] },
   { id: "shipping-review", page: "shipping", param: ["tab", "review"], label: "Review", group: "Shipping", need: ["shipping", "view"] },
+  { id: "shipping-merge", page: "shipping", param: ["tab", "merge"], label: "Order Merge", group: "Shipping", need: ["shipping", "merge"] },
   { id: "shipping-stock", page: "shipping", param: ["tab", "stock"], label: "Stock vs orders", group: "Shipping", need: ["shipping", "view"] },
   { id: "shipping-settings", page: "shipping", param: ["tab", "settings"], label: "Settings and activity", group: "Shipping", need: ["shipping", "view"] },
   { id: "stock", page: "stock", label: "Stock", group: null, need: ["stock", "view"] },

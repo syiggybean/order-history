@@ -90,6 +90,7 @@ export function SlipSheet({ s, batch }) {
             Ordered {fmtDate(s.orderCreatedAt)} · {batch.tag}
             {s.shippingMethod ? ` · ${s.shippingMethod}` : ""}
           </div>
+          {s.mergedWith?.length > 0 && <div style={{ fontSize: "13px", marginTop: "2px", fontWeight: 700 }}>Also in this box: order {s.mergedWith.join(", ")}</div>}
         </div>
         <div style={{ textAlign: "center" }}>
           <div dangerouslySetInnerHTML={{ __html: code128Svg(s.barcode, { height: 46, module: 2 }) }} />
@@ -124,6 +125,7 @@ export function SlipSheet({ s, batch }) {
               <td>
                 {l.title}
                 {l.variantTitle ? ` – ${l.variantTitle}` : ""}
+                {l.from?.length ? <span style={{ fontSize: "11px", color: "#555" }}> (order {l.from.join(", ")})</span> : null}
               </td>
               <td>{l.sku ?? ""}</td>
               <td className="bin">{l.bin ?? ""}</td>

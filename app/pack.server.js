@@ -1,5 +1,5 @@
 import db from "./db.server";
-import { ShippingError, getShippingSettings, isSandboxShop, kick, linesOf, logEvent, noticeOf, shipmentOrder, staffKeyOf, syncOrder } from "./shipping.server";
+import { ShippingError, boxLinesOf, getShippingSettings, isSandboxShop, kick, linesOf, logEvent, noticeOf, shipmentOrder, staffKeyOf, syncOrder } from "./shipping.server";
 import { gql } from "./preorders.server";
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ const flagsFor = async (shop, orderIds) => {
 
 function viewBox(s, flags, bins) {
   const packed = json(s.packed, {});
-  const lines = linesOf(s).map((l) => {
+  const lines = boxLinesOf(s).map((l) => {
     const key = itemKey(l);
     return {
       key,
@@ -55,12 +55,16 @@ function viewBox(s, flags, bins) {
       qty: l.quantity,
       scanned: Math.min(packed[key] ?? 0, l.quantity),
       bin: bins?.get(l.variantId) ?? null,
+      from: l.from ?? null,
     };
   });
   const units = lines.reduce((n, l) => n + l.qty, 0);
   const scanned = lines.reduce((n, l) => n + l.scanned, 0);
   const notice = noticeOf(s);
   return {
+    // Order Merge: the other orders whose items are in this box, and its shipping method
+    mergedWith: [...new Set(json(s.mergedLines, []).map((l) => l.fromOrderName))],
+    mergeMethod: s.mergeMethod ?? null,
     id: s.id,
     orderId: s.orderId,
     orderName: s.orderName,
@@ -101,7 +105,7 @@ const labelViewOf = (s) => ({
 });
 
 async function binsFor(shop, shipments) {
-  const ids = [...new Set(shipments.flatMap((s) => linesOf(s).map((l) => l.variantId)).filter(Boolean))];
+  const ids = [...new Set(shipments.flatMap((s) => boxLinesOf(s).map((l) => l.variantId)).filter(Boolean))];
   if (!ids.length) return new Map();
   const rows = await db.productBin.findMany({ where: { shop, variantId: { in: ids } } });
   return new Map(rows.map((r) => [r.variantId, r.bin]));
@@ -261,7 +265,7 @@ export async function packQueue(shop, batchId) {
   const toLabel = rows.filter((r) => r.state === "packed" || r.state === "labeling");
   // Same items in every box? (bulk labels make sense then: one package, one weight)
   const contents = (s) =>
-    linesOf(s)
+    boxLinesOf(s)
       .map((l) => `${itemKey(l)}×${l.quantity}`)
       .sort()
       .join("|");
@@ -364,11 +368,11 @@ export async function packScan(shop, batchId, shipmentId, code, user, { via = "b
   const c = norm(code);
   if (!c) return { ok: false, error: "Nothing scanned." };
   // An order barcode instead of an item: the packer wants another box
-  if (/^#?\d+(?:-\d+)?$/.test(c) && !linesOf(s).some((l) => norm(l.barcode) === c || norm(l.sku) === c)) {
+  if (/^#?\d+(?:-\d+)?$/.test(c) && !boxLinesOf(s).some((l) => norm(l.barcode) === c || norm(l.sku) === c)) {
     const found = await findBox(shop, batchId, code);
     if (found.ok && found.id !== s.id) return { ok: false, switchTo: found.id, error: `That's another order's slip.` };
   }
-  const lines = linesOf(s);
+  const lines = boxLinesOf(s);
   const packed = json(s.packed, {});
   // The pack camera matched a photo to one of the box's items (no barcode)
   const byKey = c.startsWith("line:") ? String(code).trim().slice(5) : null;
@@ -407,7 +411,7 @@ export async function sealBox(shop, batchId, shipmentId, user) {
   if (s.state !== "batched") return { ok: false, error: `${s.orderName} is already packed.` };
   if (s.noticeKey && s.packAckKey !== s.noticeKey) return { ok: false, needsAck: true, error: "Read and acknowledge the note / address change first." };
   const counts = json(s.packed, {});
-  const missing = linesOf(s).filter((l) => (counts[itemKey(l)] ?? 0) < l.quantity);
+  const missing = boxLinesOf(s).filter((l) => (counts[itemKey(l)] ?? 0) < l.quantity);
   if (missing.length) return { ok: false, error: `Scan every item first: ${missing.map(label).join(", ")} still to scan.` };
   await startPackingBatch(b);
   await markPacked(shop, b, s, user);
@@ -546,7 +550,7 @@ export async function packingSlips(shop, admin, batchId, ids = []) {
         part: s.partCount > 1 ? `${s.partIndex} of ${s.partCount}` : null,
         orderCreatedAt: s.orderCreatedAt.toISOString(),
         customerName: s.customerName,
-        shippingMethod: s.shippingMethod,
+        shippingMethod: s.mergeMethod ?? s.shippingMethod,
         shipTo: a?.formatted?.length
           ? a.formatted
           : n?.shipTo?.length
@@ -554,7 +558,8 @@ export async function packingSlips(shop, admin, batchId, ids = []) {
             : [s.customerName, [s.province, s.country].filter(Boolean).join(", ")].filter(Boolean),
         note: n?.note ?? s.orderNote ?? null,
         addressWarning: ["WARNING", "ERROR"].includes(a?.validationResultSummary) ? a.validationResultSummary : (n?.address?.level ?? null),
-        lines: linesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, qty: l.quantity, sku: l.sku, bin: bins.get(l.variantId) ?? null })),
+        lines: boxLinesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, qty: l.quantity, sku: l.sku, bin: bins.get(l.variantId) ?? null, from: l.from ?? null })),
+        mergedWith: [...new Set(json(s.mergedLines, []).map((l) => l.fromOrderName))],
       };
     }),
   };
