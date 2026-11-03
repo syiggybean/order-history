@@ -76,16 +76,18 @@ export const StatusPill = ({ status }) => {
 export const batchTitle = (b) => (b.name ? `${b.tag} · ${b.name}` : b.tag);
 
 // How full a batch is, out of 250
-function Fill({ n }) {
-  const pct = Math.min(100, Math.round((n / MAX_BATCH) * 100));
+// Shipping progress: packages shipped out of the packages in the batch
+function Fill({ shipped, total }) {
+  const pct = total ? Math.min(100, Math.round((shipped / total) * 100)) : 0;
+  const done = total > 0 && shipped >= total;
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: "140px" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: "150px" }} title={`${shipped} of ${total} package${total === 1 ? "" : "s"} shipped`}>
       <div style={{ flex: 1, height: "6px", borderRadius: "3px", background: "#efefef", overflow: "hidden" }}>
-        <div style={{ width: `${pct}%`, height: "100%", background: n >= MAX_BATCH ? "#9a9a9a" : PINK }} />
+        <div style={{ width: `${pct}%`, height: "100%", background: done ? "#36a15a" : PINK, transition: "width .3s" }} />
       </div>
-      <span style={{ fontVariantNumeric: "tabular-nums" }}>
-        {n}
-        <span style={muted}>/{MAX_BATCH}</span>
+      <span style={{ fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+        {shipped}
+        <span style={muted}>/{total} shipped</span>
       </span>
     </div>
   );
@@ -301,7 +303,8 @@ const radioRow = { display: "flex", gap: "10px", alignItems: "flex-start", curso
 const names = (list) => (list?.length ? list.map((a) => a.name).join(", ") : null);
 
 // Who's working a batch; people with "Create and edit batches" can change it
-export function AssignControl({ batch, staff, canAssign, me }) {
+// compact: inside a row of the batch list (no label; clicks don't open the batch)
+export function AssignControl({ batch, staff, canAssign, me, compact = false }) {
   const fetcher = useFetcher();
   const [open, setOpen] = useState(false);
   const [picked, setPicked] = useState(() => new Set((batch.assignees ?? []).map((a) => a.id)));
@@ -309,7 +312,7 @@ export function AssignControl({ batch, staff, canAssign, me }) {
   useEffect(() => {
     if (fetcher.data?.intent === "assignBatch" && fetcher.data.ok) setOpen(false);
   }, [fetcher.data]);
-  const current = fetcher.data?.intent === "assignBatch" && fetcher.data.ok ? fetcher.data.assignees : batch.assignees ?? [];
+  const current = (fetcher.data?.intent === "assignBatch" && fetcher.data.ok ? fetcher.data.assignees : null) ?? batch.assignees ?? [];
   const toggle = (id) =>
     setPicked((cur) => {
       const n = new Set(cur);
@@ -318,8 +321,8 @@ export function AssignControl({ batch, staff, canAssign, me }) {
       return n;
     });
   return (
-    <div style={{ marginTop: "8px", fontSize: "13px" }}>
-      <span style={{ fontWeight: 600 }}>Assigned to: </span>
+    <div style={{ marginTop: compact ? 0 : "8px", fontSize: "13px" }} onClick={compact ? (e) => e.stopPropagation() : undefined}>
+      {!compact && <span style={{ fontWeight: 600 }}>Assigned to: </span>}
       {current.length ? (
         current.map((a, i) => (
           <span key={a.id}>
@@ -336,7 +339,7 @@ export function AssignControl({ batch, staff, canAssign, me }) {
         </button>
       )}
       {open && (
-        <div className="sh-rise" style={{ ...box, padding: "10px 12px", marginTop: "8px", overflow: "visible", maxWidth: "420px" }}>
+        <div className="sh-rise" style={{ ...box, padding: "10px 12px", marginTop: "8px", overflow: "visible", maxWidth: "420px", minWidth: compact ? "220px" : undefined, background: "#fff", cursor: "default" }}>
           {!staff.length ? (
             <div style={muted}>Nobody has the Pick or Pack switch yet. Turn it on for your pickers and packers on the Permissions page.</div>
           ) : (
@@ -369,7 +372,7 @@ export function AssignControl({ batch, staff, canAssign, me }) {
   );
 }
 
-export function BatchList({ batches, show, canBatches, autoBatch, restricted = false, mine = false, locks = {}, canPriority = false }) {
+export function BatchList({ batches, show, canBatches, autoBatch, restricted = false, mine = false, locks = {}, canPriority = false, staff = [], me = null }) {
   const go = useParamSetter();
   const auto = useFetcher();
   const ran = auto.data?.intent === "autoBatch" ? auto.data : null;
@@ -450,7 +453,7 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
           <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
             <thead>
               <tr>
-                {["Batch", "Priority", "Status", "Assigned", "Shipments", "Units", "Oldest order", "Created", ""].map((h, i) => (
+                {["Batch", "Priority", "Status", "Assigned", "Packages", "Units", "Oldest order", "Created", ""].map((h, i) => (
                   <th key={i} style={head}>
                     {h}
                   </th>
@@ -483,9 +486,15 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
                   <td style={cell}>
                     <StatusPill status={b.status} />
                   </td>
-                  <td style={cell}>{names(b.assignees) ?? <span style={muted}>—</span>}</td>
                   <td style={cell}>
-                    <Fill n={b.shipments} />
+                    {show === "live" && canBatches ? (
+                      <AssignControl batch={b} staff={staff} canAssign me={me} compact />
+                    ) : (
+                      (names(b.assignees) ?? <span style={muted}>—</span>)
+                    )}
+                  </td>
+                  <td style={cell}>
+                    <Fill shipped={b.shipped ?? 0} total={b.shipments} />
                   </td>
                   <td style={{ ...cell, fontVariantNumeric: "tabular-nums" }}>{b.units.toLocaleString()}</td>
                   <td style={cell}>{b.oldestOrderAt ? fmtDate(b.oldestOrderAt) : "—"}</td>

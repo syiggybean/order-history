@@ -489,6 +489,18 @@ export function allocate(shipments, stock, now = new Date(), products = {}, { ah
       });
     }
   }
+  // A box planned with other orders in it (Order Merge) is only ready when they all are
+  const stateOf = (x) => changes.get(x.id)?.state ?? x.state;
+  const reasonOf = (x) => (changes.get(x.id) && "waitingReason" in changes.get(x.id) ? changes.get(x.id).waitingReason : x.waitingReason);
+  for (const main of shipments.filter((x) => x.mergeGroupId && !x.mergedInto && ["ready", "waiting"].includes(stateOf(x)))) {
+    const late = shipments.filter((x) => x.mergeGroupId === main.mergeGroupId && x.mergedInto && stateOf(x) === "waiting");
+    if (!late.length) continue;
+    const reason = `Same box as ${late.map((x) => `${x.orderName} (${reasonOf(x) ?? "waiting"})`).join(", ")}`;
+    const own = reasonOf(main);
+    const want = stateOf(main) === "waiting" && own && !own.startsWith("Same box as") ? own : reason;
+    if (stateOf(main) !== "waiting" || want !== own) changes.set(main.id, { ...(changes.get(main.id) ?? {}), state: "waiting", waitingReason: want, readyAt: null });
+  }
+
   // Understocked: items more open orders want than there's stock for (every open
   // order with one gets the badge). Labels already bought have left the stock.
   const demand = new Map(); // key -> { title, ordered }
@@ -885,15 +897,26 @@ export const shipmentOrder = (sort) => {
 // understock: may this person see understocked badges? (otherwise they're left out)
 export async function listShipments(shop, filter = {}, { page = 1, pageSize = 50, viewer = null, understock = false } = {}) {
   const where = shipmentWhere(shop, filter);
-  const [rows, total] = await Promise.all([
-    db.shipment.findMany({
-      where,
-      orderBy: shipmentOrder(filter.sort),
-      skip: (page - 1) * pageSize,
-      take: pageSize,
-    }),
-    db.shipment.count({ where }),
-  ]);
+  let rows;
+  let total;
+  if (filter.batchId) {
+    // A batch (up to 250): packages still to ship first, then the shipped ones
+    const all = await db.shipment.findMany({ where, orderBy: shipmentOrder(filter.sort) });
+    const gone = (x) => ["shipped", "closed"].includes(x.state);
+    all.sort((a, b) => Number(gone(a)) - Number(gone(b)));
+    total = all.length;
+    rows = all.slice((page - 1) * pageSize, page * pageSize);
+  } else {
+    [rows, total] = await Promise.all([
+      db.shipment.findMany({
+        where,
+        orderBy: shipmentOrder(filter.sort),
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      db.shipment.count({ where }),
+    ]);
+  }
   const shipments = (await withNotices(shop, await withFlags(shop, rows.map(viewShipment)), viewer)).map((x) => (understock ? x : { ...x, understocked: null }));
   return { shipments, total, page, hasMore: page * pageSize < total };
 }

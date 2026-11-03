@@ -1,189 +1,410 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useFetcher } from "react-router";
 import { OrderLink } from "./OrderLink";
 import { MethodBadge } from "./MethodBadge";
-import { box, fmtDate, muted, pill, small } from "./ui";
+import { box, fmtDate, input, muted, pill, small, useParamSetter } from "./ui";
 
-// Order Merge: a customer's open orders to the same address, shipped in one box.
-// The main order (left) goes in whole; tick which items of the other orders
-// (right) go with it. Its label is bought in Shopify as usual; the app then
-// fulfills the ticked items of the other orders with the same tracking.
+// Order Merge: find a customer, see their open orders and history, and arrange
+// their items into boxes any way you like (ready or not). An order split across
+// boxes becomes separate shipments in Shopify; a box with several orders ships as
+// one (label on one order, the others fulfilled with the same tracking).
 
 const label = (l) => `${l.title}${l.variantTitle ? ` – ${l.variantTitle}` : ""}`;
 const dayLabel = (day) => new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric" });
+const linkBtn = { appearance: "none", border: 0, background: "none", padding: 0, font: "inherit", color: "#005bd3", cursor: "pointer" };
 
-function StatePill({ s }) {
-  if (s.state === "ready") return <span style={pill("#e3f1df", "#1a5e20")}>Ready</span>;
+function StatePill({ o }) {
+  if (!o) return null;
+  if (o.state === "ready") return <span style={pill("#e3f1df", "#1a5e20")}>Ready</span>;
   return (
-    <span style={pill("#fff1e3", "#8a4b00")} title={s.waitingReason ?? ""}>
-      Waiting{s.releaseDay ? ` · releases ${dayLabel(s.releaseDay)}` : ""}
+    <span style={pill("#fff1e3", "#8a4b00")} title={o.waitingReason ?? ""}>
+      Waiting{o.releaseDay ? ` · releases ${dayLabel(o.releaseDay)}` : ""}
     </span>
   );
 }
 
-function Lines({ s, picks = null, onToggle = null }) {
-  return (
-    <ul style={{ listStyle: "none", padding: 0, margin: "8px 0 0", display: "grid", gap: "6px" }}>
-      {s.lines.map((l) => {
-        const on = picks ? picks.has(l.id) : true;
-        return (
-          <li key={l.id} style={{ display: "flex", gap: "8px", alignItems: "center", opacity: on ? 1 : 0.6 }}>
-            {picks && (
-              <input type="checkbox" checked={on} onChange={() => onToggle(l.id)} aria-label={`Put ${label(l)} from ${s.orderName} in the box`} style={{ margin: 0, width: "18px", height: "18px" }} />
-            )}
-            {l.imageUrl ? (
-              <img src={l.imageUrl} alt="" style={{ width: "32px", height: "32px", objectFit: "cover", borderRadius: "4px", flexShrink: 0 }} />
-            ) : (
-              <span style={{ width: "32px", height: "32px", borderRadius: "4px", background: "#f1f1f1", flexShrink: 0 }} />
-            )}
-            <span style={{ flex: 1, minWidth: 0 }}>
-              <span style={{ fontWeight: 600 }}>{l.quantity} ×</span> {label(l)}
-              {l.sku && <span style={small}> · {l.sku}</span>}
-            </span>
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
+// ---- Finding a customer -------------------------------------------------------
 
-function OrderCard({ s, children, right = null }) {
-  return (
-    <div style={{ ...box, padding: "12px", overflow: "visible" }}>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
-        <OrderLink orderId={s.orderId} orderNumber={s.orderNumber} name={s.orderName} />
-        {s.part && <span style={small}>part {s.part}</span>}
-        <StatePill s={s} />
-        <span style={{ flex: 1 }} />
-        {right}
-      </div>
-      <div style={{ ...small, marginTop: "4px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-        Ordered {fmtDate(s.orderCreatedAt)}
-        {s.shippingMethod && <MethodBadge method={s.shippingMethod} />}
-      </div>
-      {s.state !== "ready" && s.waitingReason && <div style={{ ...small, color: "#8a4b00", marginTop: "4px" }}>{s.waitingReason}</div>}
-      {children}
-    </div>
-  );
-}
-
-function Group({ g }) {
+function CustomerSearch() {
   const fetcher = useFetcher();
-  const ready = g.shipments.filter((s) => s.state === "ready");
-  const [mainId, setMainId] = useState(ready[0]?.id);
-  const main = g.shipments.find((s) => s.id === mainId) ?? ready[0];
-  const others = g.shipments.filter((s) => s.id !== main.id && s.orderId !== main.orderId);
-  // Ticked items: ready orders' items to start with; waiting orders' items are left for the person to choose
-  const startPicks = () => new Map(others.map((s) => [s.id, new Set(s.state === "ready" ? s.lines.map((l) => l.id) : [])]));
-  const [picks, setPicks] = useState(startPicks);
-  useEffect(() => setPicks(startPicks()), [mainId]); // eslint-disable-line react-hooks/exhaustive-deps
-  const methods = useMemo(() => [...new Set(g.shipments.map((s) => s.shippingMethod).filter(Boolean))], [g.shipments]);
-  const [method, setMethod] = useState(main.shippingMethod ?? methods[0] ?? "");
-  useEffect(() => setMethod(main.shippingMethod ?? methods[0] ?? ""), [mainId]); // eslint-disable-line react-hooks/exhaustive-deps
-  const toggle = (sid, lid) =>
-    setPicks((cur) => {
-      const n = new Map(cur);
-      const set = new Set(n.get(sid) ?? []);
-      if (set.has(lid)) set.delete(lid);
-      else set.add(lid);
-      n.set(sid, set);
-      return n;
-    });
-  const chosen = others.flatMap((s) => s.lines.filter((l) => picks.get(s.id)?.has(l.id)).map((l) => ({ s, l })));
-  const items = chosen.reduce((n, x) => n + x.l.quantity, 0);
-  const notReady = [...new Set(chosen.filter((x) => x.s.state !== "ready").map((x) => x.s.orderName))];
-  const busy = fetcher.state !== "idle";
-  const result = fetcher.data?.intent === "mergeOrders" ? fetcher.data : null;
-  const submit = () =>
-    fetcher.submit(
-      {
-        intent: "mergeOrders",
-        main: String(main.id),
-        method,
-        riders: JSON.stringify(others.map((s) => ({ shipmentId: s.id, lineIds: [...(picks.get(s.id) ?? [])] })).filter((r) => r.lineIds.length)),
-      },
-      { method: "post" },
-    );
-
-  if (result?.ok)
-    return (
-      <s-banner tone="success" heading={`${result.mainOrderName} now ships with ${result.items} more item${result.items === 1 ? "" : "s"}`}>
-        <s-paragraph>Batch {result.mainOrderName} as usual: the other orders' items are on its pick list, packing slip and pack bench.</s-paragraph>
-      </s-banner>
-    );
+  const go = useParamSetter();
+  const [q, setQ] = useState("");
+  const timer = useRef(null);
+  const results = fetcher.data?.intent === "findCustomers" ? fetcher.data.customers : null;
+  const ask = (text) => {
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => fetcher.submit({ intent: "findCustomers", q: text }, { method: "post" }), 250);
+  };
+  useEffect(() => () => clearTimeout(timer.current), []);
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "12px", alignItems: "start" }}>
-      <div>
-        <div style={{ ...small, fontWeight: 700, marginBottom: "6px" }}>Main order: goes in the box whole{ready.length > 1 ? "" : ""}</div>
-        <OrderCard s={main}>
-          <Lines s={main} />
-        </OrderCard>
-      </div>
-      <div style={{ display: "grid", gap: "10px" }}>
-        <div style={{ ...small, fontWeight: 700 }}>Tick what goes in the same box</div>
-        {others.map((s) => (
-          <OrderCard
-            key={s.id}
-            s={s}
-            right={
-              s.state === "ready" && ready.length > 1 ? (
-                <button type="button" onClick={() => setMainId(s.id)} style={{ appearance: "none", border: 0, background: "none", color: "#005bd3", font: "inherit", fontSize: "12px", cursor: "pointer", padding: 0 }}>
-                  Make this the main order
-                </button>
-              ) : null
-            }
-          >
-            <Lines s={s} picks={picks.get(s.id) ?? new Set()} onToggle={(lid) => toggle(s.id, lid)} />
-          </OrderCard>
-        ))}
-      </div>
-      <div style={{ gridColumn: "1 / -1", display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", paddingTop: "4px" }}>
-        <label style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
-          Ship by
-          <select value={method} onChange={(e) => setMethod(e.target.value)} aria-label="Shipping method for the box" style={{ font: "inherit", padding: "5px 8px", borderRadius: "8px", border: "1px solid #c9c9c9" }}>
-            {methods.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-            {!methods.length && <option value="">Main order's method</option>}
-          </select>
-        </label>
-        <s-button variant="primary" onClick={submit} {...(busy ? { loading: true } : {})} {...(!items ? { disabled: true } : {})}>
-          {items ? `Ship ${items} more item${items === 1 ? "" : "s"} with ${main.orderName}` : "Tick items to merge"}
+    <div>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          fetcher.submit({ intent: "findCustomers", q }, { method: "post" });
+        }}
+        style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}
+      >
+        <input
+          type="search"
+          value={q}
+          onChange={(e) => {
+            setQ(e.target.value);
+            if (e.target.value.trim().length >= 2) ask(e.target.value.trim());
+          }}
+          placeholder="Customer name or order number"
+          aria-label="Find a customer"
+          style={{ ...input, flex: "1 1 280px", maxWidth: "420px", padding: "8px 10px" }}
+        />
+        <s-button variant="primary" onClick={() => fetcher.submit({ intent: "findCustomers", q }, { method: "post" })} {...(fetcher.state !== "idle" ? { loading: true } : {})}>
+          Find customer
         </s-button>
-        {notReady.length > 0 && <span style={{ ...small, color: "#8a4b00" }}>Not ready yet: {notReady.join(", ")}. Make sure those items are on the shelf before packing.</span>}
-        {result?.error && <span style={{ color: "#b42318" }}>{result.error}</span>}
-      </div>
+      </form>
+      {results && (
+        <div style={{ marginTop: "10px", display: "grid", gap: "6px" }}>
+          {!results.length && <div style={small}>No customers matching "{fetcher.data.q}".</div>}
+          {results.map((c) => (
+            <button
+              key={c.customerId}
+              type="button"
+              onClick={() => go({ customer: c.customerId }, { replace: false })}
+              style={{ ...box, overflow: "visible", textAlign: "left", background: "#fff", padding: "8px 12px", font: "inherit", cursor: "pointer", display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}
+            >
+              <strong>{c.name ?? "Customer"}</strong>
+              <span style={small}>
+                {c.openOrders} open order{c.openOrders === 1 ? "" : "s"} · {c.orders} in all · last ordered {fmtDate(c.lastOrderAt)}
+              </span>
+              <span style={{ flex: 1 }} />
+              <span style={{ color: "#005bd3", fontWeight: 600 }}>Plan boxes →</span>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
+
+// ---- The planner ----------------------------------------------------------------
+
+let rowSeq = 0;
+const rowsFrom = (plan) => plan.boxes.flatMap((b, bi) => b.lines.map((l) => ({ ...l, rid: ++rowSeq, box: bi })));
+const metaFrom = (plan) => plan.boxes.map((b) => ({ labelShipmentId: b.labelShipmentId, method: b.method ?? "" }));
+
+function Planner({ plan }) {
+  const go = useParamSetter();
+  const save = useFetcher();
+  const [rows, setRows] = useState(() => rowsFrom(plan));
+  const [meta, setMeta] = useState(() => metaFrom(plan));
+  const planKey = JSON.stringify(plan.boxes);
+  useEffect(() => {
+    setRows(rowsFrom(plan));
+    setMeta(metaFrom(plan));
+  }, [planKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const orderOf = useMemo(() => new Map(plan.orders.map((o) => [o.shipmentId, o])), [plan.orders]);
+
+  const move = (rid, to) => {
+    if (to === "new") {
+      setMeta((m) => [...m, { labelShipmentId: null, method: "" }]);
+      setRows((rs) => rs.map((r) => (r.rid === rid ? { ...r, box: meta.length } : r)));
+    } else setRows((rs) => rs.map((r) => (r.rid === rid ? { ...r, box: Number(to) } : r)));
+  };
+  const splitOne = (rid) =>
+    setRows((rs) => rs.flatMap((r) => (r.rid === rid && r.quantity > 1 ? [{ ...r, quantity: r.quantity - 1 }, { ...r, rid: ++rowSeq, quantity: 1 }] : [r])));
+  const addBox = () => setMeta((m) => [...m, { labelShipmentId: null, method: "" }]);
+  const reset = () => {
+    setRows(rowsFrom(plan));
+    setMeta(metaFrom(plan));
+  };
+
+  // What each box holds
+  const boxes = meta.map((m, i) => {
+    const items = rows.filter((r) => r.box === i);
+    const sids = [...new Set(items.map((r) => r.shipmentId))];
+    const orders = sids.map((sid) => orderOf.get(sid)).filter(Boolean);
+    const labelId = sids.includes(m.labelShipmentId) ? m.labelShipmentId : (orders.find((o) => o.state === "ready") ?? orders[0])?.shipmentId ?? null;
+    const methods = [...new Set(orders.map((o) => o.shippingMethod).filter(Boolean))];
+    const method = m.method && methods.includes(m.method) ? m.method : (orderOf.get(labelId)?.shippingMethod ?? methods[0] ?? "");
+    const waiting = orders.filter((o) => o.state !== "ready");
+    const addresses = new Set(orders.map((o) => o.addressKey).filter(Boolean));
+    return { i, items, orders, labelId, methods, method, waiting, mixedAddress: addresses.size > 1 };
+  });
+  const used = boxes.filter((b) => b.items.length);
+  // What will change
+  const splits = plan.orders
+    .map((o) => ({ o, n: new Set(rows.filter((r) => r.shipmentId === o.shipmentId).map((r) => r.box)).size }))
+    .filter((x) => x.n > 1);
+  const together = used.filter((b) => b.orders.length > 1);
+  const changed = JSON.stringify(rows.map((r) => [r.shipmentId, r.id, r.quantity, r.box]).sort()) !== JSON.stringify(rowsFrom(plan).map((r) => [r.shipmentId, r.id, r.quantity, r.box]).sort()) || JSON.stringify(meta) !== JSON.stringify(metaFrom(plan));
+  const blocked = used.some((b) => b.mixedAddress);
+  const submit = () => {
+    const out = used.map((b) => {
+      const sum = new Map();
+      for (const r of b.items) {
+        const k = `${r.shipmentId}|${r.id}`;
+        sum.set(k, { shipmentId: r.shipmentId, id: r.id, quantity: (sum.get(k)?.quantity ?? 0) + r.quantity });
+      }
+      return { items: [...sum.values()], labelShipmentId: b.labelId, method: b.method || null };
+    });
+    save.submit({ intent: "saveBoxes", customer: plan.customerId, plan: JSON.stringify({ boxes: out }) }, { method: "post" });
+  };
+  const result = save.data?.intent === "saveBoxes" ? save.data : null;
+  const boxName = (i) => `Box ${used.findIndex((b) => b.i === i) + 1 || i + 1}`;
+
+  return (
+    <>
+      <s-section>
+        <button type="button" style={{ ...linkBtn, marginBottom: "8px" }} onClick={() => go({ customer: null }, { replace: false })}>
+          ← All customers
+        </button>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "baseline" }}>
+          <h2 style={{ margin: 0, fontSize: "20px" }}>{plan.name ?? "Customer"}</h2>
+          <span style={small}>
+            {plan.orders.length} open order{plan.orders.length === 1 ? "" : "s"} to plan
+            {plan.inWork.length ? ` · ${plan.inWork.length} already in a batch` : ""}
+          </span>
+        </div>
+        {!plan.addressesChecked && plan.orders.length > 1 && (
+          <div style={{ marginTop: "10px" }}>
+            <s-banner tone="warning">
+              <s-paragraph>Shopify didn't share shipping addresses, so check the orders in a box all go to the same address.</s-paragraph>
+            </s-banner>
+          </div>
+        )}
+        {result?.ok && (
+          <div style={{ marginTop: "10px" }} className="sh-rise">
+            <s-banner tone="success" heading={`Saved: ${result.boxes} box${result.boxes === 1 ? "" : "es"}`}>
+              <s-paragraph>
+                {[result.splits?.length ? `Split in Shopify: ${result.splits.join(", ")}.` : null, result.merged?.length ? `Shipping together: ${result.merged.join("; ")}.` : null].filter(Boolean).join(" ") ||
+                  "No changes needed."}
+              </s-paragraph>
+            </s-banner>
+          </div>
+        )}
+        {result?.error && (
+          <div style={{ marginTop: "10px" }}>
+            <s-banner tone="critical">
+              <s-paragraph>{result.error}</s-paragraph>
+            </s-banner>
+          </div>
+        )}
+
+        {!plan.orders.length ? (
+          <s-paragraph>No open orders to plan for this customer (orders already in a batch are listed below).</s-paragraph>
+        ) : (
+          <>
+            <div style={{ ...small, margin: "12px 0 8px" }}>
+              Move items between boxes with the Box menu; Split takes one off to move it on its own. Each box ships as one package; ready or not is up to you (a box
+              waits until everything in it is ready).
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: "12px", alignItems: "start" }}>
+              {boxes.map((b) =>
+                !b.items.length && b.i < plan.boxes.length ? null : (
+                  <div key={b.i} style={{ ...box, overflow: "visible", padding: "12px", background: b.items.length ? "#fff" : "#fafafa", borderStyle: b.items.length ? "solid" : "dashed" }}>
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                      <strong style={{ fontSize: "15px" }}>{b.items.length ? boxName(b.i) : "New box"}</strong>
+                      {b.items.length > 0 && <span style={small}>{b.items.reduce((n, r) => n + r.quantity, 0)} items</span>}
+                      <span style={{ flex: 1 }} />
+                      {b.items.length > 0 &&
+                        (b.waiting.length ? (
+                          <span style={pill("#fff1e3", "#8a4b00")} title={b.waiting.map((o) => `${o.orderName}: ${o.waitingReason ?? "waiting"}`).join("\n")}>
+                            Waits for {b.waiting.map((o) => o.orderName).join(", ")}
+                          </span>
+                        ) : (
+                          <span style={pill("#e3f1df", "#1a5e20")}>Ready</span>
+                        ))}
+                    </div>
+                    {!b.items.length && <div style={{ ...small, marginTop: "6px" }}>Move items here with their Box menu.</div>}
+                    {b.mixedAddress && <div style={{ ...small, color: "#b42318", marginTop: "6px", fontWeight: 600 }}>These orders go to different addresses: they can't share a box.</div>}
+                    <ul style={{ listStyle: "none", padding: 0, margin: "8px 0 0", display: "grid", gap: "8px" }}>
+                      {b.items.map((r) => {
+                        const o = orderOf.get(r.shipmentId);
+                        return (
+                          <li key={r.rid} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                            {r.imageUrl ? (
+                              <img src={r.imageUrl} alt="" style={{ width: "34px", height: "34px", objectFit: "cover", borderRadius: "4px", flexShrink: 0 }} />
+                            ) : (
+                              <span style={{ width: "34px", height: "34px", borderRadius: "4px", background: "#f1f1f1", flexShrink: 0 }} />
+                            )}
+                            <span style={{ flex: 1, minWidth: 0 }}>
+                              <span style={{ fontWeight: 600 }}>{r.quantity} ×</span> {label(r)}
+                              <div style={small}>
+                                {o?.orderName}
+                                {o?.state !== "ready" ? ` · ${o?.releaseDay ? `releases ${dayLabel(o.releaseDay)}` : "waiting"}` : ""}
+                              </div>
+                            </span>
+                            {r.quantity > 1 && (
+                              <button type="button" style={{ ...linkBtn, fontSize: "12px" }} onClick={() => splitOne(r.rid)} title="Take one off, to move it on its own">
+                                Split
+                              </button>
+                            )}
+                            <select value={r.box} onChange={(e) => move(r.rid, e.target.value)} aria-label={`Box for ${label(r)} (${o?.orderName})`} style={{ ...input, padding: "3px 4px", fontSize: "12px" }}>
+                              {boxes
+                                .filter((x) => x.items.length || x.i === r.box || x.i >= plan.boxes.length)
+                                .map((x) => (
+                                  <option key={x.i} value={x.i}>
+                                    {x.items.length ? boxName(x.i) : "New box"}
+                                  </option>
+                                ))}
+                              <option value="new">+ New box</option>
+                            </select>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    {b.orders.length > 0 && (
+                      <div style={{ display: "grid", gap: "6px", marginTop: "10px", paddingTop: "10px", borderTop: "1px solid #eee", fontSize: "13px" }}>
+                        {b.orders.length > 1 && (
+                          <label style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
+                            Label on
+                            <select
+                              value={b.labelId ?? ""}
+                              onChange={(e) => setMeta((m) => m.map((x, j) => (j === b.i ? { ...x, labelShipmentId: Number(e.target.value) } : x)))}
+                              aria-label={`Order to buy the label on for ${boxName(b.i)}`}
+                              style={{ ...input, padding: "3px 6px" }}
+                            >
+                              {b.orders.map((o) => (
+                                <option key={o.shipmentId} value={o.shipmentId}>
+                                  {o.orderName}
+                                </option>
+                              ))}
+                            </select>
+                            <span style={small}>the others are marked shipped with its tracking</span>
+                          </label>
+                        )}
+                        {b.methods.length > 1 ? (
+                          <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                            Ship by
+                            <select
+                              value={b.method}
+                              onChange={(e) => setMeta((m) => m.map((x, j) => (j === b.i ? { ...x, method: e.target.value } : x)))}
+                              aria-label={`Shipping method for ${boxName(b.i)}`}
+                              style={{ ...input, padding: "3px 6px" }}
+                            >
+                              {b.methods.map((x) => (
+                                <option key={x} value={x}>
+                                  {x}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        ) : (
+                          b.method && (
+                            <span style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
+                              Ship by <MethodBadge method={b.method} />
+                            </span>
+                          )
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ),
+              )}
+              <button type="button" onClick={addBox} style={{ ...box, overflow: "visible", borderStyle: "dashed", background: "#fff", minHeight: "80px", font: "inherit", color: "#005bd3", fontWeight: 600, cursor: "pointer" }}>
+                + New box
+              </button>
+            </div>
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center", marginTop: "14px" }}>
+              <s-button variant="primary" onClick={submit} {...(save.state !== "idle" ? { loading: true } : {})} {...(!changed || blocked ? { disabled: true } : {})}>
+                Save boxes
+              </s-button>
+              {changed && (
+                <s-button variant="tertiary" onClick={reset}>
+                  Undo changes
+                </s-button>
+              )}
+              <span style={small}>
+                {!changed
+                  ? "Showing how these orders ship today."
+                  : [splits.length ? `Splits ${splits.map((x) => `${x.o.orderName} into ${x.n}`).join(", ")} in Shopify` : null, together.length ? `${together.length} box${together.length === 1 ? "" : "es"} with more than one order` : null]
+                      .filter(Boolean)
+                      .join(" · ") || "Saves the new arrangement"}
+              </span>
+            </div>
+          </>
+        )}
+      </s-section>
+
+      <s-section heading="Orders">
+        <div style={{ ...box }}>
+          <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
+            <tbody>
+              {plan.orders.map((o) => (
+                <tr key={`o${o.shipmentId}`}>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>
+                    <OrderLink orderId={o.orderId} orderNumber={o.orderNumber} name={o.orderName} />
+                  </td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>{fmtDate(o.orderCreatedAt)}</td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>
+                    <StatePill o={o} />
+                    {o.state !== "ready" && o.waitingReason && <div style={small}>{o.waitingReason}</div>}
+                  </td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>{o.shippingMethod ? <MethodBadge method={o.shippingMethod} /> : "—"}</td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee", ...small }}>{Array.isArray(o.address) ? o.address.join(", ") : (o.address ?? "")}</td>
+                </tr>
+              ))}
+              {plan.inWork.map((o) => (
+                <tr key={`w${o.shipmentId}`} style={{ opacity: 0.75 }}>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>
+                    <OrderLink orderId={o.orderId} orderNumber={o.orderNumber} name={o.orderName} />
+                  </td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>{fmtDate(o.orderCreatedAt)}</td>
+                  <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }} colSpan={3}>
+                    <span style={pill("#eef3ff", "#1c4a9c")}>{o.state === "packed" || o.state === "labeling" ? "Packed" : "In a batch"}</span>{" "}
+                    <span style={small}>Take it out of its batch to re-plan it. {o.items.map((i) => `${i.quantity} × ${label(i)}`).join(", ")}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </s-section>
+
+      {plan.history.length > 0 && (
+        <s-section heading="Order history">
+          <div style={{ ...box }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
+              <tbody>
+                {plan.history.map((o) => (
+                  <tr key={o.shipmentId}>
+                    <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>
+                      <OrderLink orderId={o.orderId} orderNumber={o.orderNumber} name={o.orderName} />
+                    </td>
+                    <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>{fmtDate(o.orderCreatedAt)}</td>
+                    <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee" }}>
+                      {o.state === "shipped" ? <span style={pill("#f1f1f1", "#1a5e20")}>Shipped{o.closedAt ? ` ${fmtDate(o.closedAt)}` : ""}</span> : <span style={pill("#f1f1f1", "#4a4a4a")}>Closed</span>}
+                    </td>
+                    <td style={{ padding: "8px 10px", borderBottom: "1px solid #eee", ...small }}>{o.items.map((i) => `${i.quantity} × ${label(i)}`).join(", ")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </s-section>
+      )}
+    </>
+  );
+}
+
+// ---- Merges list -------------------------------------------------------------------
 
 function Merges({ merges }) {
   const fetcher = useFetcher();
-  if (!merges.length) return null;
+  if (!merges?.length) return null;
   const status = (m) =>
-    m.status === "shipped"
-      ? pill("#e3f1df", "#1a5e20")
-      : m.status === "cancelled"
-        ? pill("#f1f1f1", "#4a4a4a")
-        : m.error
-          ? pill("#fde7e9", "#8e1f0b")
-          : pill("#eef3ff", "#1c4a9c");
+    m.status === "shipped" ? pill("#e3f1df", "#1a5e20") : m.status === "cancelled" ? pill("#f1f1f1", "#4a4a4a") : m.error ? pill("#fde7e9", "#8e1f0b") : pill("#eef3ff", "#1c4a9c");
   const statusText = (m) =>
     m.status === "shipped" ? "Shipped" : m.status === "cancelled" ? "Ended" : m.error ? "Needs attention" : m.mainState === "shipped" ? "Fulfilling the others…" : m.batchId ? "In a batch" : "To batch";
   return (
-    <s-section heading="Merged boxes">
+    <s-section heading="Boxes with more than one order">
       <div style={{ display: "grid", gap: "8px" }}>
         {merges.map((m) => (
           <div key={m.id} style={{ ...box, padding: "10px 12px", overflow: "visible", display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center" }}>
             <span style={{ flex: "1 1 320px", minWidth: 0 }}>
               <OrderLink orderId={m.mainOrderId} orderNumber={m.mainOrderId?.split("/").pop()} name={m.mainOrderName} />{" "}
-              <span>
-                + {m.riders.map((r) => `${r.items} from ${r.orderName}${r.done ? " ✓" : ""}`).join(", ")}
-              </span>
+              <span>+ {m.riders.map((r) => `${r.items} from ${r.orderName}${r.done ? " ✓" : ""}`).join(", ")}</span>
               <div style={small}>
-                {m.method ? `${m.method} · ` : ""}merged {fmtDate(m.createdAt, true)}
+                {m.method ? `${m.method} · ` : ""}planned {fmtDate(m.createdAt, true)}
                 {m.createdBy ? ` by ${m.createdBy}` : ""}
                 {m.shippedAt ? ` · shipped ${fmtDate(m.shippedAt, true)}` : ""}
               </div>
@@ -192,7 +413,7 @@ function Merges({ merges }) {
             <span style={status(m)}>{statusText(m)}</span>
             {m.canUndo && (
               <s-button variant="tertiary" onClick={() => fetcher.submit({ intent: "undoMerge", id: String(m.id) }, { method: "post" })} {...(fetcher.state !== "idle" ? { loading: true } : {})}>
-                Undo
+                Ship separately
               </s-button>
             )}
           </div>
@@ -204,56 +425,54 @@ function Merges({ merges }) {
 }
 
 export function MergeTab({ data }) {
-  const [open, setOpen] = useState(null);
+  const go = useParamSetter();
   if (!data) return null;
-  const { groups, addressesChecked, merges } = data;
+  if (data.plan !== undefined)
+    return data.plan ? (
+      <Planner plan={data.plan} />
+    ) : (
+      <s-section>
+        <button type="button" style={linkBtn} onClick={() => go({ customer: null }, { replace: false })}>
+          ← All customers
+        </button>
+        <s-paragraph>That customer couldn't be found.</s-paragraph>
+      </s-section>
+    );
+  const { groups = [], merges = [] } = data;
   return (
     <>
       <s-section heading="Order Merge">
         <s-paragraph>
           <span style={muted}>
-            Customers with more than one open order to the same address. Merge to send them in one box: the main order goes in whole, and you choose which items of
-            the other orders go with it. Buy the label on the main order in Shopify as usual; the app then marks the other orders' items as shipped with the same
-            tracking number, and Shopify emails the customer for each order.
+            Find a customer to see their open orders and order history, then arrange their items into boxes however you like: ship orders together, or split an
+            order to send part of it now. Buy each box's label on one of its orders in Shopify as usual; the app marks the box's other orders shipped with the
+            same tracking, and Shopify emails the customer for each.
           </span>
         </s-paragraph>
-        {!addressesChecked && groups.length > 0 && (
-          <div style={{ margin: "10px 0" }}>
-            <s-banner tone="warning">
-              <s-paragraph>Shopify didn't share shipping addresses, so these are grouped by customer only. Check the addresses match before merging.</s-paragraph>
-            </s-banner>
-          </div>
-        )}
-        {!groups.length ? (
-          <s-paragraph>Nothing to merge: no customer has more than one open order to the same address right now (with at least one ready to ship).</s-paragraph>
-        ) : (
-          <div style={{ display: "grid", gap: "10px", marginTop: "10px" }}>
-            {groups.map((g) => {
-              const orders = new Set(g.shipments.map((s) => s.orderId)).size;
-              const isOpen = open === g.key;
-              return (
-                <div key={g.key} style={{ ...box, padding: "12px 14px", overflow: "visible" }}>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", alignItems: "center" }}>
-                    <strong>{g.customerName ?? "Customer"}</strong>
-                    <span style={small}>{orders} orders · {g.shipments.reduce((n, s) => n + s.lines.reduce((m, l) => m + l.quantity, 0), 0)} items</span>
-                    <span style={small}>{g.shipments.map((s) => s.orderName).join(", ")}</span>
-                    <span style={{ flex: 1 }} />
-                    <s-button variant={isOpen ? "tertiary" : "secondary"} onClick={() => setOpen(isOpen ? null : g.key)}>
-                      {isOpen ? "Close" : "Review and merge"}
-                    </s-button>
-                  </div>
-                  {g.address && <div style={{ ...small, marginTop: "4px" }}>{Array.isArray(g.address) ? g.address.join(", ") : g.address}</div>}
-                  {isOpen && (
-                    <div style={{ marginTop: "12px" }}>
-                      <Group g={g} />
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
+        <div style={{ marginTop: "10px" }}>
+          <CustomerSearch />
+        </div>
       </s-section>
+      {groups.length > 0 && (
+        <s-section heading="Suggestions: several open orders to one address">
+          <div style={{ display: "grid", gap: "6px" }}>
+            {groups.map((g) => (
+              <button
+                key={g.key}
+                type="button"
+                onClick={() => go({ customer: g.customerId }, { replace: false })}
+                style={{ ...box, overflow: "visible", textAlign: "left", background: "#fff", padding: "8px 12px", font: "inherit", cursor: "pointer", display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}
+              >
+                <strong>{g.customerName ?? "Customer"}</strong>
+                <span style={small}>{g.shipments.map((s) => s.orderName).join(", ")}</span>
+                {g.address && <span style={small}>{Array.isArray(g.address) ? g.address.join(", ") : g.address}</span>}
+                <span style={{ flex: 1 }} />
+                <span style={{ color: "#005bd3", fontWeight: 600 }}>Plan boxes →</span>
+              </button>
+            ))}
+          </div>
+        </s-section>
+      )}
       <Merges merges={merges} />
     </>
   );

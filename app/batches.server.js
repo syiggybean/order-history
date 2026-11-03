@@ -298,6 +298,7 @@ const viewBatch = (b, stats) => ({
   pickedAt: b.pickedAt?.toISOString() ?? null,
   pickedBy: b.pickedBy,
   shipments: stats?.shipments ?? 0,
+  shipped: stats?.shipped ?? 0,
   units: stats?.units ?? 0,
   flagged: stats?.flagged ?? 0,
   oldestOrderAt: stats?.oldest ?? null,
@@ -308,12 +309,13 @@ async function statsFor(batchIds) {
   if (!batchIds.length) return new Map();
   const rows = await db.shipment.findMany({
     where: { batchId: { in: batchIds }, state: { in: ["batched", "packed", "labeling", "shipped"] } },
-    select: { batchId: true, units: true, flag: true, orderCreatedAt: true, mergedLines: true },
+    select: { batchId: true, units: true, flag: true, orderCreatedAt: true, mergedLines: true, state: true },
   });
   const m = new Map();
   for (const r of rows) {
-    const s = m.get(r.batchId) ?? { shipments: 0, units: 0, flagged: 0, oldest: null };
+    const s = m.get(r.batchId) ?? { shipments: 0, shipped: 0, units: 0, flagged: 0, oldest: null };
     s.shipments++;
+    if (r.state === "shipped") s.shipped++;
     s.units += r.units + json(r.mergedLines, []).reduce((n, l) => n + (l.quantity ?? 0), 0);
     if (r.flag) s.flagged++;
     const at = r.orderCreatedAt.toISOString();

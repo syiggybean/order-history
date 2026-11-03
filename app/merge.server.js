@@ -1,6 +1,6 @@
 import db from "./db.server";
 import { gql } from "./preorders.server";
-import { ShippingError, isSandboxShop, kick, linesOf, logEvent, onAfterRun, releaseHold } from "./shipping.server";
+import { ShippingError, isSandboxShop, kick, linesOf, logEvent, onAfterRun, releaseHold, syncOrder } from "./shipping.server";
 
 // ---------------------------------------------------------------------------
 // Order Merge: open orders for the same customer and address shipped in one box.
@@ -99,6 +99,7 @@ export async function mergeCandidates(shop, admin, { limit = 60 } = {}) {
     for (const [k, x] of byAddress) {
       if (new Set(x.shipments.map((s) => s.orderId)).size < 2 || !x.shipments.some((s) => s.state === "ready")) continue;
       out.push({
+        customerId: g[0].customerId,
         key: `${g[0].customerId}|${k}`,
         customerName: x.shipments[0].customerName,
         address: x.address,
@@ -195,6 +196,300 @@ export async function undoMerge(shop, groupId, user) {
   await db.mergeGroup.update({ where: { id: g.id }, data: { status: "undone" } });
   await logEvent(shop, { shipmentId: g.mainShipmentId, orderName: g.mainOrderName, type: "orders_unmerged", detail: `${g.mainOrderName}: the other orders' items ship on their own again`, user });
   kick(shop);
+}
+
+// ---------------------------------------------------------------------------
+// Box planner: a customer's open orders, arranged into boxes any way the person
+// likes (ready or not). An order whose items go into several boxes is split in
+// Shopify (one fulfillment order per box); a box with several orders becomes a
+// merge (label on one of them, the others fulfilled with its tracking).
+// ---------------------------------------------------------------------------
+
+const PLANNABLE = ["waiting", "ready"];
+
+// Customers by name (or an order number), with their open and recent orders counted
+export async function searchCustomers(shop, q) {
+  const text = String(q ?? "").trim();
+  if (text.length < 2) return [];
+  const num = text.replace(/^#/, "");
+  const rows = await db.shipment.findMany({
+    where: {
+      shop,
+      customerId: { not: null },
+      OR: [{ customerName: { contains: text, mode: "insensitive" } }, ...(/^\d+$/.test(num) ? [{ orderName: `#${num}` }, { orderName: num }] : [])],
+    },
+    select: { customerId: true, customerName: true, orderId: true, state: true, orderCreatedAt: true },
+    orderBy: { orderCreatedAt: "desc" },
+    take: 2000,
+  });
+  const by = new Map();
+  for (const r of rows) {
+    const c = by.get(r.customerId) ?? { customerId: r.customerId, name: r.customerName, open: new Set(), orders: new Set(), lastOrderAt: r.orderCreatedAt.toISOString() };
+    c.orders.add(r.orderId);
+    if (PLANNABLE.includes(r.state) || ["batched", "packed", "labeling"].includes(r.state)) c.open.add(r.orderId);
+    by.set(r.customerId, c);
+  }
+  return [...by.values()]
+    .map((c) => ({ customerId: c.customerId, name: c.name, openOrders: c.open.size, orders: c.orders.size, lastOrderAt: c.lastOrderAt }))
+    .sort((a, b) => b.openOrders - a.openOrders || b.lastOrderAt.localeCompare(a.lastOrderAt))
+    .slice(0, 20);
+}
+
+const planLine = (s, l) => ({
+  shipmentId: s.id,
+  id: l.foLineItemId,
+  key: itemKey(l),
+  title: l.title,
+  variantTitle: l.variantTitle,
+  sku: l.sku,
+  imageUrl: l.imageUrl,
+  quantity: l.quantity,
+});
+
+// One customer: their open shipments (as boxes today), what can't be changed, and history
+export async function customerPlan(shop, admin, customerId) {
+  const all = await db.shipment.findMany({ where: { shop, customerId: String(customerId) }, orderBy: [{ orderCreatedAt: "asc" }, { id: "asc" }] });
+  if (!all.length) return null;
+  const open = all.filter((s) => PLANNABLE.includes(s.state) && !s.batchId);
+  const groups = await db.mergeGroup.findMany({ where: { shop, status: "open", mainShipmentId: { in: all.map((s) => s.id) } } });
+  const groupOf = new Map(groups.map((g) => [g.id, g]));
+  // Merges whose box is already in a batch (or packed) can't be re-planned here
+  const lockedGroups = new Set(groups.filter((g) => all.find((s) => s.id === g.mainShipmentId && s.batchId)).map((g) => g.id));
+  const plannable = open.filter((s) => !(s.mergeGroupId && lockedGroups.has(s.mergeGroupId)));
+
+  // Addresses, so boxes don't mix two addresses
+  const addr = new Map();
+  let addressesChecked = false;
+  if (!isSandboxShop(shop) && plannable.length) {
+    try {
+      const ids = [...new Set(plannable.map((s) => s.orderId))];
+      for (let i = 0; i < ids.length; i += 100) {
+        const data = await gql(admin, ADDRESSES, { ids: ids.slice(i, i + 100) });
+        for (const n of data?.nodes ?? []) if (n?.id) addr.set(n.id, n.shippingAddress ?? null);
+      }
+      addressesChecked = addr.size > 0;
+    } catch {
+      addressesChecked = false;
+    }
+  }
+
+  // Today's boxes: each shipment on its own, merges together
+  const boxes = [];
+  const boxOfGroup = new Map();
+  for (const s of plannable) {
+    if (s.mergeGroupId && groupOf.has(s.mergeGroupId)) {
+      if (!boxOfGroup.has(s.mergeGroupId)) {
+        boxOfGroup.set(s.mergeGroupId, boxes.length);
+        const g = groupOf.get(s.mergeGroupId);
+        boxes.push({ lines: [], labelShipmentId: g.mainShipmentId, method: g.method ?? null, mergeId: g.id });
+      }
+      // The box's own items (not the copies it carries for the others)
+      boxes[boxOfGroup.get(s.mergeGroupId)].lines.push(...linesOf(s).map((l) => planLine(s, l)));
+    } else boxes.push({ lines: linesOf(s).map((l) => planLine(s, l)), labelShipmentId: s.id, method: s.shippingMethod ?? null, mergeId: null });
+  }
+  const orders = new Map();
+  for (const s of plannable) {
+    const a = addr.get(s.orderId) ?? null;
+    orders.set(s.id, {
+      shipmentId: s.id,
+      orderId: s.orderId,
+      orderName: s.orderName,
+      orderNumber: s.orderId.split("/").pop(),
+      orderCreatedAt: s.orderCreatedAt.toISOString(),
+      state: s.state,
+      waitingReason: s.waitingReason,
+      releaseDay: s.releaseDay ?? null,
+      shippingMethod: s.shippingMethod,
+      otherHold: s.otherHold,
+      address: a?.formatted ?? null,
+      addressKey: addressesChecked ? addressKey(a) : null,
+    });
+  }
+  const inWork = all.filter((s) => (["batched", "packed", "labeling"].includes(s.state) || (PLANNABLE.includes(s.state) && s.batchId)) || (s.mergeGroupId && lockedGroups.has(s.mergeGroupId) && !s.batchId));
+  const history = all
+    .filter((s) => ["shipped", "closed"].includes(s.state))
+    .sort((a, b) => b.orderCreatedAt - a.orderCreatedAt)
+    .slice(0, 15);
+  const brief = (s) => ({
+    shipmentId: s.id,
+    orderId: s.orderId,
+    orderName: s.orderName,
+    orderNumber: s.orderId.split("/").pop(),
+    orderCreatedAt: s.orderCreatedAt.toISOString(),
+    state: s.state,
+    reason: s.waitingReason,
+    closedAt: s.closedAt?.toISOString() ?? null,
+    items: linesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, quantity: l.quantity })),
+  });
+  return {
+    customerId: String(customerId),
+    name: all[0].customerName,
+    addressesChecked,
+    orders: [...orders.values()],
+    boxes,
+    inWork: inWork.map(brief),
+    history: history.map(brief),
+  };
+}
+
+const SPLIT = `#graphql
+  mutation ($splits: [FulfillmentOrderSplitInput!]!) {
+    fulfillmentOrderSplit(fulfillmentOrderSplits: $splits) {
+      fulfillmentOrderSplits {
+        fulfillmentOrder { id lineItems(first: 50) { nodes { id remainingQuantity lineItem { id } } } }
+        remainingFulfillmentOrder { id lineItems(first: 50) { nodes { id remainingQuantity lineItem { id } } } }
+      }
+      userErrors { field message }
+    }
+  }`;
+
+const sameContents = (fo, want) => {
+  const have = new Map();
+  for (const n of fo?.lineItems?.nodes ?? []) if (n.remainingQuantity > 0) have.set(n.lineItem?.id, (have.get(n.lineItem?.id) ?? 0) + n.remainingQuantity);
+  if (have.size !== want.size) return false;
+  for (const [k, q] of want) if (have.get(k) !== q) return false;
+  return true;
+};
+
+// boxes: [{ items: [{ shipmentId, id (fulfillment order line item), quantity }], labelShipmentId, method }]
+// Every item of every shipment in the plan must be in exactly one box.
+export async function saveBoxes(shop, admin, { customerId, boxes }, user) {
+  const plan = (boxes ?? []).map((b) => ({ ...b, items: (b.items ?? []).filter((i) => Number(i.quantity) > 0) })).filter((b) => b.items.length);
+  if (!plan.length) throw new ShippingError("Put the items in at least one box.");
+  const ids = [...new Set(plan.flatMap((b) => b.items.map((i) => Number(i.shipmentId))))];
+  const ships = await db.shipment.findMany({ where: { shop, id: { in: ids } } });
+  if (ships.length !== ids.length) throw new ShippingError("Some of these orders changed. Reload the customer.");
+  for (const s of ships) {
+    if (s.customerId !== String(customerId)) throw new ShippingError(`${s.orderName} is for a different customer.`);
+    if (!PLANNABLE.includes(s.state) || s.batchId) throw new ShippingError(`${s.orderName} is in a batch or on its way already. Reload the customer.`);
+    if (s.otherHold) throw new ShippingError(`${s.orderName} is on hold in Shopify (${s.otherHold}). Release that hold first.`);
+  }
+  // Every item placed once, in full
+  for (const s of ships) {
+    for (const l of linesOf(s)) {
+      const placed = plan.flatMap((b) => b.items).filter((i) => Number(i.shipmentId) === s.id && String(i.id) === String(l.foLineItemId)).reduce((n, i) => n + Number(i.quantity), 0);
+      if (placed !== l.quantity) throw new ShippingError(`${l.quantity} × ${l.title} (${s.orderName}): put all of them in boxes (${placed} placed).`);
+    }
+  }
+  // One address per box (when Shopify shares addresses)
+  if (!isSandboxShop(shop)) {
+    const orderIds = [...new Set(ships.map((s) => s.orderId))];
+    const addr = new Map();
+    try {
+      for (let i = 0; i < orderIds.length; i += 100) {
+        const data = await gql(admin, ADDRESSES, { ids: orderIds.slice(i, i + 100) });
+        for (const n of data?.nodes ?? []) if (n?.id) addr.set(n.id, addressKey(n.shippingAddress));
+      }
+    } catch {
+      // not shared: the page warned about it
+    }
+    for (const [i, b] of plan.entries()) {
+      const keys = new Set(b.items.map((it) => addr.get(ships.find((s) => s.id === Number(it.shipmentId)).orderId)).filter(Boolean));
+      if (keys.size > 1) throw new ShippingError(`Box ${i + 1} has orders going to different addresses.`);
+    }
+  }
+
+  // Merges being re-planned: undone first (the plan says how they ship now)
+  const oldGroups = [...new Set(ships.map((s) => s.mergeGroupId).filter(Boolean))];
+  for (const gid of oldGroups) {
+    const g = await db.mergeGroup.findFirst({ where: { shop, id: gid, status: "open" } });
+    if (!g) continue;
+    await db.shipment.updateMany({ where: { mergeGroupId: g.id }, data: { mergeGroupId: null, mergedLines: null, mergedInto: null, mergeMethod: null } });
+    await db.mergeGroup.update({ where: { id: g.id }, data: { status: "undone" } });
+  }
+
+  // Split shipments whose items go into more than one box
+  const sandbox = isSandboxShop(shop);
+  const foOf = new Map(); // `${boxIndex}:${shipmentId}` -> fulfillment order id
+  const splitOrders = new Set();
+  const notes = [];
+  for (const s of ships) {
+    const parts = plan
+      .map((b, bi) => ({ bi, items: b.items.filter((i) => Number(i.shipmentId) === s.id) }))
+      .filter((p) => p.items.length);
+    if (parts.length === 1) {
+      foOf.set(`${parts[0].bi}:${s.id}`, s.fulfillmentOrderId);
+      continue;
+    }
+    const lines = linesOf(s);
+    const lineItemOf = new Map(lines.map((l) => [String(l.foLineItemId), l.lineItemId]));
+    if (sandbox) {
+      // Practice copy: split in the app only
+      for (const [n, p] of parts.entries()) {
+        const want = p.items.map((i) => ({ ...lines.find((l) => String(l.foLineItemId) === String(i.id)), quantity: Number(i.quantity) }));
+        if (n === 0) {
+          await db.shipment.update({ where: { id: s.id }, data: { lines: JSON.stringify(want), units: want.reduce((a, l) => a + l.quantity, 0) } });
+          foOf.set(`${p.bi}:${s.id}`, s.fulfillmentOrderId);
+        } else {
+          const foId = `${s.fulfillmentOrderId}-split-${Date.now()}-${n}`;
+          const { id: _id, createdAt: _c, updatedAt: _u, mergeGroupId: _m, mergedLines: _ml, mergedInto: _mi, mergeMethod: _mm, ...rest } = s;
+          await db.shipment.create({ data: { ...rest, fulfillmentOrderId: foId, lines: JSON.stringify(want), units: want.reduce((a, l) => a + l.quantity, 0) } });
+          foOf.set(`${p.bi}:${s.id}`, foId);
+        }
+      }
+    } else {
+      if (s.appHoldId) await releaseHold(admin, s);
+      // Split one part off at a time; the last part keeps what's left
+      let current = { id: s.fulfillmentOrderId, ids: new Map(lines.map((l) => [l.lineItemId, String(l.foLineItemId)])) };
+      for (const p of parts.slice(1)) {
+        const want = new Map();
+        for (const i of p.items) {
+          const li = lineItemOf.get(String(i.id));
+          want.set(li, (want.get(li) ?? 0) + Number(i.quantity));
+        }
+        const data = await gql(admin, SPLIT, {
+          splits: [{ fulfillmentOrderId: current.id, fulfillmentOrderLineItems: [...want].map(([li, q]) => ({ id: current.ids.get(li), quantity: q })) }],
+        });
+        const errs = data?.fulfillmentOrderSplit?.userErrors ?? [];
+        const r = data?.fulfillmentOrderSplit?.fulfillmentOrderSplits?.[0];
+        if (errs.length || !r) throw new ShippingError(`Shopify couldn't split ${s.orderName}: ${errs.map((e) => e.message).join("; ") || "no answer"}`);
+        const pair = [r.fulfillmentOrder, r.remainingFulfillmentOrder].filter(Boolean);
+        const mine = pair.find((fo) => sameContents(fo, want)) ?? r.fulfillmentOrder;
+        const rest = pair.find((fo) => fo.id !== mine.id) ?? r.remainingFulfillmentOrder;
+        foOf.set(`${p.bi}:${s.id}`, mine.id);
+        current = { id: rest.id, ids: new Map((rest.lineItems?.nodes ?? []).map((n) => [n.lineItem?.id, n.id])) };
+      }
+      foOf.set(`${parts[0].bi}:${s.id}`, current.id);
+      splitOrders.add(s.orderId);
+    }
+    notes.push(`${s.orderName} split into ${parts.length}`);
+  }
+  for (const orderId of splitOrders) await syncOrder(shop, admin, orderId);
+
+  // Boxes with more than one shipment: merged (label on the chosen order)
+  const merged = [];
+  for (const [bi, b] of plan.entries()) {
+    const sids = [...new Set(b.items.map((i) => Number(i.shipmentId)))];
+    const foIds = sids.map((sid) => foOf.get(`${bi}:${sid}`));
+    const rows = await db.shipment.findMany({ where: { shop, fulfillmentOrderId: { in: foIds } } });
+    if (rows.length !== foIds.length) throw new ShippingError(`Box ${bi + 1}: Shopify's split didn't come back as expected. Reload the customer and check it.`);
+    if (rows.length < 2) continue;
+    const labelFo = b.labelShipmentId ? foOf.get(`${bi}:${Number(b.labelShipmentId)}`) : null;
+    const main = rows.find((r) => r.fulfillmentOrderId === labelFo) ?? rows.find((r) => r.state === "ready") ?? rows[0];
+    const riders = rows.filter((r) => r.id !== main.id);
+    const mergedLines = riders.flatMap((r) => linesOf(r).map((l) => ({ ...l, fromOrderName: r.orderName, fromShipmentId: r.id })));
+    const g = await db.mergeGroup.create({
+      data: {
+        shop,
+        mainShipmentId: main.id,
+        mainOrderName: main.orderName,
+        method: b.method ? String(b.method).slice(0, 120) : null,
+        riders: JSON.stringify(riders.map((r) => ({ shipmentId: r.id, orderId: r.orderId, orderName: r.orderName, fulfillmentOrderId: r.fulfillmentOrderId, lines: linesOf(r), done: false }))),
+        createdBy: user?.name ?? null,
+      },
+    });
+    await db.shipment.update({ where: { id: main.id }, data: { mergeGroupId: g.id, mergedLines: JSON.stringify(mergedLines), mergeMethod: g.method } });
+    await db.shipment.updateMany({ where: { id: { in: riders.map((r) => r.id) } }, data: { mergeGroupId: g.id, mergedInto: main.orderName } });
+    merged.push(`${main.orderName} + ${riders.map((r) => r.orderName).join(", ")}`);
+  }
+  await logEvent(shop, {
+    orderName: ships[0].orderName,
+    type: "boxes_planned",
+    detail: `${ships[0].customerName ?? "Customer"}: ${plan.length} box${plan.length === 1 ? "" : "es"}${notes.length ? ` · ${notes.join(", ")}` : ""}${merged.length ? ` · together: ${merged.join("; ")}` : ""}`,
+    user,
+  });
+  kick(shop, 500);
+  return { boxes: plan.length, splits: notes, merged };
 }
 
 const TRACKING = `#graphql

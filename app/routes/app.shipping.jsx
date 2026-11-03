@@ -24,7 +24,7 @@ import {
   uninstallCommand,
 } from "../print.server";
 import { slipsPdf } from "../slips-pdf.server";
-import { createMerge, listMerges, mergeCandidates, undoMerge } from "../merge.server";
+import { createMerge, customerPlan, listMerges, mergeCandidates, saveBoxes, searchCustomers, undoMerge } from "../merge.server";
 import { MergeTab } from "../components/shipping/Merge";
 import { benchContext, benchLink, benchTakeScans, benchUnlink, pickPhoneLink, videosFor } from "../camera.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
@@ -180,7 +180,13 @@ export const loader = async ({ request }) => {
   const lockBatches = batchId ? [{ id: batchId }] : (batches ?? []);
   const lockMap = lockBatches.length ? await batchLocksFor(shop, lockBatches, user, early) : new Map();
   const canMerge = can(user, "shipping", "merge");
-  const merge = tab === "merge" && canMerge ? { ...(await mergeCandidates(shop, sandboxOn ? sandboxAdmin(admin, shop) : admin)), merges: await listMerges(shop) } : null;
+  const mergeAdmin = sandboxOn ? sandboxAdmin(admin, shop) : admin;
+  const merge =
+    tab === "merge" && canMerge
+      ? params.get("customer")
+        ? { plan: await customerPlan(shop, mergeAdmin, params.get("customer")), merges: [] }
+        : { ...(await mergeCandidates(shop, mergeAdmin)), merges: await listMerges(shop) }
+      : null;
   return {
     merge,
     batchLockList: Object.fromEntries(lockMap),
@@ -205,7 +211,8 @@ export const loader = async ({ request }) => {
     mine,
     hiddenBatch,
     me: user?.id ?? null,
-    staff: batchId && !view && canBatches ? await assignableStaff(shop) : [],
+    // People a batch can be assigned to: on a batch, and on the batch list (To ship)
+    staff: canBatches && ((batchId && !view) || (tab === "batches" && !batchId && (params.get("show") || "live") === "live")) ? await assignableStaff(shop) : [],
     sandbox: sandboxOn ? await sandboxSummary(session.shop) : null,
     // For "Review in Shopify": the order page in Shopify admin
     shopAdmin: `https://admin.shopify.com/store/${session.shop.replace(/\.myshopify\.com$/, "")}`,
@@ -285,6 +292,8 @@ const NEEDS = {
   cameraLink: "pack",
   pickPhoneLink: "pick",
   mergeOrders: "merge",
+  findCustomers: "merge",
+  saveBoxes: "merge",
   undoMerge: "merge",
   cameraContext: "pack",
   cameraScans: "pack",
@@ -419,6 +428,11 @@ export const action = async ({ request }) => {
     if (intent === "sealBox") return { intent, ...(await sealBox(shop, id, Number(form.get("shipmentId")), user)) };
     if (intent === "cameraLink")
       return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request), { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null })) };
+    if (intent === "findCustomers") return { intent, q: String(form.get("q") ?? ""), customers: await searchCustomers(shop, form.get("q")) };
+    if (intent === "saveBoxes") {
+      const plan = JSON.parse(String(form.get("plan") ?? "{}"));
+      return { intent, ok: true, ...(await saveBoxes(shop, admin, { customerId: String(form.get("customer") ?? ""), boxes: plan.boxes ?? [] }, user)) };
+    }
     if (intent === "mergeOrders") {
       const riders = JSON.parse(String(form.get("riders") ?? "[]"));
       return { intent, ok: true, ...(await createMerge(shop, { mainShipmentId: form.get("main"), riders, method: form.get("method") || null }, user)) };
@@ -623,7 +637,7 @@ const BATCH_INTENTS = new Set([
 ]);
 
 // Busy, local-only actions don't reload the whole page
-const LOCAL = new Set(["more", "order", "scan", "setPicked", "setBin", "exportBins", "packScan", "findBox", "ackNotice", "recheckOrder", "keepAddress", "labelCheck", "savePackage", "productSuggest", "labelFile", "batchLabelFile", "bulkLabelStatus",
+const LOCAL = new Set(["findCustomers", "more", "order", "scan", "setPicked", "setBin", "exportBins", "packScan", "findBox", "ackNotice", "recheckOrder", "keepAddress", "labelCheck", "savePackage", "productSuggest", "labelFile", "batchLabelFile", "bulkLabelStatus",
   "agentPrint", "printJobs", "printStations", "setMyStation", "retryPrint", "testPrint"]);
 export const shouldRevalidate = ({ formData, defaultShouldRevalidate }) =>
   LOCAL.has(formData?.get("intent")) ? false : defaultShouldRevalidate;
@@ -1330,6 +1344,7 @@ const EVENT_LABEL = {
   batch_cancelled: "Batch cancelled",
   batch_done: "Batch shipped",
   batch_priority: "Batch priority",
+  boxes_planned: "Boxes planned",
   orders_merged: "Orders merged",
   orders_unmerged: "Merge undone",
   merged_shipped: "Shipped in a merged box",
@@ -1819,7 +1834,7 @@ function Page() {
                 (p) => {
                   const n = new URLSearchParams(p);
                   n.set("tab", t.id);
-                  for (const k of ["batch", "view", "show", "q", "missing", "status", "box", "slips", "mine"]) if (t.id !== tab) n.delete(k);
+                  for (const k of ["batch", "view", "show", "q", "missing", "status", "box", "slips", "mine", "customer"]) if (t.id !== tab) n.delete(k);
                   if (t.id === "batches" && tab === "batches") {
                     for (const k of ["batch", "view", "box", "slips"]) n.delete(k);
                   }
@@ -1917,6 +1932,8 @@ function Page() {
           }}
           locks={batchLockList}
           canPriority={allowed.priority}
+          staff={staff}
+          me={me}
         />
       )}
       {tab === "batches" && batch && <BatchDetail batch={batch} list={list} filter={filter} allowed={allowed} staff={staff} me={me} lock={lock} />}
