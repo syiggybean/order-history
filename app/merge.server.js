@@ -33,7 +33,22 @@ const ADDRESSES = `#graphql
   }`;
 
 const norm = (t) => String(t ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-const addressKey = (a) => (a ? [a.address1, a.address2, a.city, a.zip, a.provinceCode, a.countryCodeV2].map(norm).join("|") : null);
+// Same place written two ways ("123 Main Street, Apt 4" / "123 main st #4", ZIP+4 or not)
+// gives the same key
+const WORDS = {
+  street: "st", avenue: "ave", av: "ave", road: "rd", drive: "dr", boulevard: "blvd", lane: "ln", court: "ct", place: "pl", circle: "cir",
+  highway: "hwy", parkway: "pkwy", terrace: "ter", square: "sq", trail: "trl", way: "wy",
+  north: "n", south: "s", east: "e", west: "w", northeast: "ne", northwest: "nw", southeast: "se", southwest: "sw",
+  apartment: "apt", unit: "apt", suite: "apt", ste: "apt", number: "apt", no: "apt", floor: "fl", building: "bldg",
+};
+const streetKey = (a) =>
+  norm(`${a.address1 ?? ""} ${a.address2 ?? ""}`.replace(/#/g, " apt "))
+    .split(" ")
+    .map((w) => WORDS[w] ?? w)
+    .filter((w, i, all) => !(w === "apt" && all[i + 1] === "apt"))
+    .join(" ");
+const addressKey = (a) =>
+  a ? [streetKey(a), norm(a.city), String(a.zip ?? "").replace(/\s+/g, "").slice(0, 5).toLowerCase(), norm(a.provinceCode), norm(a.countryCodeV2)].join("|") : null;
 
 const viewForMerge = (s) => ({
   id: s.id,
@@ -385,7 +400,7 @@ export async function saveBoxes(shop, admin, { customerId, boxes }, user) {
     }
     for (const [i, b] of plan.entries()) {
       const keys = new Set(b.items.map((it) => addr.get(ships.find((s) => s.id === Number(it.shipmentId)).orderId)).filter(Boolean));
-      if (keys.size > 1) throw new ShippingError(`Box ${i + 1} has orders going to different addresses.`);
+      if (keys.size > 1 && !b.sameAddress) throw new ShippingError(`Box ${i + 1} has orders going to different addresses.`);
     }
   }
 

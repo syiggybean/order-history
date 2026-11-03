@@ -88,7 +88,7 @@ function CustomerSearch() {
 
 let rowSeq = 0;
 const rowsFrom = (plan) => plan.boxes.flatMap((b, bi) => b.lines.map((l) => ({ ...l, rid: ++rowSeq, box: bi })));
-const metaFrom = (plan) => plan.boxes.map((b) => ({ labelShipmentId: b.labelShipmentId, method: b.method ?? "" }));
+const metaFrom = (plan) => plan.boxes.map((b) => ({ labelShipmentId: b.labelShipmentId, method: b.method ?? "", sameAddress: false }));
 
 function Planner({ plan }) {
   const go = useParamSetter();
@@ -104,13 +104,13 @@ function Planner({ plan }) {
 
   const move = (rid, to) => {
     if (to === "new") {
-      setMeta((m) => [...m, { labelShipmentId: null, method: "" }]);
+      setMeta((m) => [...m, { labelShipmentId: null, method: "", sameAddress: false }]);
       setRows((rs) => rs.map((r) => (r.rid === rid ? { ...r, box: meta.length } : r)));
     } else setRows((rs) => rs.map((r) => (r.rid === rid ? { ...r, box: Number(to) } : r)));
   };
   const splitOne = (rid) =>
     setRows((rs) => rs.flatMap((r) => (r.rid === rid && r.quantity > 1 ? [{ ...r, quantity: r.quantity - 1 }, { ...r, rid: ++rowSeq, quantity: 1 }] : [r])));
-  const addBox = () => setMeta((m) => [...m, { labelShipmentId: null, method: "" }]);
+  const addBox = () => setMeta((m) => [...m, { labelShipmentId: null, method: "", sameAddress: false }]);
   const reset = () => {
     setRows(rowsFrom(plan));
     setMeta(metaFrom(plan));
@@ -126,7 +126,7 @@ function Planner({ plan }) {
     const method = m.method && methods.includes(m.method) ? m.method : (orderOf.get(labelId)?.shippingMethod ?? methods[0] ?? "");
     const waiting = orders.filter((o) => o.state !== "ready");
     const addresses = new Set(orders.map((o) => o.addressKey).filter(Boolean));
-    return { i, items, orders, labelId, methods, method, waiting, mixedAddress: addresses.size > 1 };
+    return { i, items, orders, labelId, methods, method, waiting, mixedAddress: addresses.size > 1 && !m.sameAddress, addressDiffers: addresses.size > 1, sameAddress: m.sameAddress };
   });
   const used = boxes.filter((b) => b.items.length);
   // What will change
@@ -143,7 +143,7 @@ function Planner({ plan }) {
         const k = `${r.shipmentId}|${r.id}`;
         sum.set(k, { shipmentId: r.shipmentId, id: r.id, quantity: (sum.get(k)?.quantity ?? 0) + r.quantity });
       }
-      return { items: [...sum.values()], labelShipmentId: b.labelId, method: b.method || null };
+      return { items: [...sum.values()], labelShipmentId: b.labelId, method: b.method || null, ...(b.sameAddress && b.addressDiffers ? { sameAddress: true } : {}) };
     });
     save.submit({ intent: "saveBoxes", customer: plan.customerId, plan: JSON.stringify({ boxes: out }) }, { method: "post" });
   };
@@ -214,7 +214,24 @@ function Planner({ plan }) {
                         ))}
                     </div>
                     {!b.items.length && <div style={{ ...small, marginTop: "6px" }}>Move items here with their Box menu.</div>}
-                    {b.mixedAddress && <div style={{ ...small, color: "#b42318", marginTop: "6px", fontWeight: 600 }}>These orders go to different addresses: they can't share a box.</div>}
+                    {b.addressDiffers && (
+                      <div style={{ marginTop: "6px", padding: "8px 10px", borderRadius: "8px", background: b.sameAddress ? "#f6f6f7" : "#fde7e9", fontSize: "12px" }}>
+                        <div style={{ color: b.sameAddress ? "#4a4a4a" : "#8e1f0b", fontWeight: 600 }}>Shopify has different addresses on these orders:</div>
+                        {b.orders.map((o) => (
+                          <div key={o.shipmentId} style={{ marginTop: "2px" }}>
+                            <strong>{o.orderName}:</strong> {Array.isArray(o.address) ? o.address.join(", ") : (o.address ?? "no address")}
+                          </div>
+                        ))}
+                        <label style={{ display: "flex", gap: "6px", alignItems: "center", marginTop: "6px", cursor: "pointer" }}>
+                          <input
+                            type="checkbox"
+                            checked={b.sameAddress}
+                            onChange={(e) => setMeta((m) => m.map((x, j) => (j === b.i ? { ...x, sameAddress: e.target.checked } : x)))}
+                          />
+                          It's the same place: ship them together (the label goes to {orderOf.get(b.labelId)?.orderName ?? "the label order"}'s address)
+                        </label>
+                      </div>
+                    )}
                     <ul style={{ listStyle: "none", padding: 0, margin: "8px 0 0", display: "grid", gap: "8px" }}>
                       {b.items.map((r) => {
                         const o = orderOf.get(r.shipmentId);
