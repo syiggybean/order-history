@@ -566,9 +566,13 @@ const RELEASE = `#graphql
   }`;
 
 // Should the app be holding this shipment right now?
-export function wantsHold(s, mode, today = dayInStore(new Date())) {
+// siblingPacked: another part of the same order is packed and waiting for its label.
+// Shopify's label screens show every open part of an order, so the parts not in
+// that box are held until it has shipped (whatever the hold setting).
+export function wantsHold(s, mode, today = dayInStore(new Date()), { siblingPacked = false } = {}) {
   if (s.overrideAt) return false; // let through by someone allowed to ship outside a batch
   if (!ACTIVE_STATES.includes(s.state)) return false;
+  if (siblingPacked && ["waiting", "ready", "batched"].includes(s.state) && !s.otherHold) return true;
   // Shown in Ready ahead of its release date: stays held in Shopify until the date (unless already packed)
   const unreleased = Boolean(s.releaseDay && s.releaseDay > today) && ["waiting", "ready", "batched"].includes(s.state);
   if (mode === "notReady") return (s.state === "waiting" || unreleased) && !s.otherHold;
@@ -576,13 +580,13 @@ export function wantsHold(s, mode, today = dayInStore(new Date())) {
   return false;
 }
 
-async function placeHold(admin, s, mode) {
+async function placeHold(admin, s, mode, why = null) {
   const data = await gql(admin, HOLD, {
     id: s.fulfillmentOrderId,
     hold: {
       reason: "OTHER",
       reasonNotes:
-        mode === "untilBatched" ? "Ships through a batch in MonkeyBean" : "Not ready to ship yet (MonkeyBean)",
+        why ?? (mode === "untilBatched" ? "Ships through a batch in MonkeyBean" : "Not ready to ship yet (MonkeyBean)"),
       handle: HOLD_HANDLE,
       notifyMerchant: false,
     },
@@ -605,10 +609,17 @@ export async function reconcileHolds(shop, admin) {
     where: { shop, OR: [{ state: { in: ACTIVE_STATES } }, { appHoldId: { not: null } }] },
     orderBy: { orderCreatedAt: "asc" },
   });
+  // Orders with a part packed and waiting for its label (see wantsHold)
+  const labelTime = (x) => ["packed", "labeling"].includes(x.state) && x.labelStatus !== "bought";
+  const packedOrders = new Set(rows.filter(labelTime).map((x) => x.orderId));
+  const today = dayInStore(new Date());
   let changed = 0;
-  for (const s of rows) {
+  // Holds for those orders first: their labels are about to be bought
+  const ordered = [...rows.filter((x) => packedOrders.has(x.orderId)), ...rows.filter((x) => !packedOrders.has(x.orderId))];
+  for (const s of ordered) {
     if (changed >= MAX_HOLD_CHANGES_PER_RUN) break;
-    const want = wantsHold(s, holdMode);
+    const siblingPacked = packedOrders.has(s.orderId) && !labelTime(s);
+    const want = wantsHold(s, holdMode, today, { siblingPacked });
     const have = Boolean(s.appHoldId);
     if (want === have) continue;
     // Don't retry a failing shipment more than every 30 minutes
@@ -616,7 +627,7 @@ export async function reconcileHolds(shop, admin) {
     changed++;
     try {
       if (want) {
-        const holdId = await placeHold(admin, s, holdMode);
+        const holdId = await placeHold(admin, s, holdMode, siblingPacked && !wantsHold(s, holdMode, today) ? "Another part of this order is packed; this part ships later (MonkeyBean)" : null);
         await db.shipment.update({ where: { id: s.id }, data: { appHoldId: holdId, holdError: null } });
       } else {
         await releaseHold(admin, s);

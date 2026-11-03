@@ -568,11 +568,22 @@ async function syncPackedTags(shop, admin, room) {
     select: { id: true, orderId: true, state: true, packTagged: true, tagError: true, updatedAt: true },
   });
   const wantOrder = new Set(rows.filter((r) => packedTag && ["packed", "labeling"].includes(r.state)).map((r) => r.orderId));
+  // The order's other open parts must be on hold first, or Shopify's label screen
+  // would offer labels for them too (a hold that failed doesn't block it forever)
+  const unheld = new Set(
+    (
+      await db.shipment.findMany({
+        where: { shop, orderId: { in: [...wantOrder] }, state: { in: ["waiting", "ready", "batched"] }, appHoldId: null, otherHold: null, holdError: null, overrideAt: null },
+        select: { orderId: true },
+      })
+    ).map((x) => x.orderId),
+  );
   let changes = 0;
   for (const r of rows) {
     if (changes >= room) break;
     const want = packedTag && ["packed", "labeling"].includes(r.state);
     if (want === r.packTagged) continue;
+    if (want && unheld.has(r.orderId)) continue; // next run, once the hold is on
     if (r.tagError && Date.now() - r.updatedAt.getTime() < 10 * 60 * 1000) continue;
     changes++;
     try {
