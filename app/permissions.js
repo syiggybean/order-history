@@ -70,6 +70,7 @@ export const CAPABILITY_FEATURES = {
       assignedOnly: "Only their assigned batches (limits what they see)",
       priority: "Set batch priority",
       pickEarly: "Pick and pack pre-release batches early (stock arrived before the release date)",
+      understock: "See understocked badges (more on order than in stock)",
       settings: "Manage shipping settings",
     },
   },

@@ -13,7 +13,7 @@ const QR_URL = "https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js";
 const WIN = "mb-pack-camera";
 const FEATURES = "popup=yes,width=1280,height=860";
 
-function loadQr() {
+export function loadQr() {
   if (window.qrcode) return Promise.resolve(window.qrcode);
   return new Promise((resolve, reject) => {
     const s = document.createElement("script");

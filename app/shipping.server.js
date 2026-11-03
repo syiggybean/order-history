@@ -403,7 +403,8 @@ export async function loadProductInfo(admin, productIds) {
 // shipments whose stock has gone. Pure: takes shipments and stock, returns changes.
 // aheadBatchIds: batches made ahead of a release (auto-batching upcoming releases):
 // "not released yet" is expected there, so it isn't flagged
-export function allocate(shipments, stock, now = new Date(), products = {}, { aheadBatchIds = new Set() } = {}) {
+// earlyHours: pre-orders count as ready this many hours before their release date
+export function allocate(shipments, stock, now = new Date(), products = {}, { aheadBatchIds = new Set(), earlyHours = 0 } = {}) {
   const free = { ...stock };
   const key = (l, s) => `${l.inventoryItemId}|${s.locationId}`;
   const take = (s) => {
@@ -422,6 +423,8 @@ export function allocate(shipments, stock, now = new Date(), products = {}, { ah
     return null;
   };
   const today = dayInStore(now);
+  // Release dates up to this day no longer hold a shipment back
+  const readyDay = dayInStore(new Date(now.getTime() + Math.max(0, Number(earlyHours) || 0) * 3600 * 1000));
   const byAge = (a, b) => new Date(a.orderCreatedAt) - new Date(b.orderCreatedAt) || a.id - b.id;
   const changes = new Map(); // id -> data
 
@@ -429,7 +432,7 @@ export function allocate(shipments, stock, now = new Date(), products = {}, { ah
   // (Boxes whose label is already bought were fulfilled in Shopify: their stock has left)
   for (const s of shipments.filter((x) => ["batched", "packed", "labeling"].includes(x.state) && x.labelStatus !== "bought").sort(byAge)) {
     const releaseDay = releaseDayOf(s, today, products);
-    const pre = releaseDay && aheadBatchIds.has(s.batchId) ? [] : preorderLines(s, today, products);
+    const pre = releaseDay && aheadBatchIds.has(s.batchId) ? [] : preorderLines(s, readyDay, products);
     // Batched ahead of its release (auto-batching upcoming releases): it claims stock from
     // its release date, so it doesn't hold back orders that can ship now
     const short = releaseDay && s.state === "batched" ? null : take(s);
@@ -451,7 +454,7 @@ export function allocate(shipments, stock, now = new Date(), products = {}, { ah
     if (!PAID.has(s.financialStatus ?? "")) reason = "Awaiting payment";
     else if (s.otherHold) reason = `On hold in Shopify: ${s.otherHold}`;
     else if (s.foStatus === "SCHEDULED") reason = "Scheduled for later";
-    else if (preorderLines(s, today, products).length) reason = `Pre-order: ${preorderLines(s, today, products).join(", ")}`;
+    else if (preorderLines(s, readyDay, products).length) reason = `Pre-order: ${preorderLines(s, readyDay, products).join(", ")}`;
     else {
       const short = take(s);
       if (short) reason = `Needs ${short.map((x) => `${x.need} more × ${lineLabel(x.line)}`).join(", ")}`;
@@ -467,6 +470,34 @@ export function allocate(shipments, stock, now = new Date(), products = {}, { ah
       });
     }
   }
+  // Understocked: items more open orders want than there's stock for (every open
+  // order with one gets the badge). Labels already bought have left the stock.
+  const demand = new Map(); // key -> { title, ordered }
+  const open = shipments.filter((x) => ACTIVE_STATES.includes(x.state) && x.labelStatus !== "bought");
+  for (const s of open) {
+    for (const l of linesOf(s)) {
+      if (!l.tracked || !l.inventoryItemId) continue;
+      const k = key(l, s);
+      const d = demand.get(k) ?? { title: lineLabel(l), ordered: 0 };
+      d.ordered += l.quantity;
+      demand.set(k, d);
+    }
+  }
+  for (const s of open) {
+    const short = [];
+    const seen = new Set();
+    for (const l of linesOf(s)) {
+      if (!l.tracked || !l.inventoryItemId) continue;
+      const k = key(l, s);
+      const d = demand.get(k);
+      const have = Math.max(0, stock[k] ?? 0);
+      if (seen.has(k) || !d || d.ordered <= have) continue;
+      seen.add(k);
+      short.push({ title: d.title, ordered: d.ordered, inStock: have });
+    }
+    const value = short.length ? JSON.stringify(short) : null;
+    if (value !== (s.understocked ?? null)) changes.set(s.id, { ...(changes.get(s.id) ?? {}), understocked: value });
+  }
   return { changes, free };
 }
 
@@ -476,7 +507,8 @@ export async function refreshReadiness(shop, admin) {
   const stock = items.length ? await loadStock(admin, items) : {};
   const products = await loadProductInfo(admin, shipments.flatMap((s) => linesOf(s).map((l) => l.productId)));
   const ahead = new Set((await db.batch.findMany({ where: { shop, source: { startsWith: "auto:release:" } }, select: { id: true } })).map((b) => b.id));
-  const { changes } = allocate(shipments, stock, new Date(), products, { aheadBatchIds: ahead });
+  const { readyBeforeReleaseHours } = await getShippingSettings(shop);
+  const { changes } = allocate(shipments, stock, new Date(), products, { aheadBatchIds: ahead, earlyHours: readyBeforeReleaseHours ?? 48 });
   for (const [id, data] of changes) await db.shipment.update({ where: { id }, data });
   await db.shippingSettings.update({ where: { shop }, data: { lastReadyRunAt: new Date() } });
   return { checked: shipments.length, changed: changes.size, stock };
@@ -503,10 +535,12 @@ const RELEASE = `#graphql
   }`;
 
 // Should the app be holding this shipment right now?
-export function wantsHold(s, mode) {
+export function wantsHold(s, mode, today = dayInStore(new Date())) {
   if (s.overrideAt) return false; // let through by someone allowed to ship outside a batch
   if (!ACTIVE_STATES.includes(s.state)) return false;
-  if (mode === "notReady") return s.state === "waiting" && !s.otherHold;
+  // Shown in Ready ahead of its release date: stays held in Shopify until the date (unless already packed)
+  const unreleased = Boolean(s.releaseDay && s.releaseDay > today) && ["waiting", "ready", "batched"].includes(s.state);
+  if (mode === "notReady") return (s.state === "waiting" || unreleased) && !s.otherHold;
   if (mode === "untilBatched") return s.state !== "labeling";
   return false;
 }
@@ -601,6 +635,16 @@ export async function saveShippingSettings(shop, { holdMode }, user) {
   if (before.holdMode !== holdMode) await logEvent(shop, { type: "hold_mode", detail: `${before.holdMode} → ${holdMode}`, user });
 }
 
+// How many hours before its release date a pre-order shows in Ready to ship
+export async function saveReadyBeforeRelease(shop, hours, user) {
+  const h = Math.round(Number(hours));
+  if (!Number.isFinite(h) || h < 0 || h > 24 * 30) throw new ShippingError("Enter a number of hours from 0 to 720.");
+  const before = await getShippingSettings(shop);
+  await db.shippingSettings.update({ where: { shop }, data: { readyBeforeReleaseHours: h } });
+  if (before.readyBeforeReleaseHours !== h)
+    await logEvent(shop, { type: "ready_before_release", detail: `Pre-orders show in Ready to ship ${h ? `${h} hours before release` : "on their release date"} (was ${before.readyBeforeReleaseHours ?? 48})`, user });
+}
+
 // Words that decide the shipping method badges (cheapest / fastest / buyer-selected)
 export async function saveMethodRules(shop, input, user) {
   const rules = methodRulesOf(input);
@@ -627,6 +671,8 @@ const viewShipment = (s) => ({
   part: s.partCount > 1 ? `${s.partIndex} of ${s.partCount}` : null,
   state: s.state,
   waitingReason: s.waitingReason,
+  releaseDay: s.releaseDay ?? null,
+  understocked: json(s.understocked, null),
   readyAt: s.readyAt?.toISOString() ?? null,
   units: s.units,
   lines: linesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, quantity: l.quantity, sku: l.sku, imageUrl: l.imageUrl, productId: l.productId })),
@@ -729,6 +775,31 @@ export async function suggestProducts(shop, { q = "", state = "ready", singles =
     .slice(0, limit);
 }
 
+// Suggestions under the product search: the products in the most shipments on the
+// list as it's filtered now. With a product chosen, that's what's most often
+// in the same box (the chosen products themselves aren't suggested).
+export async function productTiles(shop, filter = {}, { limit = 8 } = {}) {
+  const chosen = new Set([filter.product, ...comboIds(filter.with)].filter(Boolean));
+  const where = shipmentWhere(shop, { ...filter, pair: "" });
+  const rows = await db.shipment.findMany({ where, select: { lines: true }, take: 20000 });
+  const found = new Map();
+  for (const r of rows) {
+    const seen = new Set();
+    for (const l of json(r.lines, [])) {
+      if (!l.productId || seen.has(l.productId) || chosen.has(l.productId)) continue;
+      seen.add(l.productId);
+      const p = found.get(l.productId) ?? { productId: l.productId, title: l.title, imageUrl: l.imageUrl ?? null, shipments: 0 };
+      p.shipments++;
+      found.set(l.productId, p);
+    }
+  }
+  return {
+    shipments: rows.length,
+    paired: chosen.size > 0,
+    products: [...found.values()].sort((a, b) => b.shipments - a.shipments || String(a.title).localeCompare(String(b.title))).slice(0, limit),
+  };
+}
+
 // Doubles: the most common two-item combinations (two different items, or two of one),
 // among the shipments the other filters show. Picking one filters the list to it.
 const pairItem = (l, qty = 1) => ({ variantId: l.variantId, productId: l.productId ?? null, title: l.title, variantTitle: l.variantTitle ?? null, imageUrl: l.imageUrl ?? null, qty });
@@ -786,7 +857,8 @@ export const shipmentOrder = (sort) => {
   return [{ orderCreatedAt: dir }, { id: dir }];
 };
 
-export async function listShipments(shop, filter = {}, { page = 1, pageSize = 50, viewer = null } = {}) {
+// understock: may this person see understocked badges? (otherwise they're left out)
+export async function listShipments(shop, filter = {}, { page = 1, pageSize = 50, viewer = null, understock = false } = {}) {
   const where = shipmentWhere(shop, filter);
   const [rows, total] = await Promise.all([
     db.shipment.findMany({
@@ -797,7 +869,7 @@ export async function listShipments(shop, filter = {}, { page = 1, pageSize = 50
     }),
     db.shipment.count({ where }),
   ]);
-  const shipments = await withNotices(shop, await withFlags(shop, rows.map(viewShipment)), viewer);
+  const shipments = (await withNotices(shop, await withFlags(shop, rows.map(viewShipment)), viewer)).map((x) => (understock ? x : { ...x, understocked: null }));
   return { shipments, total, page, hasMore: page * pageSize < total };
 }
 
@@ -847,6 +919,7 @@ export async function shippingOverview(shop) {
       autoMultiMaxItems: settings.autoMultiMaxItems,
       autoRelease: settings.autoRelease,
       autoReleaseDays: settings.autoReleaseDays,
+      readyBeforeReleaseHours: settings.readyBeforeReleaseHours ?? 48,
       lastAutoBatchAt: settings.lastAutoBatchAt?.toISOString() ?? null,
       packageStep: settings.packageStep,
       weightUnit: settings.weightUnit,
@@ -1161,7 +1234,15 @@ export async function orderDetails(shop, admin, orderId) {
 
 export async function recentEvents(shop, take = 50) {
   const rows = await db.shippingEvent.findMany({ where: { shop }, orderBy: { id: "desc" }, take });
-  return rows.map((e) => ({ id: e.id, type: e.type, detail: e.detail, orderName: e.orderName, userName: e.userName, at: e.createdAt.toISOString() }));
+  // The order behind each event (for the order quick view)
+  const ids = [...new Set(rows.map((e) => e.shipmentId).filter(Boolean))];
+  const orders = new Map(
+    ids.length ? (await db.shipment.findMany({ where: { shop, id: { in: ids } }, select: { id: true, orderId: true } })).map((s) => [s.id, s.orderId]) : [],
+  );
+  return rows.map((e) => {
+    const orderId = e.shipmentId ? (orders.get(e.shipmentId) ?? null) : null;
+    return { id: e.id, type: e.type, detail: e.detail, orderName: e.orderName, orderId, orderNumber: orderId?.split("/").pop() ?? null, userName: e.userName, at: e.createdAt.toISOString() };
+  });
 }
 
 // ---------------------------------------------------------------------------

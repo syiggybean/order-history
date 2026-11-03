@@ -1,5 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import db from "./db.server";
+import { staffById } from "./permissions.server";
+import { allows } from "./permissions";
 import { getBox } from "./pack.server";
 import { ShippingError, isSandboxShop, logEvent, staffKeyOf } from "./shipping.server";
 import { driveFileUrl, driveSetupProblem, startDriveUpload } from "./drive.server";
@@ -50,14 +52,14 @@ export async function benchLink(shop, workShop, user, appOrigin, { batchId = nul
 // The box open at the bench (null: none), for every camera linked to this person
 export async function benchContext(shop, workShop, user, { batchId = null, shipmentId = null } = {}) {
   await db.cameraLink.updateMany({
-    where: { shop, workShop, staffKey: staffKeyOf(user), ...activeWhere() },
+    where: { shop, workShop, staffKey: staffKeyOf(user), kind: "pack", ...activeWhere() },
     data: { batchId: batchId ? Number(batchId) : null, shipmentId: shipmentId ? Number(shipmentId) : null, contextAt: new Date() },
   });
 }
 
 // Scans waiting for this person's bench (oldest first), and which cameras are connected
 export async function benchTakeScans(shop, workShop, user) {
-  const links = await db.cameraLink.findMany({ where: { shop, workShop, staffKey: staffKeyOf(user), ...activeWhere() }, orderBy: { id: "asc" } });
+  const links = await db.cameraLink.findMany({ where: { shop, workShop, staffKey: staffKeyOf(user), kind: "pack", ...activeWhere() }, orderBy: { id: "asc" } });
   if (!links.length) return { scans: [], cameras: [] };
   const ids = links.map((l) => l.id);
   const scans = await db.cameraScan.findMany({ where: { linkId: { in: ids }, takenAt: null }, orderBy: { id: "asc" }, take: 50 });
@@ -70,7 +72,7 @@ export async function benchTakeScans(shop, workShop, user) {
 }
 
 export async function benchUnlink(shop, workShop, user) {
-  const r = await db.cameraLink.updateMany({ where: { shop, workShop, staffKey: staffKeyOf(user), revokedAt: null }, data: { revokedAt: new Date() } });
+  const r = await db.cameraLink.updateMany({ where: { shop, workShop, staffKey: staffKeyOf(user), kind: "pack", revokedAt: null }, data: { revokedAt: new Date() } });
   return { unlinked: r.count };
 }
 
@@ -92,9 +94,10 @@ export async function videosFor(shop, shipmentId) {
 
 export class CameraError extends Error {}
 
-async function linkFor(secret) {
+async function linkFor(secret, kind = "pack") {
   if (!secret || String(secret).length < 20) throw new CameraError("This camera link isn't valid. Open the camera again from the pack bench.");
-  const link = await db.cameraLink.findUnique({ where: { secretHash: hash(secret) } });
+  const found = await db.cameraLink.findUnique({ where: { secretHash: hash(secret) } });
+  const link = found && (found.kind ?? "pack") === kind ? found : null;
   const last = link ? Math.max(link.createdAt.getTime(), link.cameraSeenAt?.getTime() ?? 0) : 0;
   if (!link || link.revokedAt || Date.now() - last > IDLE_MS) throw new CameraError("This camera link has expired. Open the camera again from the pack bench.");
   return link;
@@ -254,3 +257,31 @@ export async function cameraUploadDone(secret, { videoId, driveFileId, sizeBytes
 }
 
 export { ShippingError };
+
+// ---------------------------------------------------------------------------
+// Picking on a phone: a link (QR code) from a batch's pick list. The phone acts
+// as the person who made the link, with their current permissions.
+// ---------------------------------------------------------------------------
+
+export async function pickPhoneLink(shop, workShop, user, appOrigin, batchId) {
+  const secret = randomBytes(24).toString("base64url");
+  await db.cameraLink.create({
+    data: { shop, workShop, staffKey: staffKeyOf(user), userName: user?.name ?? null, secretHash: hash(secret), kind: "pick", batchId: Number(batchId), contextAt: new Date() },
+  });
+  return { url: `${appOrigin}/pick-mobile?k=${secret}` };
+}
+
+// The link, its batch and the person (who must still be allowed to pick)
+export async function pickPhoneSession(secret) {
+  let link;
+  try {
+    link = await linkFor(secret, "pick");
+  } catch (e) {
+    if (e instanceof CameraError) throw new CameraError(e.message.replace("Open the camera again from the pack bench.", "Open it again from the batch's pick list."));
+    throw e;
+  }
+  await db.cameraLink.update({ where: { id: link.id }, data: { cameraSeenAt: new Date() } });
+  const user = await staffById(link.shop, link.staffKey);
+  if (!user || !(user.isOwner || user.isAdmin || allows(user, "shipping", "pick"))) throw new CameraError("You're not allowed to pick any more. Ask a lead.");
+  return { link, user, shop: link.workShop, batchId: link.batchId };
+}

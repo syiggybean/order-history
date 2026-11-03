@@ -15,20 +15,32 @@ const linkBtn = {
   textAlign: "left",
 };
 
-export function OrderLink({ orderId, orderNumber, name }) {
+// size: a larger link (e.g. the open box's heading on the pack bench)
+export function OrderLink({ orderId, orderNumber, name, size = null }) {
   const open = useContext(OrderViewContext);
-  if (!open)
-    return (
-      <a href={`shopify:admin/orders/${orderNumber}`} target="_top" style={{ color: "#005bd3", fontWeight: 600 }}>
+  if (!open || !orderId)
+    return orderNumber ? (
+      <a href={`shopify:admin/orders/${orderNumber}`} target="_top" style={{ color: "#005bd3", fontWeight: 600, ...(size ? { fontSize: size } : {}) }}>
         {name}
       </a>
+    ) : (
+      <>{name}</>
     );
   return (
     <span style={{ display: "inline-flex", alignItems: "baseline", gap: "6px" }}>
-      <button type="button" style={linkBtn} onClick={() => open(orderId)} title="Quick view">
+      <button
+        type="button"
+        style={{ ...linkBtn, ...(size ? { fontSize: size, fontWeight: 700 } : {}) }}
+        onClick={(e) => {
+          // Inside clickable rows (e.g. the pack queue): just the quick view
+          e.stopPropagation();
+          open(orderId);
+        }}
+        title="Order quick view"
+      >
         {name}
       </button>
-      <a href={`shopify:admin/orders/${orderNumber}`} target="_blank" rel="noreferrer" aria-label={`Open ${name} in Shopify (new tab)`} title="Open in Shopify" style={{ color: "#8a8a8a", textDecoration: "none", fontSize: "12px" }}>
+      <a href={`shopify:admin/orders/${orderNumber}`} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} aria-label={`Open ${name} in Shopify (new tab)`} title="Open in Shopify" style={{ color: "#8a8a8a", textDecoration: "none", fontSize: "12px" }}>
         ↗
       </a>
     </span>

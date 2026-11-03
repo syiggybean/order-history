@@ -432,6 +432,8 @@ model Shipment {
   waitingReason      String?
   // Pre-orders: the latest release date of its items still to come ("YYYY-MM-DD"), else null
   releaseDay         String?
+  // Items on it that more open orders want than there's stock for: [{title, ordered, inStock}] (JSON), else null
+  understocked       String?
   readyAt            DateTime?
   otherHold          String?
   appHoldId          String?
@@ -525,6 +527,9 @@ model ShippingSettings {
   // (same rules as above); picking them waits for the release date
   autoRelease       Boolean @default(false)
   autoReleaseDays   Int     @default(3)
+  // Pre-orders show in Ready to ship this many hours before their release date (0: on the day).
+  // They still can't be picked or packed before it, and stay on hold in Shopify until then.
+  readyBeforeReleaseHours Int @default(48)
   // Set when Shopify won't share addresses (customer-data access not turned on)
   addressCheckError String?
   lastAutoBatchAt DateTime?
@@ -1355,6 +1360,8 @@ model CameraLink {
   workShop    String
   staffKey    String
   userName    String?
+  // "pack": the pack camera; "pick": picking a batch on a phone
+  kind        String    @default("pack")
   // sha256 of the secret in the camera window's link
   secretHash  String    @unique
   // What the bench has open: {batchId, shipmentId} (the camera reads the box from it)

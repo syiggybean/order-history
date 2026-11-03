@@ -24,7 +24,7 @@ import {
   uninstallCommand,
 } from "../print.server";
 import { slipsPdf } from "../slips-pdf.server";
-import { benchContext, benchLink, benchTakeScans, benchUnlink, videosFor } from "../camera.server";
+import { benchContext, benchLink, benchTakeScans, benchUnlink, pickPhoneLink, videosFor } from "../camera.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
 import { IN_APP_LABELS } from "../components/shipping/features";
 import { redirect, useFetcher, useLoaderData, useNavigation, useRevalidator, useSearchParams } from "react-router";
@@ -85,9 +85,11 @@ import {
   runNow,
   saveMethodRules,
   saveShippingSettings,
+  saveReadyBeforeRelease,
   shippingOverview,
   startFullRead,
   suggestProducts,
+  productTiles,
   doublePairs,
   productVariants,
   syncStatus,
@@ -102,6 +104,8 @@ async function batchLocksFor(shop, list, user, early) {
   const full = list.every((b) => b.number != null) ? list : await Promise.all(list.map((b) => getBatchRow(shop, b.id)));
   return batchLocks(shop, full.filter(Boolean), user, { early });
 }
+
+const releaseDayLabel = (day) => new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
 
 const PAGE_SIZE = 50;
 const TABS = ["ready", "waiting", "batches", "review", "stock", "settings"];
@@ -153,9 +157,9 @@ export const loader = async ({ request }) => {
   const [overview, list, events, batches, batch, pick, bins, liveBatches, open, flags, flagCount] = await Promise.all([
     shippingOverview(shop),
     tab === "ready" || tab === "waiting"
-      ? listShipments(shop, { ...filter, state: tab }, { pageSize: PAGE_SIZE, viewer })
+      ? listShipments(shop, { ...filter, state: tab }, { pageSize: PAGE_SIZE, viewer, understock: can(user, "shipping", "understock") })
       : batchId && !view
-        ? listShipments(shop, { batchId, sort: filter.sort }, { pageSize: PAGE_SIZE, viewer })
+        ? listShipments(shop, { batchId, sort: filter.sort }, { pageSize: PAGE_SIZE, viewer, understock: can(user, "shipping", "understock") })
         : null,
     tab === "settings" ? recentEvents(shop, 60) : null,
     tab === "batches" && !batchId && !hiddenBatch
@@ -212,6 +216,8 @@ export const loader = async ({ request }) => {
     sync: syncStatus(shop),
     // Doubles: the most common pairs; product filter: its variants
     pairs: (tab === "ready" || tab === "waiting") && filter.doubles ? await doublePairs(shop, { ...filter, state: tab }) : null,
+    // Suggestions under the product search (top products; with a product chosen, what's most often alongside)
+    tiles: (tab === "ready" || tab === "waiting") && !filter.doubles ? await productTiles(shop, { ...filter, state: tab }) : null,
     variants: (tab === "ready" || tab === "waiting") && filter.product ? await productVariants(shop, { ...filter, state: tab }) : null,
     // Direct printing: the packing computers (always the real shop, even in sandbox)
     printing: {
@@ -232,6 +238,7 @@ export const loader = async ({ request }) => {
       override: can(user, "shipping", "override"),
       priority: can(user, "shipping", "priority"),
       pickEarly: can(user, "shipping", "pickEarly"),
+      understock: can(user, "shipping", "understock"),
       // Release dates can be changed from the quick view by people who manage pre-orders
       editRelease: !sandboxOn && (can(user, "preorders", "manage") || can(user, "releaseReview", "manage")),
     },
@@ -249,6 +256,7 @@ const NEEDS = {
   settings: "settings",
   sync: "settings",
   autoSettings: "settings",
+  readyBeforeRelease: "settings",
   addToBatch: "batches",
   removeFromBatch: "batches",
   cancelBatch: "batches",
@@ -269,6 +277,7 @@ const NEEDS = {
   packScan: "pack",
   // Pack camera (its own window)
   cameraLink: "pack",
+  pickPhoneLink: "pick",
   cameraContext: "pack",
   cameraScans: "pack",
   cameraUnlink: "pack",
@@ -357,7 +366,7 @@ export const action = async ({ request }) => {
     if (intent === "more") {
       const filter = JSON.parse(String(form.get("filter") ?? "{}"));
       const page = Number(form.get("page") ?? 2);
-      return { intent, ...(await listShipments(shop, filter, { page, pageSize: PAGE_SIZE, viewer: staffKeyOf(user) })) };
+      return { intent, ...(await listShipments(shop, filter, { page, pageSize: PAGE_SIZE, viewer: staffKeyOf(user), understock: can(user, "shipping", "understock") })) };
     }
     if (intent === "outside") {
       await allowOutsideBatch(shop, admin, id, user, form.get("reason"));
@@ -366,6 +375,11 @@ export const action = async ({ request }) => {
     if (intent === "clearOutside") {
       await clearOutsideBatch(shop, id, user);
       return { intent, ok: true, id };
+    }
+    if (intent === "readyBeforeRelease") {
+      await saveReadyBeforeRelease(shop, form.get("hours"), user);
+      runNow(shop, { full: false }).catch(() => {});
+      return { intent, ok: true };
     }
     if (intent === "settings") {
       await saveShippingSettings(shop, { holdMode: String(form.get("holdMode")) }, user);
@@ -397,6 +411,7 @@ export const action = async ({ request }) => {
     if (intent === "sealBox") return { intent, ...(await sealBox(shop, id, Number(form.get("shipmentId")), user)) };
     if (intent === "cameraLink")
       return { intent, ok: true, ...(await benchLink(session.shop, shop, user, appUrl(request), { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null })) };
+    if (intent === "pickPhoneLink") return { intent, ok: true, ...(await pickPhoneLink(session.shop, shop, user, appUrl(request), id)) };
     if (intent === "cameraContext") {
       await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null });
       return { intent, ok: true };
@@ -588,7 +603,7 @@ const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack"]);
 const BATCH_INTENTS = new Set([
   "scan", "setPicked", "finishPicking", "reopenPicking", "packScan", "findBox", "overridePack", "unpack", "labelCheck", "savePackage",
   "buyLabel", "buyLabels", "bulkLabelStatus", "labelFile", "batchLabelFile", "agentPrint",
-  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox",
+  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox", "pickPhoneLink",
 ]);
 
 // Busy, local-only actions don't reload the whole page
@@ -816,6 +831,26 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
             <div style={small}>since {fmtDate(s.readyAt, true)}</div>
           </>
         )}
+        {s.understocked?.length > 0 && (
+          <div style={{ marginTop: "4px" }}>
+            <span
+              style={pill("#fde7e9", "#8e1f0b")}
+              title={s.understocked.map((u) => `${u.title}: ${u.ordered} on open orders, ${u.inStock} in stock`).join("\n")}
+            >
+              Understocked
+            </span>
+            <div style={{ ...small, color: "#8e1f0b" }}>
+              {s.understocked.map((u) => `${u.title}: ${u.ordered} ordered, ${u.inStock} in stock`).join(" · ")}
+            </div>
+          </div>
+        )}
+        {!waiting && s.releaseDay && (
+          <div style={{ marginTop: "4px" }}>
+            <span style={pill("#fff1e3", "#8a4b00")} title="Shown ahead of its release date: it can't be picked or packed before then">
+              Releases {releaseDayLabel(s.releaseDay)}
+            </span>
+          </div>
+        )}
         {s.held && <div style={small}>On hold in Shopify (this app)</div>}
         {s.holdError && <div style={{ ...small, color: "#b42318" }}>Hold problem: {s.holdError}</div>}
         {s.flag && <div style={{ ...small, color: "#b42318", fontWeight: 600 }}>{s.flag}</div>}
@@ -944,7 +979,7 @@ function ShipmentTable({ list, filter, state, canOutside, canReview = false, sel
   );
 }
 
-function Filters({ filter, overview, state = "ready", pairs = null, variants = null }) {
+function Filters({ filter, overview, state = "ready", pairs = null, variants = null, tiles = null }) {
   const [params, setParams] = useSearchParams();
   const navigation = useNavigation();
   const [q, setQ] = useState(filter.q);
@@ -1075,7 +1110,49 @@ function Filters({ filter, overview, state = "ready", pairs = null, variants = n
       {navigation.state === "loading" && <span style={muted}>Loading…</span>}
     </div>
     {filter.doubles && pairs && <PairList pairs={pairs} chosen={filter.pair} onChoose={(key) => set("pair", key)} />}
+    {tiles && (!filter.product || filter.with.length < 5) && (
+      <ProductTiles
+        tiles={tiles}
+        chosenName={[filter.productName, ...filter.withNames].filter(Boolean).join(" + ")}
+        onChoose={(p) =>
+          filter.product
+            ? setCombo([...filter.with, p.productId], [...filter.withNames, p.title ?? ""])
+            : setMany({ product: p.productId, pname: p.title ?? "", variant: null, with: null, wnames: null })
+        }
+      />
+    )}
     </>
+  );
+}
+
+// Under the product search: the products with the most orders, or (with products
+// chosen) the ones most often in the same box. Picking one adds it to the search.
+function ProductTiles({ tiles, chosenName, onChoose }) {
+  if (!tiles.products.length) return null;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px", margin: "-2px 0 12px" }}>
+      <span style={{ ...small, marginRight: "2px" }}>{tiles.paired ? `Most often with ${chosenName || "your products"}:` : "Most orders:"}</span>
+      {tiles.products.map((p) => (
+        <button
+          key={p.productId}
+          type="button"
+          onClick={() => onChoose(p)}
+          title={tiles.paired ? `Also contains ${p.title}` : `Show orders with ${p.title}`}
+          style={{ appearance: "none", display: "inline-flex", alignItems: "center", gap: "6px", padding: "3px 10px 3px 4px", border: "1px solid #dcdcdc", borderRadius: "999px", background: "#fff", font: "inherit", fontSize: "12px", cursor: "pointer", maxWidth: "260px" }}
+        >
+          {p.imageUrl ? (
+            <img src={p.imageUrl} alt="" style={{ width: "20px", height: "20px", objectFit: "cover", borderRadius: "50%", flexShrink: 0 }} />
+          ) : (
+            <span style={{ width: "20px", height: "20px", borderRadius: "50%", background: "#f1f1f1", flexShrink: 0 }} />
+          )}
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {tiles.paired ? "+ " : ""}
+            {p.title}
+          </span>
+          <span style={{ color: "#616161", fontVariantNumeric: "tabular-nums" }}>{p.shipments.toLocaleString()}</span>
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -1221,6 +1298,9 @@ const EVENT_LABEL = {
   batch_added: "Added to batch",
   batch_removed: "Taken out of batch",
   batch_cancelled: "Batch cancelled",
+  batch_done: "Batch shipped",
+  batch_priority: "Batch priority",
+  ready_before_release: "Pre-order timing",
   batch_renamed: "Batch renamed",
   batch_assigned: "Batch assigned",
   batch_picked: "Batch picked",
@@ -1279,6 +1359,8 @@ function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn, p
       </s-section>
 
       <SandboxSettings on={sandboxOn} />
+
+      <ReleaseSettings st={st} canSettings={canSettings} />
 
       <AutoBatchSettings st={st} canSettings={canSettings} />
 
@@ -1354,7 +1436,7 @@ function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn, p
                     <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDate(e.at, true)}</td>
                     <td style={cell}>{e.userName ?? "App"}</td>
                     <td style={cell}>{EVENT_LABEL[e.type] ?? e.type}</td>
-                    <td style={cell}>{e.orderName ?? "—"}</td>
+                    <td style={cell}>{e.orderName ? <OrderLink orderId={e.orderId} orderNumber={e.orderNumber} name={e.orderName} /> : "—"}</td>
                     <td style={cell}>{e.detail ?? "—"}</td>
                   </tr>
                 ))}
@@ -1370,6 +1452,54 @@ function SettingsTab({ overview, events, sync: status, canSettings, sandboxOn, p
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
+
+// Pre-orders: how soon before the release date they show in Ready to ship
+function ReleaseSettings({ st, canSettings }) {
+  const fetcher = useFetcher();
+  const saved = String(st.readyBeforeReleaseHours ?? 48);
+  const [hours, setHours] = useState(saved);
+  useEffect(() => setHours(saved), [saved]);
+  const dirty = hours !== saved;
+  return (
+    <s-section heading="Pre-orders">
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
+        <span>Show pre-orders in Ready to ship</span>
+        <input
+          type="number"
+          min="0"
+          max="720"
+          step="1"
+          value={hours}
+          disabled={!canSettings}
+          onChange={(e) => setHours(e.target.value)}
+          style={{ ...input, width: "80px" }}
+          aria-label="Hours before release"
+        />
+        <span>hours before their release date (0: on the release date).</span>
+      </div>
+      <div style={{ ...small, marginTop: "6px" }}>
+        So they can be batched and prepared early. They're marked with their release date, can't be picked or packed before it (except by people allowed to
+        pick early), and stay on hold in Shopify until then when holds are on. Stock still has to be in for them to count as ready.
+      </div>
+      {canSettings && (
+        <div style={{ marginTop: "10px", display: "flex", gap: "8px", alignItems: "center" }}>
+          <s-button
+            variant="primary"
+            onClick={() => fetcher.submit({ intent: "readyBeforeRelease", hours }, { method: "post" })}
+            {...(fetcher.state !== "idle" ? { loading: true } : {})}
+            {...(!dirty ? { disabled: true } : {})}
+          >
+            Save
+          </s-button>
+          {fetcher.data?.intent === "readyBeforeRelease" && fetcher.data.error && <span style={{ color: "#b42318" }}>{fetcher.data.error}</span>}
+          {fetcher.data?.intent === "readyBeforeRelease" && fetcher.data.ok && !dirty && fetcher.state === "idle" && (
+            <span style={{ color: "#1a5e20" }}>Saved. The Ready list updates in a minute or two.</span>
+          )}
+        </div>
+      )}
+    </s-section>
+  );
+}
 
 const AUTO_FIELDS = {
   enabled: (st) => st.autoBatchEnabled,
@@ -1596,7 +1726,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, batchLockList, lock } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1718,7 +1848,7 @@ function Page() {
             <span style={{ display: "inline-block", width: "14px", height: "14px", borderRadius: "3px", background: NOTICE_BG, boxShadow: `inset 3px 0 0 ${NOTICE_EDGE}` }} />
             Orange rows have an order note or an address Shopify flagged as possibly invalid. Clicking one shows it first, every time.
           </div>
-          <Filters filter={filter} overview={overview} state={tab} pairs={pairs} variants={variants} />
+          <Filters filter={filter} overview={overview} state={tab} pairs={pairs} variants={variants} tiles={tiles} />
           {tab === "ready" ? (
             <ReadyTab list={list} filter={filter} overview={overview} allowed={allowed} openBatches={openBatches} />
           ) : (

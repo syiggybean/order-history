@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { useFetcher } from "react-router";
+import { useFetcher, useRevalidator } from "react-router";
 import { PINK, ProductName, box, cell, fmtDate, head, muted, small, ProductThumb, useParamSetter, GreenButton } from "./ui";
 import { LockNote, StatusPill, batchTitle } from "./Batches";
+import { loadQr } from "./PackCameraLink";
 
 const PRINT_CSS = `
 @media print {
@@ -125,6 +126,7 @@ export function PickList({ data, canPick, lock = null }) {
       </div>
 
       {lock && ["open", "picking"].includes(batch.status) && <LockNote text={lock} />}
+      {canPick && ["open", "picking"].includes(batch.status) && !lock && <PhonePick batchId={batch.id} />}
 
       {/* Progress */}
       <div className="sh-noprint" style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "12px" }}>
@@ -306,3 +308,73 @@ const stepBtn = {
   fontSize: "16px",
   cursor: "pointer",
 };
+
+// Pick on a phone: a QR code (and link) that opens this pick list on a phone,
+// with the phone's camera as the scanner
+function PhonePick({ batchId }) {
+  const link = useFetcher();
+  const [qr, setQr] = useState(null);
+  const [open, setOpen] = useState(false);
+  const url = link.data?.intent === "pickPhoneLink" && link.data.ok ? link.data.url : null;
+  // While the phone is picking, keep this list up to date
+  const revalidator = useRevalidator();
+  const revRef = useRef(revalidator);
+  revRef.current = revalidator;
+  useEffect(() => {
+    if (!open || !url) return undefined;
+    const t = setInterval(() => revRef.current.state === "idle" && revRef.current.revalidate(), 5000);
+    return () => clearInterval(t);
+  }, [open, url]);
+  useEffect(() => {
+    if (!url) return;
+    setQr(null);
+    loadQr()
+      .then((qrcode) => {
+        const q = qrcode(0, "M");
+        q.addData(url);
+        q.make();
+        setQr(q.createSvgTag({ cellSize: 4, margin: 2, scalable: true }));
+      })
+      .catch(() => {});
+  }, [url]);
+  const start = () => {
+    setOpen(true);
+    link.submit({ intent: "pickPhoneLink", id: String(batchId) }, { method: "post" });
+  };
+  return (
+    <div className="sh-noprint" style={{ margin: "0 0 12px" }}>
+      {!open ? (
+        <button
+          type="button"
+          onClick={start}
+          style={{ appearance: "none", border: "1px solid #c9c9c9", background: "#fff", borderRadius: "8px", padding: "6px 12px", font: "inherit", fontSize: "13px", cursor: "pointer" }}
+        >
+          📱 Pick on a phone
+        </button>
+      ) : (
+        <div role="region" aria-label="Pick on a phone" style={{ display: "flex", flexWrap: "wrap", gap: "16px", alignItems: "center", background: "#fff", border: "1px solid #e3e3e3", borderRadius: "10px", padding: "12px 14px" }}>
+          {qr ? (
+            <div style={{ width: "168px", flexShrink: 0 }} dangerouslySetInnerHTML={{ __html: qr }} />
+          ) : (
+            <div style={{ ...small, width: "168px", height: "168px", display: "grid", placeItems: "center", background: "#f6f6f7", borderRadius: "8px" }}>
+              {link.data?.error ?? "Making a link…"}
+            </div>
+          )}
+          <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+              <strong>Pick on a phone</strong>
+              <button type="button" onClick={() => setOpen(false)} aria-label="Close" style={{ border: 0, background: "none", fontSize: "18px", cursor: "pointer", lineHeight: 1 }}>
+                ×
+              </button>
+            </div>
+            <p style={{ ...muted, fontSize: "12px", margin: "6px 0" }}>
+              Scan the code with the phone's camera app. The pick list opens there, sorted by bin, and the phone's camera scans the items (a Bluetooth scanner
+              works too). Picks show here as they happen. It's linked to you, so don't share the link.
+            </p>
+            {url && <input readOnly value={url} onFocus={(e) => e.target.select()} aria-label="Phone pick link" style={{ width: "100%", boxSizing: "border-box", fontSize: "11px", padding: "4px 6px" }} />}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

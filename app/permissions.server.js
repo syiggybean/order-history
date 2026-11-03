@@ -101,6 +101,24 @@ async function resolveUser(shop, who) {
   };
 }
 
+// A staff member as a request's user (for links opened outside Shopify admin, e.g.
+// picking on a phone): same shape as getStaff's user, with their current access
+export async function staffById(shop, id) {
+  const member = await db.staffMember.findFirst({ where: { shop, id: Number(id) } });
+  if (!member) return null;
+  const owner = member.accountOwner;
+  return {
+    id: member.id,
+    userId: member.userId,
+    name: member.name ?? member.email ?? "Staff member",
+    email: member.email,
+    isOwner: owner,
+    isAdmin: owner || member.isAdmin,
+    access: owner ? fullAccess() : parseAccess(member.access),
+    views: parseViews(member.views),
+  };
+}
+
 // My Views: starred view ids, in order
 export const parseViews = (json) => {
   try {

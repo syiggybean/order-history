@@ -8,6 +8,7 @@ import { BulkLabelsPanel, LabelActions } from "./Labels";
 import { IN_APP_LABELS } from "./features";
 import { SlipPrintButton, ThisComputer } from "./Printing";
 import { PackCameraBar, usePackCamera } from "./PackCameraLink";
+import { OrderLink } from "./OrderLink";
 import { PINK, ProductName, box, cell, head, input, muted, pill, small, ProductThumb, useParamSetter } from "./ui";
 
 // The pack camera's video of this box, for its latest packing only (a repacked box
@@ -697,7 +698,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                         style={{ cursor: "pointer", background: sel ? "#fff5f7" : x.notice ? NOTICE_BG : undefined }}
                       >
                         <td style={{ ...cell, ...(x.notice ? { boxShadow: `inset 4px 0 0 ${NOTICE_EDGE}` } : {}), fontWeight: sel ? 700 : 500 }}>
-                          {x.orderName}
+                          <OrderLink orderId={x.orderId} orderNumber={x.orderNumber} name={x.orderName} />
                           {x.part ? <span style={small}> · {x.part}</span> : null}
                           {x.notice && <div style={{ ...small, color: "#7a3d00", fontWeight: 700 }}>! Read first</div>}
                           {x.flags.length > 0 && <div style={{ ...small, color: "#8e1f0b", fontWeight: 700 }}>⚑ {x.flags[0].reason}</div>}
@@ -744,7 +745,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                 <div style={{ ...box, padding: "14px", overflow: "visible", ...(b.notice ? { borderColor: NOTICE_EDGE, borderWidth: "2px" } : {}) }}>
                   <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "10px" }}>
                     <h3 style={{ margin: 0, fontSize: "20px" }}>
-                      {b.orderName}
+                      <OrderLink orderId={b.orderId} orderNumber={b.orderNumber} name={b.orderName} size="20px" />
                       {b.part ? <span style={{ ...muted, fontSize: "14px" }}> · part {b.part}</span> : null}
                     </h3>
                     {cam.linked && <BoxVideo boxId={b.id} batchId={batch.id} state={b.state} packedAt={b.packedAt} connected={cam.cameras.some((c) => c.connected)} />}

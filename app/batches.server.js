@@ -325,6 +325,7 @@ async function statsFor(batchIds) {
 // show: "live" (still to ship) | "done" | "cancelled"
 // onlyFor: a staff member id; just the batches assigned to them
 export async function listBatches(shop, { show = "live", onlyFor = null } = {}) {
+  if (show === "live") await closeFinishedBatches(shop).catch((e) => console.error(`[batches] closing finished (${shop}):`, errorMessage(e)));
   const status = show === "cancelled" ? ["cancelled"] : show === "done" ? ["done"] : LIVE;
   let batches = await db.batch.findMany({ where: { shop, status: { in: status } }, orderBy: { number: show === "live" ? "asc" : "desc" }, take: 500 });
   if (onlyFor != null) batches = batches.filter((b) => isAssignedTo(b, onlyFor));
@@ -968,6 +969,44 @@ export async function exportBins(shop) {
 // After every shipping refresh: the daily auto-batch, then order tags
 // ---------------------------------------------------------------------------
 
+// Batches whose orders have all left (shipped, or fulfilled/cancelled in Shopify or
+// another app, e.g. labels bought on Shopify's own pages): Shipped, or Cancelled
+// if none of them shipped. Runs after every refresh and when the Batches tab opens.
+export async function closeFinishedBatches(shop) {
+  const live = await db.batch.findMany({ where: { shop, status: { in: LIVE } }, select: { id: true, tag: true, status: true, packDoneAt: true } });
+  if (!live.length) return [];
+  const rows = await db.shipment.groupBy({ by: ["batchId", "state"], where: { shop, batchId: { in: live.map((b) => b.id) } }, _count: { _all: true } });
+  const counts = new Map();
+  for (const r of rows) {
+    const c = counts.get(r.batchId) ?? { open: 0, shipped: 0, gone: 0 };
+    if (["batched", "packed", "labeling", "ready", "waiting"].includes(r.state)) c.open += r._count._all;
+    else if (r.state === "shipped") c.shipped += r._count._all;
+    else c.gone += r._count._all;
+    counts.set(r.batchId, c);
+  }
+  const closed = [];
+  for (const b of live) {
+    const c = counts.get(b.id);
+    if (!c || c.open || !(c.shipped + c.gone)) continue; // still work to do, or empty (just made)
+    const done = c.shipped > 0;
+    const r = await db.batch.updateMany({
+      where: { id: b.id, status: { in: LIVE } },
+      data: done ? { status: "done", packDoneAt: b.packDoneAt ?? new Date() } : { status: "cancelled", cancelledAt: new Date() },
+    });
+    if (!r.count) continue;
+    closed.push({ id: b.id, tag: b.tag, status: done ? "done" : "cancelled" });
+    await logEvent(shop, {
+      batchId: b.id,
+      type: done ? "batch_done" : "batch_cancelled",
+      detail: done
+        ? `${b.tag}: every order has shipped${c.gone ? ` (${c.gone} cancelled or closed in Shopify)` : ""}`
+        : `${b.tag}: every order was cancelled or closed in Shopify`,
+      user: { name: null },
+    });
+  }
+  return closed;
+}
+
 onAfterRun(async (shop, admin, step) => {
   // Bin locations edited in Shopify admin: a full check every 30 minutes, in the background
   syncAllBins(shop).catch((e) => console.error(`[bins] sync (${shop}):`, errorMessage(e)));
@@ -976,6 +1015,7 @@ onAfterRun(async (shop, admin, step) => {
     step("Auto-batching");
     await runAutoBatch(shop, null, { manual: false });
   }
+  await closeFinishedBatches(shop);
   step("Updating batch tags on orders");
   await syncBatchTags(shop, admin);
 });
