@@ -517,7 +517,7 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
 // One batch
 // ---------------------------------------------------------------------------
 
-export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null, canPriority = false, lock = null }) {
+export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null, canPriority = false, lock = null, canComplete = false }) {
   const go = useParamSetter();
   const fetcher = useFetcher();
   const [renaming, setRenaming] = useState(false);
@@ -588,6 +588,7 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null,
         <s-button href={`shopify:admin/orders?query=${encodeURIComponent(`tag:${batch.tag}`)}`} target="_top" variant="secondary">
           Orders in Shopify
         </s-button>
+        {canComplete && ["open", "picking", "picked", "packing"].includes(batch.status) && <CompleteBatch batch={batch} />}
         {canBatches && batch.editable && !confirmCancel && (
           <s-button variant="tertiary" tone="critical" onClick={() => setConfirmCancel(true)}>
             Cancel batch
@@ -653,6 +654,48 @@ export function RemoveBar({ batch, ids, onDone }) {
         Take out of {batch.tag}
       </s-button>
       {fetcher.data?.error && <span style={{ color: "#b42318" }}>{fetcher.data.error}</span>}
+    </div>
+  );
+}
+
+// Leaders: mark the whole batch picked and packed (with a reason)
+function CompleteBatch({ batch }) {
+  const fetcher = useFetcher();
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const toPack = batch.shipments - (batch.packed ?? 0);
+  const done = fetcher.data?.intent === "completeBatch" && fetcher.data.ok;
+  if (done) return <span style={{ ...small, color: "#1a5e20", fontWeight: 600, alignSelf: "center" }}>Marked picked and packed ✓</span>;
+  if (!open)
+    return (
+      <s-button variant="secondary" onClick={() => setOpen(true)}>
+        Mark picked and packed…
+      </s-button>
+    );
+  return (
+    <div className="sh-rise" style={{ flexBasis: "100%", ...box, overflow: "visible", padding: "12px 14px", background: "#fff8f0", borderColor: "#f3c98b" }}>
+      <strong>Mark {batch.tag} picked and packed?</strong>
+      <div style={{ ...small, color: "#5c3a00", margin: "4px 0 8px" }}>
+        {["open", "picking"].includes(batch.status) ? "Every item counts as picked, and " : ""}
+        {toPack} package{toPack === 1 ? "" : "s"} still to pack {toPack === 1 ? "is" : "are"} marked packed without scanning. Nothing is checked, and the pack camera
+        doesn't record them. Labels are bought afterwards as usual. It's logged with your name and reason.
+      </div>
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+        <input type="text" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason (required)" aria-label="Reason" style={{ ...input, flex: "1 1 260px" }} />
+        <s-button
+          variant="primary"
+          tone="critical"
+          onClick={() => fetcher.submit({ intent: "completeBatch", id: String(batch.id), reason }, { method: "post" })}
+          {...(fetcher.state !== "idle" ? { loading: true } : {})}
+          {...(!reason.trim() ? { disabled: true } : {})}
+        >
+          Mark picked and packed
+        </s-button>
+        <s-button variant="tertiary" onClick={() => setOpen(false)}>
+          Cancel
+        </s-button>
+      </div>
+      {fetcher.data?.error && <div style={{ color: "#b42318", marginTop: "6px" }}>{fetcher.data.error}</div>}
     </div>
   );
 }

@@ -419,6 +419,51 @@ export async function sealBox(shop, batchId, shipmentId, user) {
   return { ok: true, complete: true, sealed: true, packedAt: fresh?.packedAt?.toISOString() ?? null };
 }
 
+// Leaders: mark a whole batch picked and packed at once (no scanning), with a reason.
+// Every package still to pack is marked packed; a label bought before packing means
+// it's shipped. Labels are bought afterwards as usual.
+export async function completeBatch(shop, batchId, reason, user) {
+  const b = await batchFor(shop, batchId);
+  if (!["open", "picking", "picked", "packing"].includes(b.status)) throw new ShippingError(`${b.tag} is already packed.`);
+  const why = String(reason ?? "").trim().slice(0, 280);
+  if (!why) throw new ShippingError('Give a reason, e.g. "Packed by hand during the stocktake".');
+  const rows = await db.shipment.findMany({ where: { shop, batchId: b.id, state: "batched" } });
+  if (!rows.length && ["picked", "packing"].includes(b.status)) throw new ShippingError(`${b.tag} has nothing left to pack.`);
+  const who = user?.name ?? "A lead";
+  const now = new Date();
+  let picked = false;
+  if (["open", "picking"].includes(b.status)) {
+    // Everything counts as picked
+    const counts = {};
+    for (const s of await db.shipment.findMany({ where: { shop, batchId: b.id, state: { in: ["batched", "packed", "labeling", "shipped"] } } }))
+      for (const l of boxLinesOf(s)) counts[itemKey(l)] = (counts[itemKey(l)] ?? 0) + l.quantity;
+    await db.batch.update({ where: { id: b.id }, data: { status: "picked", picked: JSON.stringify(counts), pickStartedAt: b.pickStartedAt ?? now, pickedAt: now, pickedBy: who } });
+    picked = true;
+  }
+  const fresh = await db.batch.findUnique({ where: { id: b.id } });
+  await startPackingBatch(fresh);
+  const note = `${who}: marked packed with the whole batch (${why})`;
+  const early = rows.filter((s) => s.labelStatus === "bought" && s.labelEarly).map((s) => s.id);
+  const rest = rows.filter((s) => !early.includes(s.id)).map((s) => s.id);
+  // Full counts, so the pack bench shows every item in
+  for (const s of rows) {
+    const counts = {};
+    for (const l of boxLinesOf(s)) counts[itemKey(l)] = (counts[itemKey(l)] ?? 0) + l.quantity;
+    await db.shipment.update({ where: { id: s.id }, data: { packed: JSON.stringify(counts) } });
+  }
+  if (rest.length) await db.shipment.updateMany({ where: { id: { in: rest }, state: "batched" }, data: { state: "packed", packedAt: now, packedBy: who, packOverride: note } });
+  if (early.length) await db.shipment.updateMany({ where: { id: { in: early }, state: "batched" }, data: { state: "shipped", closedAt: now, packedAt: now, packedBy: who, packOverride: note } });
+  await logEvent(shop, {
+    batchId: b.id,
+    type: "batch_completed",
+    detail: `${b.tag}: ${picked ? "marked picked and " : ""}${rows.length} package${rows.length === 1 ? "" : "s"} marked packed without scanning (${why})`,
+    user,
+  });
+  await settleBatch(await db.batch.findUnique({ where: { id: b.id } }));
+  kick(shop, 3000);
+  return { picked, packed: rows.length };
+}
+
 // Pack without a full scan (damaged barcode, item swapped with the customer's OK...)
 export async function overridePack(shop, batchId, shipmentId, reason, user) {
   const { b, s } = await loadBox(shop, batchId, shipmentId);

@@ -40,7 +40,7 @@ import { FlagMarker, ReviewTab } from "../components/shipping/Review";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "../components/shipping/Notice";
 import { PackStation } from "../components/shipping/Pack";
 import { Slips } from "../components/shipping/Slips";
-import { findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
+import { completeBatch, findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
 import { createPortal } from "react-dom";
 import { assertInBatch, batchLabelFile, bulkStatus, buyLabel, labelFile, startBulkLabels } from "../labels.server";
 import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "../flags.server";
@@ -252,6 +252,7 @@ export const loader = async ({ request }) => {
       pickEarly: can(user, "shipping", "pickEarly"),
       understock: can(user, "shipping", "understock"),
       merge: can(user, "shipping", "merge"),
+      completeBatch: can(user, "shipping", "completeBatch"),
       // Release dates can be changed from the quick view by people who manage pre-orders
       editRelease: !sandboxOn && (can(user, "preorders", "manage") || can(user, "releaseReview", "manage")),
     },
@@ -313,6 +314,7 @@ const NEEDS = {
   savePackage: "pack",
   packageSettings: "settings",
   overridePack: "override",
+  completeBatch: "completeBatch",
   flagOrder: "review",
   resolveFlag: "review",
   reopenFlag: "review",
@@ -449,6 +451,12 @@ export const action = async ({ request }) => {
     if (intent === "cameraScans") return { intent, ok: true, ...(await benchTakeScans(session.shop, shop, user)) };
     if (intent === "cameraUnlink") return { intent, ok: true, ...(await benchUnlink(session.shop, shop, user)) };
     if (intent === "boxVideos") return { intent, ok: true, shipmentId: Number(form.get("shipmentId")), videos: await videosFor(session.shop, form.get("shipmentId")) };
+    if (intent === "completeBatch") {
+      // A batch held for its release date: only people allowed to pick early
+      const lock = await batchLock(shop, id, user, { early: can(user, "shipping", "pickEarly") });
+      if (lock?.releaseDay && !can(user, "shipping", "pickEarly")) return { intent, error: lock.pick ?? "This batch waits for its release date." };
+      return { intent, ok: true, ...(await completeBatch(shop, id, form.get("reason"), user)) };
+    }
     if (intent === "overridePack") return { intent, ...(await overridePack(shop, id, Number(form.get("shipmentId")), form.get("reason"), user)) };
     if (intent === "labelCheck") return { intent, ...(await labelCheck(shop, admin, id, Number(form.get("shipmentId")))) };
     if (intent === "buyLabel") {
@@ -633,7 +641,7 @@ const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack"]);
 const BATCH_INTENTS = new Set([
   "scan", "setPicked", "finishPicking", "reopenPicking", "packScan", "findBox", "overridePack", "unpack", "labelCheck", "savePackage",
   "buyLabel", "buyLabels", "bulkLabelStatus", "labelFile", "batchLabelFile", "agentPrint",
-  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox", "pickPhoneLink",
+  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox", "pickPhoneLink", "completeBatch",
 ]);
 
 // Busy, local-only actions don't reload the whole page
@@ -1344,6 +1352,7 @@ const EVENT_LABEL = {
   batch_cancelled: "Batch cancelled",
   batch_done: "Batch shipped",
   batch_priority: "Batch priority",
+  batch_completed: "Batch marked packed",
   boxes_planned: "Boxes planned",
   orders_merged: "Orders merged",
   orders_unmerged: "Merge undone",
@@ -1754,7 +1763,7 @@ function BatchDetail({ batch, list, filter, allowed, staff, me, lock }) {
   const bf = { batchId: batch.id, sort: filter.sort };
   return (
     <s-section>
-      <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} canPriority={allowed.priority} lock={lock} />
+      <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} canPriority={allowed.priority} lock={lock} canComplete={allowed.completeBatch} />
       {editable && <RemoveBar batch={batch} ids={[...selected]} onDone={() => setSelected(new Set())} />}
       <ShipmentTable
         key={`batch:${batch.id}:${filter.sort}`}
