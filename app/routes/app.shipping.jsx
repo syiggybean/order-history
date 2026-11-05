@@ -1761,6 +1761,7 @@ function ReadyTab({ list, filter, overview, allowed, openBatches }) {
 
 function BatchDetail({ batch, list, filter, allowed, staff, me, lock }) {
   const [selected, setSelected] = useState(() => new Set());
+  const [removed, setRemoved] = useState(null); // what the last "Take out" did
   const editable = allowed.batches && batch.removable;
   const selection = editable
     ? {
@@ -1784,7 +1785,28 @@ function BatchDetail({ batch, list, filter, allowed, staff, me, lock }) {
   return (
     <s-section>
       <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} canPriority={allowed.priority} lock={lock} canComplete={allowed.completeBatch} />
-      {editable && <RemoveBar batch={batch} ids={[...selected]} onDone={() => setSelected(new Set())} />}
+      {editable && (
+        <RemoveBar
+          batch={batch}
+          ids={[...selected]}
+          onDone={(r) => {
+            setSelected(new Set());
+            setRemoved(r);
+          }}
+        />
+      )}
+      {removed?.removed > 0 && (
+        <div style={{ margin: "0 0 10px" }}>
+          <s-banner tone={removed.unpacked?.length || removed.skipped?.length ? "warning" : "success"} heading={`${removed.removed} taken out of ${batch.tag}; back on Ready to ship`} dismissible onDismiss={() => setRemoved(null)}>
+            {removed.unpacked?.length > 0 && (
+              <s-paragraph>
+                {removed.unpacked.join(", ")} {removed.unpacked.length === 1 ? "was" : "were"} packed: take the items out of {removed.unpacked.length === 1 ? "that box" : "those boxes"} and back to the shelf. {removed.unpacked.length === 1 ? "It's" : "They're"} picked and packed again in the next batch.
+              </s-paragraph>
+            )}
+            {removed.skipped?.length > 0 && <s-paragraph>Left in the batch: {removed.skipped.join(", ")}.</s-paragraph>}
+          </s-banner>
+        </div>
+      )}
       <ShipmentTable
         key={`batch:${batch.id}:${filter.sort}`}
         list={list}

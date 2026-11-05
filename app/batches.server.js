@@ -133,17 +133,34 @@ export async function removeFromBatch(shop, batchId, shipmentIds, user) {
   const batch = await db.batch.findFirst({ where: { shop, id: Number(batchId) } });
   if (!batch) throw new ShippingError("That batch couldn't be found.");
   if (!REMOVABLE.includes(batch.status)) throw new ShippingError(`${batch.tag} has moved on; shipments can't be taken out here.`);
-  const rows = await db.shipment.findMany({ where: { shop, batchId: batch.id, id: { in: shipmentIds.map(Number) }, state: "batched" } });
-  if (!rows.length) return { removed: 0 };
-  await db.shipment.updateMany({ where: { id: { in: rows.map((r) => r.id) } }, data: { state: "ready", batchId: null, flag: null } });
+  const asked = await db.shipment.findMany({ where: { shop, batchId: batch.id, id: { in: shipmentIds.map(Number) } } });
+  // Not packed, or packed with no label yet: out they come (a packed box is unpacked as it goes,
+  // so it's picked and packed again in its next batch). A label bought or shipped: it stays.
+  const rows = asked.filter((r) => r.state === "batched" || (r.state === "packed" && r.labelStatus !== "bought" && r.labelStatus !== "buying"));
+  const kept = asked.filter((r) => !rows.includes(r));
+  const why = (r) => (r.state === "shipped" || r.state === "closed" ? "already shipped" : r.labelStatus === "bought" || r.labelStatus === "buying" ? "has a label" : `is ${r.state}`);
+  const skipped = kept.map((r) => `${r.orderName} ${why(r)}`);
+  if (!rows.length) {
+    if (skipped.length) throw new ShippingError(`Nothing taken out: ${skipped.join(", ")}.`);
+    return { removed: 0, skipped };
+  }
+  const wasPacked = rows.filter((r) => r.state === "packed");
+  await db.shipment.updateMany({
+    where: { id: { in: rows.map((r) => r.id) } },
+    data: {
+      state: "ready", batchId: null, flag: null,
+      packed: null, packedAt: null, packedBy: null, packOverride: null, packAckKey: null,
+      pkgWeight: null, pkgWeightUnit: null, pkgBox: null, pkgLength: null, pkgWidth: null, pkgHeight: null, pkgDimUnit: null, pkgAt: null, pkgBy: null,
+    },
+  });
   await logEvent(shop, {
     batchId: batch.id,
     type: "batch_removed",
-    detail: `${rows.map((r) => r.orderName).join(", ")} taken out of ${batch.tag}`,
+    detail: `${rows.map((r) => r.orderName).join(", ")} taken out of ${batch.tag}${wasPacked.length ? ` (${wasPacked.map((r) => r.orderName).join(", ")} had been packed: unpack ${wasPacked.length === 1 ? "that box" : "those boxes"})` : ""}${skipped.length ? `; left in: ${skipped.join(", ")}` : ""}`,
     user,
   });
-  kick(shop);
-  return { removed: rows.length };
+  kick(shop); // batch and Packed tags come off in Shopify
+  return { removed: rows.length, unpacked: wasPacked.map((r) => r.orderName), skipped };
 }
 
 export async function cancelBatch(shop, batchId, user) {

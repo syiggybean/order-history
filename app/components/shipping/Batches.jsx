@@ -636,7 +636,7 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null,
 export function RemoveBar({ batch, ids, onDone }) {
   const fetcher = useFetcher();
   useEffect(() => {
-    if (fetcher.data?.intent === "removeFromBatch" && fetcher.data.ok) onDone();
+    if (fetcher.data?.intent === "removeFromBatch" && fetcher.data.ok) onDone(fetcher.data);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetcher.data]);
   if (!ids.length) return null;
