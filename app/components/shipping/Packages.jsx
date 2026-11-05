@@ -401,16 +401,19 @@ export function PackageSettings({ st, canSettings }) {
 // unshipped orders. Select all there, then "Create shipping labels".
 export function BulkLabelsButton({ bulk }) {
   const admin = useCtx(ShopAdminContext);
-  if (!bulk?.tagging || !admin) return null;
-  const n = bulk.ready;
+  if (!bulk) return null;
+  if (!admin) return <span style={small}>Couldn't work out your Shopify admin address, so the bulk label link isn't available. Open Orders in Shopify and search {bulk.tagging ? bulk.query : bulk.batchQuery}.</span>;
+  // Packed tag turned off: the whole batch is packed, so its unshipped orders are the ones to label
+  const n = bulk.tagging ? bulk.ready : bulk.toLabel;
+  const query = bulk.tagging ? bulk.query : bulk.batchQuery;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
       {n > 0 ? (
-        <GreenButton href={`${admin}/orders?query=${encodeURIComponent(bulk.query)}`} target="_blank">
+        <GreenButton href={`${admin}/orders?query=${encodeURIComponent(query)}`} target="_blank">
           Buy labels in bulk ({n}) ↗
         </GreenButton>
       ) : null}
-      {bulk.pending > 0 && <span style={small}>{n ? `${bulk.pending} more being tagged…` : `Getting ${bulk.pending} order${bulk.pending === 1 ? "" : "s"} ready in Shopify…`}</span>}
+      {bulk.tagging && bulk.pending > 0 && <span style={small}>{n ? `${bulk.pending} more being tagged…` : `Getting ${bulk.pending} order${bulk.pending === 1 ? "" : "s"} ready in Shopify…`}</span>}
     </span>
   );
 }

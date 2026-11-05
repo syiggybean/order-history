@@ -252,8 +252,13 @@ export function describePackage(p) {
 export const bulkLabelQuery = (tag) => `tag:${tag} tag:${PACKED_TAG} -fulfillment_status:shipped`;
 export const PACKED_TAG = "Packed";
 
+const itemsText = (s) =>
+  boxLinesOf(s)
+    .map((l) => `${l.quantity} × ${l.title}${l.variantTitle ? ` – ${l.variantTitle}` : ""}${l.sku ? ` (${l.sku})` : ""}`)
+    .join(", ");
+
 // The pack bench for a batch: the queue, oldest order first
-export async function packQueue(shop, batchId) {
+export async function packQueue(shop, batchId, { debug = false } = {}) {
   const b = await batchFor(shop, batchId);
   const rows = await db.shipment.findMany({
     where: { batchId: b.id, state: { in: ["batched", "packed", "labeling", "shipped"] } },
@@ -269,15 +274,81 @@ export async function packQueue(shop, batchId) {
       .map((l) => `${itemKey(l)}×${l.quantity}`)
       .sort()
       .join("|");
-  const identical = rows.length > 0 && rows.every((r) => contents(r) === contents(rows[0]));
+  // Boxes that differ from the usual contents (named so the packer knows which to check)
+  const tally = new Map();
+  for (const r of rows) tally.set(contents(r), (tally.get(contents(r)) ?? 0) + 1);
+  const usual = [...tally.entries()].sort((x, y) => y[1] - x[1])[0]?.[0];
+  const different = rows.filter((r) => contents(r) !== usual && r.state !== "shipped" && r.labelStatus !== "bought");
+  const identical = rows.length > 0 && different.length === 0;
+  // Everything that stops buying this batch's labels in bulk on Shopify's page
+  const tagging = settings.packedTag !== false;
+  const pending = tagging ? toLabel.filter((r) => !r.packTagged).length : 0;
+  const unpacked = rows.filter((r) => r.state === "batched");
+  const ref = (r) => ({ id: r.id, orderName: r.orderName, orderId: r.orderId, orderNumber: r.orderId.split("/").pop(), part: r.partCount > 1 ? `${r.partIndex} of ${r.partCount}` : null });
+  const flagged = toLabel
+    .filter((r) => r.labelStatus !== "bought")
+    .map((r) => ({ r, n: noticeOf(r) }))
+    .filter(({ n }) => n?.address && !n.kept);
+  const reasons = [
+    flagged.length && {
+      code: "address",
+      count: flagged.length,
+      orders: flagged.map(({ r, n }) => ({ ...ref(r), level: n.address.level, address: n.address.address ?? [] })),
+    },
+    unpacked.length && { code: "unpacked", count: unpacked.length, orders: unpacked.slice(0, 10).map(ref) },
+    !identical && different.length && {
+      code: "mixed",
+      count: different.length,
+      usualItems: usual != null ? itemsText(rows.find((r) => contents(r) === usual)) : null,
+      orders: different.slice(0, 10).map((r) => ({ ...ref(r), items: itemsText(r) })),
+    },
+    !tagging && { code: "tagsOff" },
+    pending > 0 && { code: "tagging", count: pending },
+  ].filter(Boolean);
+  // Debug: every check and every order that fails one, with the raw values behind it
+  const debugInfo = debug
+    ? {
+        checks: [
+          { name: "Every box packed (state not 'batched')", pass: unpacked.length === 0, value: `${rows.length - unpacked.length}/${rows.length}` },
+          { name: "Same items in every box", pass: identical, value: `${tally.size} different contents` },
+          { name: "Packed tag setting on", pass: tagging, value: String(settings.packedTag) },
+          { name: "Packed orders tagged in Shopify (packTagged)", pass: pending === 0, value: `${toLabel.filter((r) => r.packTagged).length}/${toLabel.length}` },
+          { name: "No flagged address left (not fixed or kept)", pass: flagged.length === 0, value: String(flagged.length) },
+          { name: "Something left to label", pass: toLabel.length > 0, value: String(toLabel.length) },
+        ],
+        query: bulkLabelQuery(b.tag),
+        orders: rows
+          .map((r) => {
+            const n = noticeOf(r);
+            const why = [
+              r.state === "batched" && "not packed",
+              contents(r) !== usual && r.state !== "shipped" && r.labelStatus !== "bought" && "different items",
+              tagging && ["packed", "labeling"].includes(r.state) && !r.packTagged && "no Packed tag yet",
+              n?.address && !n.kept && ["packed", "labeling"].includes(r.state) && r.labelStatus !== "bought" && `address ${n.address.level}`,
+            ].filter(Boolean);
+            return why.length
+              ? { ...ref(r), why, state: r.state, packTagged: r.packTagged, tagError: r.tagError ?? null, labelStatus: r.labelStatus ?? null, contents: contents(r), holdError: r.holdError ?? null }
+              : null;
+          })
+          .filter(Boolean),
+        usualContents: usual ?? null,
+      }
+    : null;
   return {
     pkg: packageSettingsOf(settings),
+    debug: debugInfo,
     bulk: {
+      reasons,
       query: bulkLabelQuery(b.tag),
       ready: toLabel.filter((r) => r.packTagged).length,
       pending: settings.packedTag === false ? 0 : toLabel.filter((r) => !r.packTagged).length,
       tagging: settings.packedTag !== false,
+      // Without the Packed tag: the batch's unshipped orders (fine once all of it is packed)
+      batchQuery: `tag:${b.tag} -fulfillment_status:shipped`,
+      toLabel: toLabel.length,
       identical,
+      different: different.length,
+      differentNames: different.slice(0, 5).map((r) => r.orderName),
       complete: rows.length > 0 && rows.every((r) => r.state !== "batched"),
       // In-app labels for the whole batch
       unlabelled: rows.filter((r) => ["batched", "packed"].includes(r.state) && r.labelStatus !== "bought").length,
@@ -611,3 +682,20 @@ export async function packingSlips(shop, admin, batchId, ids = []) {
 }
 
 export { staffKeyOf };
+
+// Someone allowed to buy bulk labels anyway did, despite these reasons: on the record
+export async function logBulkLabelOverride(shop, batchId, user) {
+  const q = await packQueue(shop, batchId);
+  const what = q.bulk.reasons.map((r) => BULK_REASON_TEXT[r.code]?.(r) ?? r.code).join("; ");
+  await logEvent(shop, { batchId: q.batch.id, type: "bulk_labels_override", detail: `${q.batch.tag}: bulk labels opened anyway${what ? ` (${what})` : ""}`, user });
+  return { reasons: q.bulk.reasons.length };
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+export const BULK_REASON_TEXT = {
+  address: (r) => `${plural(r.count, "address", "addresses")} flagged by Shopify`,
+  unpacked: (r) => `${plural(r.count, "box", "boxes")} not packed`,
+  mixed: (r) => `${plural(r.count, "box holds", "boxes hold")} different items`,
+  tagsOff: () => "Packed tag off",
+  tagging: (r) => `${plural(r.count, "order", "orders")} still being tagged`,
+};

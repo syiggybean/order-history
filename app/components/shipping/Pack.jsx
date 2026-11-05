@@ -3,7 +3,7 @@ import { MethodBadge } from "./MethodBadge";
 import { useFetcher, useRevalidator } from "react-router";
 import { LockNote, StatusPill, batchTitle } from "./Batches";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "./Notice";
-import { BulkLabelsButton, PackagePanel, packageText } from "./Packages";
+import { PackagePanel, packageText } from "./Packages";
 import { BulkLabelsPanel, LabelActions } from "./Labels";
 import { IN_APP_LABELS } from "./features";
 import { SlipPrintButton, ThisComputer } from "./Printing";
@@ -420,14 +420,8 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
   useEffect(() => {
     if (!askAck && !pkgFocus) inputRef.current?.focus?.();
   }, [askAck, current?.id, pkgFocus]);
-  // Packed boxes whose address Shopify flags (not yet fixed or kept as is): Shopify's
-  // bulk labels can't go ahead for them, so the button waits and says what to do
-  const addressBlocked =
-    !sandbox && !IN_APP_LABELS && data.bulk?.complete
-      ? boxes.filter((x) => ["packed", "labeling"].includes(x.state) && x.label?.status !== "bought" && x.notice?.address && !x.notice.kept)
-      : [];
   // Packing done but the "Packed" tags are still going on in Shopify: check back
-  const waitingForTags = Boolean(data.bulk?.complete && data.bulk.identical && data.bulk.pending > 0);
+  const waitingForTags = Boolean(data.bulk?.complete && data.bulk.reasons?.some((r) => r.code === "tagging"));
   useEffect(() => {
     if (!waitingForTags) return undefined;
     const t = setInterval(() => {
@@ -621,13 +615,9 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
 
       {/* Every box holds the same items: buy (and print) all the labels at once, before or after packing */}
       {!sandbox && IN_APP_LABELS && <BulkLabelsPanel batch={batch} bulk={data.bulk} cfg={pkgCfg} canShip={can.ship} canPrint={can.pack || can.ship} />}
-      {/* Shopify flags a shipping address on a packed box: bulk labels wait until each is fixed or kept */}
-      {addressBlocked.length > 0 && (
-        <AddressBlockers
-          boxes={addressBlocked}
-          toLabel={boxes.filter((x) => ["packed", "labeling"].includes(x.state) && x.label?.status !== "bought").length}
-          onReview={(x) => setReviewing(x)}
-        />
+      {/* Buying the batch's labels in bulk on Shopify's page: the button, and anything stopping it */}
+      {!sandbox && !IN_APP_LABELS && data.bulk && (data.bulk.toLabel > 0 || data.debug) && (data.bulk.complete || can.bulkLabels || data.debug) && (
+        <BulkLabelBanner batch={batch} bulk={data.bulk} debug={data.debug} canForce={Boolean(can.bulkLabels)} boxes={boxes} onReview={(x) => setReviewing(x)} />
       )}
       {reviewing && (
         <NoticeModal
@@ -645,13 +635,6 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
           }}
           onNoticeChange={() => revalidator.revalidate()}
         />
-      )}
-      {/* Every box packed, all with the same items: buy all the labels at once on Shopify's bulk page */}
-      {!sandbox && !IN_APP_LABELS && !addressBlocked.length && data.bulk?.complete && data.bulk.identical && (data.bulk.ready > 0 || data.bulk.pending > 0) && (
-        <div style={{ padding: "12px", border: "1px solid #b7dfc2", background: "#f6fbf7", borderRadius: "10px", margin: "10px 0" }}>
-          <BulkLabelsButton bulk={data.bulk} />
-          <div style={{ ...small, marginTop: "6px" }}>Every box has the same items. In Shopify, select all, then Create shipping labels.</div>
-        </div>
       )}
 
       {lock && data.canPack && <LockNote text={lock} />}
@@ -949,37 +932,191 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
   );
 }
 
-// Bulk labels on hold: which orders' addresses Shopify flags, and what to do about each
-function AddressBlockers({ boxes, toLabel, onReview }) {
-  const n = boxes.length;
+// The bulk label button, with every reason it can't be used yet and what to do
+// about each. People allowed to (shipping: bulkLabels) can go ahead anyway; that's logged.
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const orderRef = (o) => (
+  <span style={{ whiteSpace: "nowrap" }}>
+    <OrderLink orderId={o.orderId} orderNumber={o.orderNumber} name={o.orderName} />
+    {o.part && <span style={small}> · {o.part}</span>}
+  </span>
+);
+function Reason({ title, todo, children }) {
   return (
-    <div role="status" style={{ padding: "12px", border: "1px solid #f1c48b", background: "#fff8ef", borderRadius: "10px", margin: "10px 0" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-        <GreenButton disabled>Buy labels in bulk ({toLabel})</GreenButton>
-        <strong style={{ color: "#7a3d00" }}>
-          Not yet: Shopify flags the shipping address on {n} order{n === 1 ? "" : "s"} in this batch.
-        </strong>
-      </div>
-      <div style={{ ...small, margin: "6px 0 8px" }}>
-        For each one, review the address in Shopify and accept its suggestion or correct it, or keep it as is if it's right. Labels in bulk open up once none are left.
-      </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-        {boxes.map((x) => (
-          <div key={x.id} style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", background: "#fff", border: "1px solid #f3dcc0", borderRadius: "8px", padding: "8px 10px" }}>
-            <span style={{ minWidth: "90px" }}>
-              <OrderLink orderId={x.orderId} orderNumber={x.orderNumber} name={x.orderName} />
-              {x.part && <span style={small}> · {x.part}</span>}
-            </span>
-            <span style={{ flex: "1 1 260px", fontSize: "13px" }}>
-              <span style={{ fontWeight: 600, color: x.notice.address.level === "ERROR" ? "#a41c0b" : "#7a3d00" }}>
-                {x.notice.address.level === "ERROR" ? "Likely invalid" : "May be invalid"}:
-              </span>{" "}
-              {(x.notice.address.address ?? []).join(", ") || "address not shown"}
-            </span>
-            <s-button onClick={() => onReview(x)}>Review address</s-button>
-          </div>
-        ))}
-      </div>
+    <div style={{ background: "#fff", border: "1px solid #f3dcc0", borderRadius: "8px", padding: "8px 10px" }}>
+      <div style={{ fontWeight: 700, color: "#7a3d00" }}>{title}</div>
+      <div style={{ ...small, margin: "2px 0 4px" }}>{todo}</div>
+      {children}
     </div>
+  );
+}
+function OrderList({ orders, count, render = () => null }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+      {orders.map((o) => (
+        <div key={o.id} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          {orderRef(o)}
+          {render(o)}
+        </div>
+      ))}
+      {count > orders.length && <span style={small}>and {count - orders.length} more</span>}
+    </div>
+  );
+}
+export function BulkLabelBanner({ batch, bulk, debug, canForce, boxes, onReview }) {
+  const admin = useContext(ShopAdminContext);
+  const log = useFetcher();
+  const reasons = bulk.reasons ?? [];
+  const has = (code) => reasons.find((r) => r.code === code);
+  const blocked = reasons.length > 0;
+  // Packed tag off: only safe to list the batch's unshipped orders once all of it is packed
+  const query = bulk.tagging ? bulk.query : bulk.batchQuery;
+  const n = bulk.tagging ? bulk.ready : bulk.toLabel;
+  const unsafe = !bulk.tagging && has("unpacked");
+  const live = Boolean(admin) && n > 0 && !unsafe && (!blocked || canForce);
+  const href = live ? `${admin}/orders?query=${encodeURIComponent(query)}` : null;
+  const label = `Buy labels in bulk${blocked && canForce ? " anyway" : ""} (${n})`;
+  const ok = !blocked;
+  return (
+    <div
+      role="status"
+      style={{ padding: "12px", border: `1px solid ${ok ? "#b7dfc2" : "#f1c48b"}`, background: ok ? "#f6fbf7" : "#fff8ef", borderRadius: "10px", margin: "10px 0" }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+        {href ? (
+          <span onClickCapture={() => blocked && log.submit({ intent: "bulkLabelsOverride", id: String(batch.id) }, { method: "post" })}>
+            <GreenButton href={href} target="_blank">
+              {label} ↗
+            </GreenButton>
+          </span>
+        ) : (
+          <GreenButton disabled>{label}</GreenButton>
+        )}
+        {ok ? (
+          <span style={small}>Every box has the same items. In Shopify, select all, then Create shipping labels.</span>
+        ) : (
+          <strong style={{ color: "#7a3d00" }}>
+            {canForce ? "Check these first. You can go ahead anyway." : `Not yet: ${plural(reasons.length, "thing needs", "things need")} sorting out first.`}
+          </strong>
+        )}
+      </div>
+      {!admin && n > 0 && <div style={{ ...small, marginTop: "6px" }}>Couldn't work out your Shopify admin address. In Shopify Orders, search: {query}</div>}
+
+      {blocked && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "10px" }}>
+          {has("address") && (
+            <Reason
+              title={`Shopify flags the shipping address on ${plural(has("address").count, "order", "orders")}`}
+              todo="Review each address: accept Shopify's suggestion or correct it in Shopify, or keep it as is if it's right."
+            >
+              <OrderList
+                orders={has("address").orders}
+                count={has("address").count}
+                render={(o) => {
+                  const bx = boxes.find((x) => x.id === o.id);
+                  return (
+                    <>
+                      <span style={{ flex: "1 1 240px" }}>
+                        <span style={{ fontWeight: 600, color: o.level === "ERROR" ? "#a41c0b" : "#7a3d00" }}>{o.level === "ERROR" ? "Likely invalid" : "May be invalid"}:</span>{" "}
+                        {o.address.join(", ") || "address not shown"}
+                      </span>
+                      {bx?.notice && <s-button onClick={() => onReview(bx)}>Review address</s-button>}
+                    </>
+                  );
+                }}
+              />
+            </Reason>
+          )}
+          {has("unpacked") && (
+            <Reason
+              title={`${plural(has("unpacked").count, "box isn't", "boxes aren't")} packed yet`}
+              todo="Pack them first, or take them out of the batch. Someone allowed to can also mark the whole batch packed."
+            >
+              <OrderList orders={has("unpacked").orders} count={has("unpacked").count} />
+            </Reason>
+          )}
+          {has("mixed") && (
+            <Reason
+              title={`${plural(has("mixed").count, "box holds", "boxes hold")} different items from the rest`}
+              todo="Shopify's bulk page uses one package and weight for every label. Check these (often the same title on a different listing or variant), buy their labels one at a time from the box, or take them out of the batch."
+            >
+              {has("mixed").usualItems && <div style={{ ...small, marginBottom: "4px" }}>Most boxes: {has("mixed").usualItems}</div>}
+              <OrderList orders={has("mixed").orders} count={has("mixed").count} render={(o) => <span style={{ color: "#7a3d00" }}>{o.items}</span>} />
+            </Reason>
+          )}
+          {has("tagsOff") && (
+            <Reason
+              title='The "Packed" tag is off'
+              todo={
+                unsafe
+                  ? `Turn it on in Settings and activity, or finish packing: without it, Shopify's list would include ${batch.tag}'s unpacked orders.`
+                  : `Turn it on in Settings and activity so Shopify's list shows only packed orders. Until then the button lists every unshipped order in ${batch.tag}.`
+              }
+            />
+          )}
+          {has("tagging") && (
+            <Reason
+              title={`${plural(has("tagging").count, "order is", "orders are")} still getting the Packed tag in Shopify`}
+              todo="This clears by itself within a few minutes; the page checks back. Orders without the tag yet won't appear on Shopify's page."
+            />
+          )}
+          {!canForce && <div style={small}>The button turns on once these are sorted. People with the "Buy labels in bulk anyway" permission can go ahead now.</div>}
+          {canForce && unsafe && <div style={small}>Even with your permission, the button waits: turn the Packed tag on or finish packing first.</div>}
+        </div>
+      )}
+
+      {debug && <BulkLabelDebug debug={debug} />}
+    </div>
+  );
+}
+
+// Debug permission: each check with pass/fail, and every order that failed one
+function BulkLabelDebug({ debug }) {
+  const td = { padding: "3px 6px", borderTop: "1px solid #eee", verticalAlign: "top", fontFamily: "ui-monospace, monospace", fontSize: "12px" };
+  return (
+    <details style={{ marginTop: "10px", background: "#fff", border: "1px dashed #bbb", borderRadius: "8px", padding: "6px 10px" }}>
+      <summary style={{ cursor: "pointer", fontWeight: 600, fontSize: "13px" }}>
+        Debug: {debug.checks.filter((c) => !c.pass).length} check(s) failing, {debug.orders.length} order(s) behind them
+      </summary>
+      <table style={{ borderCollapse: "collapse", marginTop: "6px" }}>
+        <tbody>
+          {debug.checks.map((c) => (
+            <tr key={c.name}>
+              <td style={{ ...td, color: c.pass ? "#1a5e20" : "#b42318", fontWeight: 700 }}>{c.pass ? "PASS" : "FAIL"}</td>
+              <td style={td}>{c.name}</td>
+              <td style={td}>{c.value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div style={{ ...td, borderTop: 0, margin: "6px 0" }}>Shopify query: {debug.query}</div>
+      {debug.usualContents != null && <div style={{ ...td, borderTop: 0, marginBottom: "6px" }}>Most common contents: {debug.usualContents || "(empty)"}</div>}
+      {debug.orders.length > 0 && (
+        <div style={{ maxHeight: "320px", overflow: "auto" }}>
+          <table style={{ borderCollapse: "collapse", width: "100%" }}>
+            <thead>
+              <tr>
+                {["Order", "Why", "state", "packTagged", "labelStatus", "contents", "tagError / holdError"].map((h) => (
+                  <th key={h} style={{ ...td, textAlign: "left", fontFamily: "inherit" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {debug.orders.map((o) => (
+                <tr key={o.id}>
+                  <td style={td}>{orderRef(o)}</td>
+                  <td style={{ ...td, color: "#b42318" }}>{o.why.join(", ")}</td>
+                  <td style={td}>{o.state}</td>
+                  <td style={td}>{String(o.packTagged)}</td>
+                  <td style={td}>{o.labelStatus ?? "–"}</td>
+                  <td style={td}>{o.contents}</td>
+                  <td style={td}>{[o.tagError, o.holdError].filter(Boolean).join(" · ") || "–"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </details>
   );
 }

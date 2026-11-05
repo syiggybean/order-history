@@ -66,6 +66,7 @@ export const CAPABILITY_FEATURES = {
       ship: "Ship (labels, final scan)",
       override: "Override scan mismatches",
       completeBatch: "Mark a whole batch picked and packed (no scanning)",
+      bulkLabels: "Buy labels in bulk even when something would normally stop it (flagged addresses, mixed boxes…)",
       shipOutside: "Ship outside a batch",
       review: "Flag/Review orders",
       assignedOnly: "Only their assigned batches (limits what they see)",

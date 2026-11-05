@@ -40,7 +40,7 @@ import { FlagMarker, ReviewTab } from "../components/shipping/Review";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "../components/shipping/Notice";
 import { PackStation } from "../components/shipping/Pack";
 import { Slips } from "../components/shipping/Slips";
-import { completeBatch, findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
+import { completeBatch, logBulkLabelOverride, findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
 import { createPortal } from "react-dom";
 import { assertInBatch, batchLabelFile, bulkStatus, buyLabel, labelFile, startBulkLabels } from "../labels.server";
 import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "../flags.server";
@@ -216,7 +216,7 @@ export const loader = async ({ request }) => {
     sandbox: sandboxOn ? await sandboxSummary(session.shop) : null,
     // For "Review in Shopify": the order page in Shopify admin
     shopAdmin: `https://admin.shopify.com/store/${session.shop.replace(/\.myshopify\.com$/, "")}`,
-    pack: batchId && view === "pack" ? await packQueue(shop, batchId).catch(() => null) : null,
+    pack: batchId && view === "pack" ? await packQueue(shop, batchId, { debug: can(user, "debug", "view") }).catch(() => null) : null,
     box:
       batchId && view === "pack" && params.get("box")
         ? await getBox(shop, batchId, Number(params.get("box"))).catch(() => null)
@@ -253,6 +253,7 @@ export const loader = async ({ request }) => {
       understock: can(user, "shipping", "understock"),
       merge: can(user, "shipping", "merge"),
       completeBatch: can(user, "shipping", "completeBatch"),
+      bulkLabels: can(user, "shipping", "bulkLabels"),
       // Release dates can be changed from the quick view by people who manage pre-orders
       editRelease: !sandboxOn && (can(user, "preorders", "manage") || can(user, "releaseReview", "manage")),
     },
@@ -315,6 +316,7 @@ const NEEDS = {
   packageSettings: "settings",
   overridePack: "override",
   completeBatch: "completeBatch",
+  bulkLabelsOverride: "bulkLabels",
   flagOrder: "review",
   resolveFlag: "review",
   reopenFlag: "review",
@@ -451,6 +453,7 @@ export const action = async ({ request }) => {
     if (intent === "cameraScans") return { intent, ok: true, ...(await benchTakeScans(session.shop, shop, user)) };
     if (intent === "cameraUnlink") return { intent, ok: true, ...(await benchUnlink(session.shop, shop, user)) };
     if (intent === "boxVideos") return { intent, ok: true, shipmentId: Number(form.get("shipmentId")), videos: await videosFor(session.shop, form.get("shipmentId")) };
+    if (intent === "bulkLabelsOverride") return { intent, ok: true, ...(await logBulkLabelOverride(shop, id, user)) };
     if (intent === "completeBatch") {
       // A batch held for its release date: only people allowed to pick early
       const lock = await batchLock(shop, id, user, { early: can(user, "shipping", "pickEarly") });
@@ -641,11 +644,11 @@ const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack"]);
 const BATCH_INTENTS = new Set([
   "scan", "setPicked", "finishPicking", "reopenPicking", "packScan", "findBox", "overridePack", "unpack", "labelCheck", "savePackage",
   "buyLabel", "buyLabels", "bulkLabelStatus", "labelFile", "batchLabelFile", "agentPrint",
-  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox", "pickPhoneLink", "completeBatch",
+  "removeFromBatch", "cancelBatch", "renameBatch", "assignBatch", "addToBatch", "setPriority", "sealBox", "pickPhoneLink", "completeBatch", "bulkLabelsOverride",
 ]);
 
 // Busy, local-only actions don't reload the whole page
-const LOCAL = new Set(["findCustomers", "more", "order", "scan", "setPicked", "setBin", "exportBins", "packScan", "findBox", "ackNotice", "recheckOrder", "keepAddress", "labelCheck", "savePackage", "productSuggest", "labelFile", "batchLabelFile", "bulkLabelStatus",
+const LOCAL = new Set(["bulkLabelsOverride", "findCustomers", "more", "order", "scan", "setPicked", "setBin", "exportBins", "packScan", "findBox", "ackNotice", "recheckOrder", "keepAddress", "labelCheck", "savePackage", "productSuggest", "labelFile", "batchLabelFile", "bulkLabelStatus",
   "agentPrint", "printJobs", "printStations", "setMyStation", "retryPrint", "testPrint"]);
 export const shouldRevalidate = ({ formData, defaultShouldRevalidate }) =>
   LOCAL.has(formData?.get("intent")) ? false : defaultShouldRevalidate;
@@ -809,6 +812,11 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
   // Order links and "Flag for review" in this row go through the same pop-up
   const gatedOpen = openOrder ? (id, opts) => gate(() => openOrder(id, opts)) : null;
   const rowBg = checked ? "#fff5f7" : notice ? NOTICE_BG : undefined;
+  // Understocked items: a merged box's own plus the merged-in orders'
+  const under = [];
+  for (const u of [...(s.understocked ?? []), ...(s.merge?.orders ?? []).flatMap((o) => o.understocked ?? [])]) {
+    if (!under.some((x) => x.title === u.title)) under.push(u);
+  }
   return (
     <OrderViewContext.Provider value={gatedOpen}>
     <tr
@@ -847,12 +855,17 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
       )}
       <td style={{ ...cell, whiteSpace: "nowrap", ...(!selection && notice ? { boxShadow: `inset 4px 0 0 ${NOTICE_EDGE}` } : {}) }}>
         <OrderLink orderId={s.orderId} orderNumber={s.orderNumber} name={s.orderName} />
+        {s.merge?.orders?.map((o) => (
+          <div key={o.shipmentId} style={small}>
+            + <OrderLink orderId={o.orderId} orderNumber={o.orderNumber} name={o.orderName} />
+          </div>
+        ))}
         {s.part && <div style={small}>Part {s.part}</div>}
         <div style={small}>{fmtDate(s.orderCreatedAt)}</div>
       </td>
       <td style={cell}>{s.customerName ?? <span style={muted}>—</span>}</td>
       <td style={cell}>
-        <Items lines={s.lines} />
+        <Items lines={s.merge?.role === "box" ? [...s.lines, ...s.merge.items] : s.lines} />
       </td>
       <td style={cell}>
         {s.shippingMethod ? <MethodBadge method={s.shippingMethod} /> : <span style={muted}>—</span>}
@@ -873,8 +886,15 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
           <div style={{ marginTop: "4px" }}>
             <span style={pill("#eef3ff", "#1c4a9c")}>Merged box</span>
             <div style={small}>
-              + {s.merge.items.map((i) => `${i.quantity} × ${i.title}${i.variantTitle ? ` – ${i.variantTitle}` : ""} (${i.from})`).join(", ")}
+              {[s.orderName, ...(s.merge.orders ?? []).map((o) => o.orderName)].join(" + ")} ship together
             </div>
+            {(s.merge.orders ?? [])
+              .filter((o) => o.waitingReason)
+              .map((o) => (
+                <div key={o.shipmentId} style={{ ...small, color: "#7a4f01" }}>
+                  {o.orderName}: {o.waitingReason}
+                </div>
+              ))}
           </div>
         )}
         {s.merge?.role === "part" && (
@@ -883,16 +903,16 @@ function ShipmentRow({ s, i, mode, canOutside, canReview, selection }) {
             <div style={small}>Merged: this order isn't batched on its own until that box ships.</div>
           </div>
         )}
-        {s.understocked?.length > 0 && (
+        {under.length > 0 && (
           <div style={{ marginTop: "4px" }}>
             <span
               style={pill("#fde7e9", "#8e1f0b")}
-              title={s.understocked.map((u) => `${u.title}: ${u.ordered} on open orders, ${u.inStock} in stock`).join("\n")}
+              title={under.map((u) => `${u.title}: ${u.ordered} on open orders, ${u.inStock} in stock`).join("\n")}
             >
               Understocked
             </span>
             <div style={{ ...small, color: "#8e1f0b" }}>
-              {s.understocked.map((u) => `${u.title}: ${u.ordered} ordered, ${u.inStock} in stock`).join(" · ")}
+              {under.map((u) => `${u.title}: ${u.ordered} ordered, ${u.inStock} in stock`).join(" · ")}
             </div>
           </div>
         )}
@@ -1947,7 +1967,7 @@ function Page() {
       )}
       {tab === "batches" && batch && <BatchDetail batch={batch} list={list} filter={filter} allowed={allowed} staff={staff} me={me} lock={lock} />}
       {tab === "batches" && pick && <PickList key={pick.batch.id} data={pick} canPick={allowed.pick} lock={lock?.pick ?? null} />}
-      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick }} sandbox={Boolean(sandbox)} lock={lock?.pack ?? null} />}
+      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick, bulkLabels: allowed.bulkLabels }} sandbox={Boolean(sandbox)} lock={lock?.pack ?? null} />}
       {tab === "batches" && slips && <Slips data={slips} />}
       {tab === "batches" && !batches && !batch && !pick && !pack && !slips && (
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
