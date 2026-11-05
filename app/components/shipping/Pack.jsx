@@ -9,7 +9,7 @@ import { IN_APP_LABELS } from "./features";
 import { SlipPrintButton, ThisComputer } from "./Printing";
 import { PackCameraBar, usePackCamera } from "./PackCameraLink";
 import { OrderLink } from "./OrderLink";
-import { PINK, ProductName, box, cell, head, input, muted, pill, small, ProductThumb, useParamSetter } from "./ui";
+import { GreenButton, PINK, ProductName, box, cell, head, input, muted, pill, small, ProductThumb, useParamSetter } from "./ui";
 
 // The pack camera's video of this box, for its latest packing only (a repacked box
 // starts again): recording, waiting, uploading (with a progress bar), saved, or failed
@@ -307,6 +307,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
   const [code, setCode] = useState("");
   const [last, setLast] = useState(null);
   const [askAck, setAskAck] = useState(false);
+  const [reviewing, setReviewing] = useState(null); // box whose flagged address is open from the label banner
   const queue = useRef([]);
   const scanner = useFetcher();
   const admin = useContext(ShopAdminContext);
@@ -419,6 +420,12 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
   useEffect(() => {
     if (!askAck && !pkgFocus) inputRef.current?.focus?.();
   }, [askAck, current?.id, pkgFocus]);
+  // Packed boxes whose address Shopify flags (not yet fixed or kept as is): Shopify's
+  // bulk labels can't go ahead for them, so the button waits and says what to do
+  const addressBlocked =
+    !sandbox && !IN_APP_LABELS && data.bulk?.complete
+      ? boxes.filter((x) => ["packed", "labeling"].includes(x.state) && x.label?.status !== "bought" && x.notice?.address && !x.notice.kept)
+      : [];
   // Packing done but the "Packed" tags are still going on in Shopify: check back
   const waitingForTags = Boolean(data.bulk?.complete && data.bulk.identical && data.bulk.pending > 0);
   useEffect(() => {
@@ -614,8 +621,33 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
 
       {/* Every box holds the same items: buy (and print) all the labels at once, before or after packing */}
       {!sandbox && IN_APP_LABELS && <BulkLabelsPanel batch={batch} bulk={data.bulk} cfg={pkgCfg} canShip={can.ship} canPrint={can.pack || can.ship} />}
+      {/* Shopify flags a shipping address on a packed box: bulk labels wait until each is fixed or kept */}
+      {addressBlocked.length > 0 && (
+        <AddressBlockers
+          boxes={addressBlocked}
+          toLabel={boxes.filter((x) => ["packed", "labeling"].includes(x.state) && x.label?.status !== "bought").length}
+          onReview={(x) => setReviewing(x)}
+        />
+      )}
+      {reviewing && (
+        <NoticeModal
+          notice={reviewing.notice}
+          shipmentId={reviewing.id}
+          orderName={reviewing.orderName}
+          orderNumber={reviewing.orderNumber}
+          onCancel={() => {
+            setReviewing(null);
+            revalidator.revalidate();
+          }}
+          onContinue={() => {
+            setReviewing(null);
+            revalidator.revalidate();
+          }}
+          onNoticeChange={() => revalidator.revalidate()}
+        />
+      )}
       {/* Every box packed, all with the same items: buy all the labels at once on Shopify's bulk page */}
-      {!sandbox && !IN_APP_LABELS && data.bulk?.complete && data.bulk.identical && (data.bulk.ready > 0 || data.bulk.pending > 0) && (
+      {!sandbox && !IN_APP_LABELS && !addressBlocked.length && data.bulk?.complete && data.bulk.identical && (data.bulk.ready > 0 || data.bulk.pending > 0) && (
         <div style={{ padding: "12px", border: "1px solid #b7dfc2", background: "#f6fbf7", borderRadius: "10px", margin: "10px 0" }}>
           <BulkLabelsButton bulk={data.bulk} />
           <div style={{ ...small, marginTop: "6px" }}>Every box has the same items. In Shopify, select all, then Create shipping labels.</div>
@@ -914,5 +946,40 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
         />
       )}
     </s-section>
+  );
+}
+
+// Bulk labels on hold: which orders' addresses Shopify flags, and what to do about each
+function AddressBlockers({ boxes, toLabel, onReview }) {
+  const n = boxes.length;
+  return (
+    <div role="status" style={{ padding: "12px", border: "1px solid #f1c48b", background: "#fff8ef", borderRadius: "10px", margin: "10px 0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+        <GreenButton disabled>Buy labels in bulk ({toLabel})</GreenButton>
+        <strong style={{ color: "#7a3d00" }}>
+          Not yet: Shopify flags the shipping address on {n} order{n === 1 ? "" : "s"} in this batch.
+        </strong>
+      </div>
+      <div style={{ ...small, margin: "6px 0 8px" }}>
+        For each one, review the address in Shopify and accept its suggestion or correct it, or keep it as is if it's right. Labels in bulk open up once none are left.
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+        {boxes.map((x) => (
+          <div key={x.id} style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", background: "#fff", border: "1px solid #f3dcc0", borderRadius: "8px", padding: "8px 10px" }}>
+            <span style={{ minWidth: "90px" }}>
+              <OrderLink orderId={x.orderId} orderNumber={x.orderNumber} name={x.orderName} />
+              {x.part && <span style={small}> · {x.part}</span>}
+            </span>
+            <span style={{ flex: "1 1 260px", fontSize: "13px" }}>
+              <span style={{ fontWeight: 600, color: x.notice.address.level === "ERROR" ? "#a41c0b" : "#7a3d00" }}>
+                {x.notice.address.level === "ERROR" ? "Likely invalid" : "May be invalid"}:
+              </span>{" "}
+              {(x.notice.address.address ?? []).join(", ") || "address not shown"}
+            </span>
+            <s-button onClick={() => onReview(x)}>Review address</s-button>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
