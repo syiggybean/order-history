@@ -72,7 +72,9 @@
       el.closest('[data-section-type="product"], [data-product-section], .shopify-section, section') || document.body;
     this.panel = el.querySelector("[data-ohpc-panel]");
     this.notify = el.querySelector("[data-ohpc-notify]");
-    this.clock = this.panel ? new clockLib().Clock(this.panel, "until pre-orders open") : null;
+    // The Clock constructor lives in the lib file; take it out first so it's called with `new`
+    var ClockCtor = clockLib().Clock;
+    this.clock = this.panel ? new ClockCtor(this.panel, "until pre-orders open") : null;
     this.heading = el.querySelector("[data-ohpc-heading]");
     this.whenOpens = el.querySelector('[data-ohpc-when="opens"]');
     this.whenCloses = el.querySelector('[data-ohpc-when="closes"]');

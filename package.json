@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "build": "react-router build",
-    "build:storefront": "esbuild storefront/preorder-countdown.js storefront/preorder-closing.js --bundle --minify --format=iife --target=es2017 --legal-comments=none --outdir=extensions/preorder-countdown/assets && esbuild storefront/wishlist.js storefront/loyalty.js --bundle --minify --format=iife --target=es2017 --legal-comments=none --outdir=extensions/preorder-countdown/assets",
+    "build:storefront": "esbuild storefront/preorder-countdown.js storefront/preorder-countdown-lib.js storefront/preorder-closing.js --bundle --minify --format=iife --target=es2017 --legal-comments=none --outdir=extensions/preorder-countdown/assets && esbuild storefront/wishlist.js storefront/loyalty.js --bundle --minify --format=iife --target=es2017 --legal-comments=none --outdir=extensions/preorder-countdown/assets",
     "dev": "shopify app dev",
     "config:link": "shopify app config link",
     "generate": "shopify app generate",
