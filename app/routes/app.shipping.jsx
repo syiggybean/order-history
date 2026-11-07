@@ -47,6 +47,18 @@ import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "..
 import { enterSandbox, inSandbox, leaveSandbox, resetSandbox, sandboxAdmin, sandboxShopOf, sandboxSummary } from "../sandbox.server";
 import { EnterSandboxButton, SandboxBanner, SandboxSettings } from "../components/shipping/Sandbox";
 import { BatchHeader, BatchList, RemoveBar, SelectionBar } from "../components/shipping/Batches";
+import { OrdoroBatchPanel, OrdoroTab } from "../components/shipping/OrdoroBatches";
+import {
+  OrdoroBatchError,
+  importStatus as ordoroImportStatus,
+  listOrdoroBatches,
+  ordoroBlock,
+  reconcileIssue as reconcileOrdoroIssue,
+  recheckIssue as recheckOrdoroIssue,
+  reopenIssue as reopenOrdoroIssue,
+  startImport as startOrdoroImport,
+} from "../ordoro-batches.server";
+import { ordoroConfigured } from "../ordoro.server";
 import { PickList } from "../components/shipping/PickList";
 import { PackageSettings } from "../components/shipping/Packages";
 import {
@@ -110,7 +122,7 @@ async function batchLocksFor(shop, list, user, early) {
 const releaseDayLabel = (day) => new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
 
 const PAGE_SIZE = 50;
-const TABS = ["ready", "waiting", "batches", "review", "merge", "stock", "settings"];
+const TABS = ["ready", "waiting", "batches", "ordoro", "review", "merge", "stock", "settings"];
 
 const filterFrom = (params) => ({
   q: params.get("q") || "",
@@ -187,8 +199,15 @@ export const loader = async ({ request }) => {
         ? { plan: await customerPlan(shop, mergeAdmin, params.get("customer")), merges: [] }
         : { ...(await mergeCandidates(shop, mergeAdmin)), merges: await listMerges(shop) }
       : null;
+  const ordoroBatches = await listOrdoroBatches(shop);
   return {
     merge,
+    ordoro:
+      tab === "ordoro"
+        ? { batches: ordoroBatches, job: ordoroImportStatus(shop), configured: ordoroConfigured() && !sandboxOn }
+        : null,
+    ordoroLive: ordoroBatches.filter((b) => !["done", "cancelled"].includes(b.status)).length,
+    ordoroHeld: ordoroBatches.filter((b) => b.blocking > 0).length,
     batchLockList: Object.fromEntries(lockMap),
     lock: batchId ? (lockMap.get(batchId) ?? null) : null,
     tab,
@@ -317,6 +336,11 @@ const NEEDS = {
   overridePack: "override",
   completeBatch: "completeBatch",
   bulkLabelsOverride: "bulkLabels",
+  // Ordoro batches: import, and reconciling what didn't line up
+  ordoroImport: "batches",
+  ordoroRecheck: "batches",
+  ordoroReconcile: "batches",
+  ordoroReopen: "batches",
   flagOrder: "review",
   resolveFlag: "review",
   reopenFlag: "review",
@@ -364,6 +388,12 @@ export const action = async ({ request }) => {
   if (stage && id) {
     const lock = await batchLock(shop, id, user, { early: can(user, "shipping", "pickEarly") });
     if (lock?.[stage]) return { intent, ok: false, error: lock[stage], locked: true };
+  }
+  // An Ordoro batch with orders shipped there but not in Shopify: hands off until reconciled
+  if (ORDORO_HELD.has(intent)) {
+    const target = intent === "addToBatch" ? Number(form.get("target")) : id || Number(form.get("batchId"));
+    const why = target ? await ordoroBlock(shop, target) : null;
+    if (why) return { intent, ok: false, error: why, locked: true };
   }
   if (intent === "resetSandbox") {
     if (!sandboxOn) return { intent, error: "You're not in sandbox mode." };
@@ -454,6 +484,23 @@ export const action = async ({ request }) => {
     if (intent === "cameraUnlink") return { intent, ok: true, ...(await benchUnlink(session.shop, shop, user)) };
     if (intent === "boxVideos") return { intent, ok: true, shipmentId: Number(form.get("shipmentId")), videos: await videosFor(session.shop, form.get("shipmentId")) };
     if (intent === "bulkLabelsOverride") return { intent, ok: true, ...(await logBulkLabelOverride(shop, id, user)) };
+    if (intent === "ordoroImport") {
+      if (sandboxOn) return { intent, error: "Importing from Ordoro is off in sandbox." };
+      await startOrdoroImport(shop, user);
+      return { intent, ok: true, started: true };
+    }
+    if (intent === "ordoroRecheck") {
+      const issueId = Number(form.get("issueId"));
+      return { intent, ok: true, issueId, ...(await recheckOrdoroIssue(shop, admin, issueId, user)) };
+    }
+    if (intent === "ordoroReconcile") {
+      const issueId = Number(form.get("issueId"));
+      return { intent, issueId, ...(await reconcileOrdoroIssue(shop, issueId, form.get("note"), user)) };
+    }
+    if (intent === "ordoroReopen") {
+      const issueId = Number(form.get("issueId"));
+      return { intent, issueId, ...(await reopenOrdoroIssue(shop, issueId, user)) };
+    }
     if (intent === "completeBatch") {
       // A batch held for its release date: only people allowed to pick early
       const lock = await batchLock(shop, id, user, { early: can(user, "shipping", "pickEarly") });
@@ -591,7 +638,7 @@ export const action = async ({ request }) => {
       return { intent, ok: true, ...startFullRead(shop) };
     }
   } catch (e) {
-    if (!(e instanceof ShippingError) && !(e instanceof PrintError)) console.error(`[shipping] ${intent}:`, e);
+    if (!(e instanceof ShippingError) && !(e instanceof PrintError) && !(e instanceof OrdoroBatchError)) console.error(`[shipping] ${intent}:`, e);
     return { intent, id, error: e?.message ?? String(e) };
   }
   return { intent, error: "Unknown action" };
@@ -638,6 +685,12 @@ async function printOnStation({ shop, printShop, admin, user, form, id }) {
 
 // Picking and packing steps (blocked by a release date still to come, or a higher-priority batch)
 const PICK_INTENTS = new Set(["scan", "setPicked", "finishPicking"]);
+// Everything that works a batch (not renaming, cancelling or taking orders out)
+const ORDORO_HELD = new Set([
+  "addToBatch", "scan", "setPicked", "finishPicking", "reopenPicking", "assignBatch", "setPriority",
+  "packScan", "sealBox", "unpack", "overridePack", "labelCheck", "savePackage", "buyLabel", "buyLabels",
+  "completeBatch", "bulkLabelsOverride", "cameraLink", "pickPhoneLink",
+]);
 const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack"]);
 
 // Actions on a batch (its id is in "id"): people limited to their assigned batches only get theirs
@@ -1785,6 +1838,7 @@ function BatchDetail({ batch, list, filter, allowed, staff, me, lock }) {
   return (
     <s-section>
       <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} canPriority={allowed.priority} lock={lock} canComplete={allowed.completeBatch} />
+      {batch.ordoro && <OrdoroBatchPanel batch={batch} canReconcile={allowed.batches} />}
       {editable && (
         <RemoveBar
           batch={batch}
@@ -1826,7 +1880,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock, merge } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock, merge, ordoro, ordoroLive, ordoroHeld } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1847,11 +1901,16 @@ function Page() {
     { id: "ready", label: "Ready to ship", n: c.ready ?? 0 },
     { id: "waiting", label: "Waiting", n: c.waiting ?? 0 },
     { id: "batches", label: "Batches", n: liveBatchCount },
+    ...(ordoroLive || ordoroHeld || tab === "ordoro" || allowed.batches
+      ? [{ id: "ordoro", label: "Ordoro batches", n: ordoroHeld || ordoroLive || null, alert: ordoroHeld > 0 }]
+      : []),
     { id: "review", label: "Review", n: flagCount, alert: flagCount > 0 },
     ...(allowed.merge ? [{ id: "merge", label: "Order Merge" }] : []),
     { id: "stock", label: "Stock vs orders" },
     { id: "settings", label: "Settings and activity" },
   ];
+  // An Ordoro batch opens on the batch pages, but belongs to the Ordoro tab
+  const shownTab = tab === "batches" && (batch?.ordoro || pick?.batch?.source === "ordoro" || pack?.batch?.source === "ordoro") ? "ordoro" : tab;
   const tabStyle = (active) => ({
     appearance: "none",
     border: 0,
@@ -1878,8 +1937,8 @@ function Page() {
           <button
             key={t.id}
             role="tab"
-            aria-selected={tab === t.id}
-            style={tabStyle(tab === t.id)}
+            aria-selected={shownTab === t.id}
+            style={tabStyle(shownTab === t.id)}
             onClick={() =>
               setParams(
                 (p) => {
@@ -1994,6 +2053,7 @@ function Page() {
       {tab === "batches" && !batches && !batch && !pick && !pack && !slips && (
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
       )}
+      {tab === "ordoro" && ordoro && <OrdoroTab data={ordoro} canBatches={allowed.batches} />}
       {tab === "review" && flags && <ReviewTab flags={flags} status={flagStatus} canReview={allowed.review} />}
       {tab === "merge" && (allowed.merge ? <MergeTab data={merge} /> : <s-paragraph>Order Merge needs the "Merge orders" permission.</s-paragraph>)}
       {tab === "stock" && <StockTab overview={overview} />}

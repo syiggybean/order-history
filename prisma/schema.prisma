@@ -285,6 +285,11 @@ model PreorderWindow {
   closedAt         DateTime?
   soldOutAt        DateTime?
   restockedUnits   Int       @default(0)
+  // Closing time: "release" = end of the release date, "manual" = its own time,
+  // null = the shop's setting (closeOnRelease)
+  closesRule       String?
+  // Release (publication) date last read from Shopify, "YYYY-MM-DD"
+  releaseDay       String?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @default(now()) @updatedAt
 
@@ -300,6 +305,9 @@ model PreorderSettings {
   locationId       String?
   fromName         String?
   storeUrl         String?
+  // Countdowns close at the end of each product's release (publication) date,
+  // unless a product is set to its own closing time
+  closeOnRelease   Boolean  @default(false)
   updatedAt        DateTime @default(now()) @updatedAt
 }
 
@@ -587,11 +595,38 @@ model Batch {
   packStartedAt DateTime?
   packDoneAt    DateTime?
   cancelledAt   DateTime?
+  // Imported from Ordoro (source "ordoro"): its reference there, and import details (JSON)
+  externalRef   String?
+  externalInfo  String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @default(now()) @updatedAt
 
   @@unique([shop, number])
   @@index([shop, status])
+}
+
+// What didn't line up when an Ordoro batch came in. Blocking ones (shipped in
+// Ordoro, not fulfilled in Shopify) hold the batch until reconciled.
+model OrdoroBatchIssue {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  batchId     Int
+  orderNumber String // Ordoro's order number
+  orderName   String? // Shopify's, e.g. #47950
+  orderId     String?
+  shipmentId  Int?
+  kind        String // shipped_unfulfilled | shopify_shipped | other_batch | waiting | not_found | cancelled | in_work
+  blocking    Boolean   @default(false)
+  detail      String
+  tracking    String?
+  status      String    @default("open") // open | fixed (now matches) | reconciled (by hand, with a note)
+  note        String?
+  resolvedBy  String?
+  resolvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) @updatedAt
+
+  @@index([shop, batchId, status])
 }
 
 // An order someone flagged for the team to look at (the Flag/Review switch).

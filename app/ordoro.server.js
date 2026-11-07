@@ -42,7 +42,8 @@ const money = (n) => Math.round(Number(n || 0) * 100) / 100;
 // Ordoro
 // ---------------------------------------------------------------------------
 
-async function ordoroGet(path) {
+// notFound: what to return for a 404 instead of throwing (single-record reads)
+export async function ordoroGet(path, { notFound } = {}) {
   const auth = Buffer.from(`${process.env.ORDORO_API_KEY}:${process.env.ORDORO_API_SECRET}`).toString("base64");
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(`${ORDORO}${path}`, { headers: { Authorization: `Basic ${auth}`, Accept: "application/json" } });
@@ -53,6 +54,7 @@ async function ordoroGet(path) {
       await sleep(testing() ? 5 : 5000 * (attempt + 1));
       continue;
     }
+    if (res.status === 404 && notFound !== undefined) return notFound;
     if (!res.ok) throw new OrdoroError(`Ordoro returned ${res.status} for ${path.split("?")[0]}`);
     return res.json();
   }

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { SOURCE as ORDORO, ordoroBatchInfo, ordoroLocks } from "./ordoro-batches.server";
 import db from "./db.server";
 import { PACKED_TAG, bulkLabelQuery } from "./pack.server";
 import { dayInStore, errorMessage, gql, TIME_ZONE, todayInStore } from "./preorders.server";
@@ -274,6 +275,11 @@ export async function batchLocks(shop, batches, user, { early = false } = {}) {
     };
     out.set(b.id, { pick: held ?? above(TO_PICK), pack: held ?? above(TO_PACK), releaseDay });
   }
+  // Imported from Ordoro with orders shipped there but not in Shopify: on hold until reconciled
+  const rows = await db.batch.findMany({ where: { shop, id: { in: batches.map((b) => b.id) } }, select: { id: true, tag: true, source: true } });
+  for (const [id, why] of await ordoroLocks(shop, rows)) {
+    out.set(id, { ...(out.get(id) ?? { releaseDay: null }), pick: why, pack: why, ordoro: why });
+  }
   return out;
 }
 
@@ -344,10 +350,16 @@ async function statsFor(batchIds) {
 
 // show: "live" (still to ship) | "done" | "cancelled"
 // onlyFor: a staff member id; just the batches assigned to them
-export async function listBatches(shop, { show = "live", onlyFor = null } = {}) {
+// Batches imported from Ordoro have their own tab and stay off these lists
+// (ordoro: true lists only them)
+export async function listBatches(shop, { show = "live", onlyFor = null, ordoro = false } = {}) {
   if (show === "live") await closeFinishedBatches(shop).catch((e) => console.error(`[batches] closing finished (${shop}):`, errorMessage(e)));
   const status = show === "cancelled" ? ["cancelled"] : show === "done" ? ["done"] : LIVE;
-  let batches = await db.batch.findMany({ where: { shop, status: { in: status } }, orderBy: { number: show === "live" ? "asc" : "desc" }, take: 500 });
+  let batches = await db.batch.findMany({
+    where: { shop, status: { in: status }, source: ordoro ? ORDORO : { not: ORDORO } },
+    orderBy: { number: show === "live" ? "asc" : "desc" },
+    take: 500,
+  });
   if (onlyFor != null) batches = batches.filter((b) => isAssignedTo(b, onlyFor));
   // To ship: highest priority first, then oldest batch
   if (show === "live") batches.sort((a, b) => (b.priority ?? 1) - (a.priority ?? 1) || a.number - b.number);
@@ -372,6 +384,7 @@ export async function getBatch(shop, batchId) {
   const { packedTag } = await getShippingSettings(shop);
   return {
     ...viewBatch(b, stats.get(b.id)),
+    ordoro: await ordoroBatchInfo(shop, b),
     editable: EDITABLE.includes(b.status),
     removable: REMOVABLE.includes(b.status),
     tagIssues,

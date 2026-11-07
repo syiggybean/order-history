@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import db from "./db.server";
 import { unauthenticated } from "./shopify.server";
-import { KEY, NAMESPACE, TIERS, errorMessage, gql, syncTemplate, toDay } from "./preorders.server";
+import { KEY, NAMESPACE, TIERS, errorMessage, gql, setReleaseDate, syncTemplate, toDay } from "./preorders.server";
 import { createCampaign, getSettings, kickMail, metricsFor, storeUrl } from "./preorder-notify.server";
 
 // ---------------------------------------------------------------------------
@@ -428,6 +428,8 @@ const view = (w, now = Date.now(), metrics = null) => {
     closesAt: w.closesAt?.toISOString() ?? null,
     opensInput: toStoreInput(w.opensAt),
     closesInput: toStoreInput(w.closesAt),
+    closesRule: w.closesRule ?? null,
+    releaseDay: w.releaseDay ?? null,
     phase,
     appliedPhase: w.appliedPhase,
     limited: Boolean(limits),
@@ -505,9 +507,17 @@ const parseLimits = (input) => {
 
 // Sets times and the optional sales limit.
 // opens/closes: Pacific "YYYY-MM-DDTHH:mm" (blank = none); limits: {variantId: n} or null
-export async function saveWindow(shop, admin, id, { opens, closes, limits }, user) {
+// closesRule: "release" closes at the end of the product's release date (read
+// from Shopify now), "manual" uses `closes`, undefined leaves the rule as it is
+export async function saveWindow(shop, admin, id, { opens, closes, limits, closesRule }, user) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) throw new WindowError("That product isn't in the group anymore.");
+  let releaseDay = w.releaseDay;
+  if (closesRule === "release") {
+    releaseDay = (await releaseDays(admin, [w.productId]))[w.productId] ?? null;
+    if (!releaseDay) throw new WindowError("This product has no release date in Shopify yet, so it can't close on it. Set one, or pick a closing time.");
+    closes = toStoreInput(releaseCloseAt(releaseDay));
+  }
   const opensAt = opens ? fromStoreInput(opens) : null;
   const closesAt = closes ? fromStoreInput(closes) : null;
   if (opens && !opensAt) throw new WindowError("The opening time isn't a valid date and time.");
@@ -536,7 +546,14 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits }, use
     await writeMetafields(admin, w.productId, { opensAt, closesAt, limited: Boolean(newLimits) });
     const saved = await db.preorderWindow.update({
       where: { id: w.id },
-      data: { opensAt, closesAt, limits: newLimits ? JSON.stringify(newLimits) : null, updatedBy: user?.name ?? null },
+      data: {
+        opensAt,
+        closesAt,
+        limits: newLimits ? JSON.stringify(newLimits) : null,
+        updatedBy: user?.name ?? null,
+        ...(closesRule === "release" || closesRule === "manual" ? { closesRule } : {}),
+        releaseDay,
+      },
     });
     await enforce(admin, saved);
   } finally {
@@ -545,6 +562,109 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits }, use
   // The countdown blocks live on the "preorder" product template
   await syncTemplate(shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
   return view(await db.preorderWindow.findUnique({ where: { id: w.id } }));
+}
+
+// ---------------------------------------------------------------------------
+// Closing on the release date
+// ---------------------------------------------------------------------------
+
+const RELEASE_QUERY = `#graphql
+  query ($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Product { id metafield(namespace: "${NAMESPACE}", key: "${KEY}") { value } }
+    }
+  }`;
+
+// productId → "YYYY-MM-DD" (or null) from Shopify
+async function releaseDays(admin, productIds) {
+  const out = {};
+  for (let i = 0; i < productIds.length; i += 100) {
+    const data = await gql(admin, RELEASE_QUERY, { ids: productIds.slice(i, i + 100) });
+    for (const n of data?.nodes ?? []) if (n?.id) out[n.id] = toDay(n.metafield?.value) ?? null;
+  }
+  return out;
+}
+
+// End of the release day, store time
+export const releaseCloseAt = (day) => fromStoreInput(`${day}T23:59`);
+
+// Follows the release date: its own rule, or the shop's setting
+export const followsRelease = (w, settings) => w.closesRule === "release" || (!w.closesRule && Boolean(settings?.closeOnRelease));
+
+// Moves the closing time of every product that follows its release date to the
+// end of that date, when it has changed. Leaves alone: products not set up yet,
+// ones already closed (re-opening is a decision for the History tab), and
+// release dates already past.
+export async function syncReleaseCloses(shop, admin, { ids = null, user = null } = {}) {
+  const settings = await getSettings(shop);
+  const rows = await db.preorderWindow.findMany({ where: { shop, ...(ids ? { id: { in: ids } } : {}) } });
+  if (!rows.length) return { changed: [], problems: [] };
+  const days = await releaseDays(admin, rows.map((w) => w.productId));
+  const changed = [];
+  const problems = [];
+  for (const w of rows) {
+    const day = days[w.productId] ?? null;
+    if (day !== (w.releaseDay ?? null)) await db.preorderWindow.update({ where: { id: w.id }, data: { releaseDay: day } });
+    if (!followsRelease(w, settings) || !day) continue;
+    if (!w.opensAt && !w.closesAt) continue; // not set up: saving it would open pre-orders now
+    if (phaseOf(w) === "closed") continue;
+    const closesAt = releaseCloseAt(day);
+    if (!closesAt || closesAt <= new Date()) continue;
+    if (w.closesAt && closesAt.getTime() === new Date(w.closesAt).getTime()) continue;
+    if (w.opensAt && closesAt <= new Date(w.opensAt)) {
+      problems.push(`${w.title}: its release date (${day}) is before pre-orders open`);
+      continue;
+    }
+    if (busy.has(w.id)) continue; // next run
+    try {
+      await saveWindow(shop, admin, w.id, { opens: toStoreInput(w.opensAt), closes: toStoreInput(closesAt), limits: limitsOf(w) }, user ?? { name: "Release date" });
+      changed.push({ id: w.id, title: w.title, closes: closesAt.toISOString() });
+    } catch (e) {
+      problems.push(`${w.title}: ${e.message}`);
+    }
+  }
+  return { changed, problems };
+}
+
+// ---------------------------------------------------------------------------
+// Bulk edit: the same times, closing rule and/or release date for several products
+// opens: "" = keep; closesMode: keep | release | date | none; release: "YYYY-MM-DD" or ""
+// ---------------------------------------------------------------------------
+export async function bulkEdit(shop, admin, ids, { opens = "", closesMode = "keep", closes = "", release = "" }, user) {
+  const rows = await db.preorderWindow.findMany({ where: { shop, id: { in: ids } } });
+  if (!rows.length) throw new WindowError("Pick at least one product.");
+  if (opens && !fromStoreInput(opens)) throw new WindowError("The opening time isn't a valid date and time.");
+  if (closesMode === "date" && !fromStoreInput(closes)) throw new WindowError("The closing time isn't a valid date and time.");
+  if (release && !/^\d{4}-\d{2}-\d{2}$/.test(release)) throw new WindowError("Enter the release date as a date.");
+  if (!opens && closesMode === "keep" && !release) throw new WindowError("Nothing to change: set an opening time, a closing choice or a release date.");
+  const results = [];
+  for (const w of rows) {
+    const done = [];
+    try {
+      if (release) {
+        await setReleaseDate(admin, shop, w.productId, release, "Countdown bulk edit");
+        done.push(`release date ${release}`);
+      }
+      if (opens || closesMode !== "keep") {
+        const times = {
+          opens: opens || toStoreInput(w.opensAt),
+          closes: closesMode === "date" ? closes : closesMode === "none" ? "" : toStoreInput(w.closesAt),
+          limits: limitsOf(w),
+          closesRule: closesMode === "release" ? "release" : closesMode === "date" || closesMode === "none" ? "manual" : undefined,
+        };
+        await saveWindow(shop, admin, w.id, times, user);
+        if (opens) done.push("opening time");
+        if (closesMode !== "keep") done.push(closesMode === "release" ? "closes on its release date" : closesMode === "none" ? "no closing time" : "closing time");
+      } else if (release) {
+        // A new release date moves the closing time of products that follow it
+        await syncReleaseCloses(shop, admin, { ids: [w.id], user });
+      }
+      results.push({ id: w.id, title: w.title, ok: true, done });
+    } catch (e) {
+      results.push({ id: w.id, title: w.title, ok: false, done, error: e?.message ?? String(e) });
+    }
+  }
+  return results;
 }
 
 // Kept for older callers
@@ -758,10 +878,24 @@ export async function searchProducts(shop, admin, text) {
 // "closing soon" reminder.
 // ---------------------------------------------------------------------------
 
+const lastReleaseSync = new Map(); // shop → time of the last release-date check
+const RELEASE_SYNC_MS = 60 * 60 * 1000;
+
 export async function checkWindows(now = Date.now()) {
   const rows = await db.preorderWindow.findMany({
     where: { OR: [{ opensAt: { not: null } }, { closesAt: { not: null } }] },
   });
+  // Release dates change in Shopify: hourly, move closing times that follow them
+  for (const shop of new Set(rows.map((w) => w.shop))) {
+    if (now - (lastReleaseSync.get(shop) ?? 0) < RELEASE_SYNC_MS) continue;
+    lastReleaseSync.set(shop, now);
+    try {
+      const { admin } = await unauthenticated.admin(shop);
+      await syncReleaseCloses(shop, admin);
+    } catch (e) {
+      console.error(`[preorder-windows] release dates ${shop}:`, errorMessage(e));
+    }
+  }
   for (const w of rows) {
     if (busy.has(w.id)) continue;
     const phase = phaseOf(w, now);

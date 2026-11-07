@@ -354,7 +354,7 @@ export async function packQueue(shop, batchId, { debug = false } = {}) {
       unlabelled: rows.filter((r) => ["batched", "packed"].includes(r.state) && r.labelStatus !== "bought").length,
       labelled: rows.filter((r) => r.labelStatus === "bought").length,
     },
-    batch: { id: b.id, tag: b.tag, name: b.name, status: b.status, number: b.number, assignees: json(b.assignees, []), packStartedAt: b.packStartedAt?.toISOString() ?? null, packDoneAt: b.packDoneAt?.toISOString() ?? null },
+    batch: { id: b.id, tag: b.tag, name: b.name, status: b.status, number: b.number, source: b.source, assignees: json(b.assignees, []), packStartedAt: b.packStartedAt?.toISOString() ?? null, packDoneAt: b.packDoneAt?.toISOString() ?? null },
     boxes,
     totals: { shipments: boxes.length, packed: boxes.filter((x) => x.state !== "batched").length },
     canPack: PACKABLE.includes(b.status),

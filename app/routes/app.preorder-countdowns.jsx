@@ -6,6 +6,7 @@ import { NoAccess } from "../components/NoAccess";
 import {
   WindowError,
   addProduct,
+  bulkEdit,
   listLocations,
   listWindows,
   removeProduct,
@@ -13,6 +14,7 @@ import {
   saveWindow,
   searchProducts,
   sellingLocation,
+  syncReleaseCloses,
   windowVariants,
 } from "../preorder-windows.server";
 import { NotifyError, getSettings, recentSends, saveSettings, sendTestEmail } from "../preorder-notify.server";
@@ -22,6 +24,8 @@ export const loader = async ({ request }) => {
   const { session, admin, user, noAccess } = await loadWithAccess(request, "preorders", "view");
   if (noAccess) return { noAccess: true };
   const shop = session.shop;
+  // Closing times that follow release dates catch up with Shopify first
+  const releaseSync = await syncReleaseCloses(shop, admin).catch((e) => ({ changed: [], problems: [`Couldn't read release dates: ${e?.message ?? e}`] }));
   const [windows, settings, mail, sends, locations] = await Promise.all([
     listWindows(shop),
     getSettings(shop),
@@ -37,7 +41,9 @@ export const loader = async ({ request }) => {
       reminderHours: settings.reminderHours,
       fromName: settings.fromName ?? "",
       locationId: settings.locationId ?? "",
+      closeOnRelease: settings.closeOnRelease,
     },
+    releaseProblems: releaseSync.problems,
     locations: locations.map((l) => ({ id: l.id, name: l.name, online: l.fulfillsOnlineOrders })),
     mail,
     sends,
@@ -54,6 +60,8 @@ const NEEDS = {
   reopen: "manage",
   settings: "manage",
   testEmail: "manage",
+  bulk: "manage",
+  closeOnRelease: "manage",
 };
 
 export const action = async ({ request }) => {
@@ -83,10 +91,36 @@ export const action = async ({ request }) => {
         shop,
         admin,
         id,
-        { opens: String(form.get("opens") ?? ""), closes: String(form.get("closes") ?? ""), limits },
+        {
+          opens: String(form.get("opens") ?? ""),
+          closes: String(form.get("closes") ?? ""),
+          limits,
+          closesRule: ["release", "manual"].includes(String(form.get("closesRule"))) ? String(form.get("closesRule")) : undefined,
+        },
         user,
       );
       return { intent, ok: true, id };
+    }
+    if (intent === "bulk") {
+      const ids = JSON.parse(String(form.get("ids") ?? "[]")).map(Number).filter(Boolean);
+      const results = await bulkEdit(
+        shop,
+        admin,
+        ids,
+        {
+          opens: String(form.get("opens") ?? ""),
+          closesMode: String(form.get("closesMode") ?? "keep"),
+          closes: String(form.get("closes") ?? ""),
+          release: String(form.get("release") ?? ""),
+        },
+        user,
+      );
+      return { intent, ok: true, results };
+    }
+    if (intent === "closeOnRelease") {
+      await saveSettings(shop, { closeOnRelease: form.get("on") === "true" });
+      const sync = await syncReleaseCloses(shop, admin, { user });
+      return { intent, ok: true, changed: sync.changed.length, problems: sync.problems };
     }
     if (intent === "reopen") {
       await reopenWindow(
@@ -139,7 +173,16 @@ const cell = { padding: "8px 10px", borderBottom: "1px solid #ebebeb", textAlign
 const head = { ...cell, fontWeight: 600, background: "#f7f7f7", position: "sticky", top: 0, zIndex: 1, whiteSpace: "nowrap" };
 const muted = { color: "#616161" };
 const small = { fontSize: "12px", color: "#616161" };
-const box = { overflow: "auto", border: "1px solid #e3e3e3", borderRadius: "8px" };
+// Scrolls inside its own frame, so the sideways scrollbar is always on screen
+const box = { overflow: "auto", border: "1px solid #e3e3e3", borderRadius: "8px", maxHeight: "calc(100vh - 200px)" };
+// The product (left) and actions (right) stay put while scrolling sideways
+const stickL = { position: "sticky", left: 0, background: "#fff", zIndex: 1, boxShadow: "1px 0 0 #ebebeb" };
+const stickR = { position: "sticky", right: 0, background: "#fff", zIndex: 1, boxShadow: "-1px 0 0 #ebebeb" };
+// Tick-box column: a fixed width, so the sticky product column sits right against it
+const CHECK_W = 38;
+const checkCol = { width: `${CHECK_W}px`, minWidth: `${CHECK_W}px`, maxWidth: `${CHECK_W}px`, boxSizing: "border-box", padding: "8px 0 8px 12px", boxShadow: "none" };
+const fmtDay = (day) =>
+  day ? new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }) : null;
 const input = { font: "inherit", padding: "5px 8px", borderRadius: "8px", border: "1px solid #c9c9c9" };
 const thumb = { width: "36px", height: "36px", objectFit: "cover", borderRadius: "6px", background: "#f1f1f1", flexShrink: 0 };
 const num = { fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" };
@@ -284,11 +327,14 @@ function Field({ label, children }) {
 // Open & upcoming
 // ---------------------------------------------------------------------------
 
-function EditPanel({ w, colSpan, onDone }) {
+const follows = (w, closeOnRelease) => w.closesRule === "release" || (!w.closesRule && Boolean(closeOnRelease));
+
+function EditPanel({ w, colSpan, onDone, closeOnRelease }) {
   const save = useFetcher();
   const variants = useFetcher();
   const [opens, setOpens] = useState(w.opensInput);
   const [closes, setCloses] = useState(w.closesInput);
+  const [onRelease, setOnRelease] = useState(Boolean(w.releaseDay) && follows(w, closeOnRelease));
   const [limited, setLimited] = useState(w.limited);
   const [limits, setLimits] = useState({});
   const busy = save.state !== "idle";
@@ -305,7 +351,7 @@ function EditPanel({ w, colSpan, onDone }) {
   }, [save.data]);
 
   const submit = () => {
-    const payload = { intent: "save", id: String(w.id), opens, closes };
+    const payload = { intent: "save", id: String(w.id), opens, closes: onRelease ? "" : closes, closesRule: onRelease ? "release" : "manual" };
     if (limited) {
       const missing = list.some((v) => limits[v.id] === "" || limits[v.id] == null);
       if (missing) return alertLater("Enter a limit for every variant, or untick “Limit pre-orders”.");
@@ -320,13 +366,28 @@ function EditPanel({ w, colSpan, onDone }) {
   return (
     <tr>
       <td style={{ ...cell, background: "#fafafa" }} colSpan={colSpan}>
+        {/* Stays in view however far the table is scrolled sideways */}
+        <div style={{ position: "sticky", left: "10px", maxWidth: "calc(100vw - 120px)" }}>
         <div style={{ display: "flex", gap: "14px", alignItems: "flex-end", flexWrap: "wrap" }}>
           <Field label="Pre-orders open (Pacific)">
             <input type="datetime-local" value={opens} onChange={(e) => setOpens(e.target.value)} style={input} />
           </Field>
           <Field label="Pre-orders close (optional)">
-            <input type="datetime-local" value={closes} onChange={(e) => setCloses(e.target.value)} style={input} />
+            <input
+              type="datetime-local"
+              value={onRelease ? `${w.releaseDay}T23:59` : closes}
+              onChange={(e) => setCloses(e.target.value)}
+              style={{ ...input, ...(onRelease ? { background: "#f1f1f1", color: "#616161" } : {}) }}
+              disabled={onRelease}
+            />
           </Field>
+          <label
+            style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "13px", paddingBottom: "6px" }}
+            title={w.releaseDay ? "" : "This product has no release date in Shopify yet"}
+          >
+            <input type="checkbox" checked={onRelease} disabled={!w.releaseDay} onChange={(e) => (setOnRelease(e.target.checked), setLocalError(null))} />
+            {w.releaseDay ? `Close at the end of its release date (${fmtDay(w.releaseDay)})` : "Close on its release date (no release date set)"}
+          </label>
           <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "13px", paddingBottom: "6px" }}>
             <input type="checkbox" checked={limited} onChange={(e) => (setLimited(e.target.checked), setLocalError(null))} />
             Limit pre-orders
@@ -372,30 +433,44 @@ function EditPanel({ w, colSpan, onDone }) {
           </s-button>
         </div>
         {error && <div style={{ color: "#b42318", marginTop: "8px" }}>{error}</div>}
+        </div>
       </td>
     </tr>
   );
 }
 
-const OPEN_COLUMNS = ["Product", "Opens", "Closes", "Status", "Stock", "Sign-ups", "Emails", "From emails", "Sold"];
+const OPEN_COLUMNS = ["Product", "Opens", "Closes", "Release date", "Status", "Stock", "Sign-ups", "Emails", "From emails", "Sold"];
 
-function OpenRow({ w, now, canManage }) {
+function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect }) {
   const fetcher = useFetcher();
   const [editing, setEditing] = useState(!w.opensAt && !w.closesAt && canManage);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const busy = fetcher.state !== "idle";
-  const colSpan = OPEN_COLUMNS.length + (canManage ? 1 : 0);
+  const colSpan = OPEN_COLUMNS.length + (canManage ? 2 : 0);
   const m = w.metrics;
 
   return (
     <>
       <tr className="pc-rise" style={{ opacity: fetcher.formData?.get("intent") === "remove" ? 0.4 : 1 }}>
-        <td style={cell}>
+        {canManage && (
+          <td style={{ ...cell, ...stickL, ...checkCol }}>
+            <input type="checkbox" aria-label={`Select ${w.title}`} checked={selected} onChange={(e) => onSelect(e.target.checked)} />
+          </td>
+        )}
+        <td style={{ ...cell, ...stickL, left: canManage ? `${CHECK_W}px` : 0 }}>
           <ProductCell {...w} />
           {w.lastError && <div style={{ color: "#b42318", fontSize: "12px", marginTop: "4px" }}>Couldn't update Shopify: {w.lastError}</div>}
         </td>
         <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtStore(w.opensAt)}</td>
-        <td style={{ ...cell, whiteSpace: "nowrap" }}>{w.closesAt ? fmtStore(w.closesAt) : <span style={muted}>No end</span>}</td>
+        <td style={{ ...cell, whiteSpace: "nowrap" }}>
+          {w.closesAt ? fmtStore(w.closesAt) : <span style={muted}>No end</span>}
+          {follows(w, closeOnRelease) && w.releaseDay && (
+            <div>
+              <span style={pill("#eef3ff", "#1c4a9c")}>On release date</span>
+            </div>
+          )}
+        </td>
+        <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDay(w.releaseDay) ?? <span style={muted}>Not set</span>}</td>
         <td style={cell}>
           <Status w={w} now={now} />
         </td>
@@ -413,7 +488,8 @@ function OpenRow({ w, now, canManage }) {
           <Sold m={m} />
         </td>
         {canManage && (
-          <td style={{ ...cell, textAlign: "right", whiteSpace: "nowrap" }}>
+          <td style={{ ...cell, ...stickR, textAlign: "right", whiteSpace: "nowrap" }}>
+            <span style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
             {!editing && (
               <s-button variant="tertiary" onClick={() => setEditing(true)}>
                 Edit
@@ -438,36 +514,69 @@ function OpenRow({ w, now, canManage }) {
                 Remove
               </s-button>
             )}
+            </span>
             {fetcher.data?.error && <div style={{ color: "#b42318", fontSize: "12px" }}>{fetcher.data.error}</div>}
           </td>
         )}
       </tr>
-      {editing && canManage && <EditPanel w={w} colSpan={colSpan} onDone={() => setEditing(false)} />}
+      {editing && canManage && <EditPanel w={w} colSpan={colSpan} closeOnRelease={closeOnRelease} onDone={() => setEditing(false)} />}
     </>
   );
 }
 
-function OpenTab({ windows, now, canManage }) {
+function OpenTab({ windows, now, canManage, settings, releaseProblems }) {
+  const [selected, setSelected] = useState(() => new Set());
+  const ids = windows.map((w) => w.id);
+  const picked = ids.filter((id) => selected.has(id));
+  const all = ids.length > 0 && picked.length === ids.length;
+  const toggle = (id, on) =>
+    setSelected((cur) => {
+      const next = new Set(cur);
+      on ? next.add(id) : next.delete(id);
+      return next;
+    });
+  const closeOnRelease = settings?.closeOnRelease;
   return (
     <>
       <s-section heading="Open and upcoming">
+        <CloseOnReleaseSetting on={Boolean(closeOnRelease)} canManage={canManage} problems={releaseProblems} />
+        {canManage && picked.length > 0 && <BulkBar windows={windows.filter((w) => selected.has(w.id))} onDone={() => setSelected(new Set())} />}
         {windows.length === 0 ? (
           <s-paragraph>Nothing scheduled. Add products below.</s-paragraph>
         ) : (
           <div style={box}>
-            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
+            <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: "13px" }}>
               <thead>
                 <tr>
-                  {[...OPEN_COLUMNS, ...(canManage ? [""] : [])].map((h, i) => (
-                    <th key={i} style={head}>
+                  {canManage && (
+                    <th style={{ ...head, ...stickL, ...checkCol, background: "#f7f7f7", zIndex: 3 }}>
+                      <input
+                        type="checkbox"
+                        aria-label="Select all"
+                        checked={all}
+                        onChange={(e) => setSelected(e.target.checked ? new Set(ids) : new Set())}
+                      />
+                    </th>
+                  )}
+                  {OPEN_COLUMNS.map((h, i) => (
+                    <th key={h} style={i === 0 ? { ...head, ...stickL, background: "#f7f7f7", zIndex: 3, left: canManage ? `${CHECK_W}px` : 0 } : head}>
                       {h}
                     </th>
                   ))}
+                  {canManage && <th style={{ ...head, ...stickR, background: "#f7f7f7", zIndex: 3 }} />}
                 </tr>
               </thead>
               <tbody>
                 {windows.map((w) => (
-                  <OpenRow key={w.id} w={w} now={now} canManage={canManage} />
+                  <OpenRow
+                    key={w.id}
+                    w={w}
+                    now={now}
+                    canManage={canManage}
+                    closeOnRelease={closeOnRelease}
+                    selected={selected.has(w.id)}
+                    onSelect={(on) => toggle(w.id, on)}
+                  />
                 ))}
               </tbody>
             </table>
@@ -829,6 +938,119 @@ function EmailsTab({ windows, settings, locations, mail, sends, canManage, staff
 // Adding products
 // ---------------------------------------------------------------------------
 
+// Shop-wide: countdowns close at the end of each product's release date
+function CloseOnReleaseSetting({ on, canManage, problems }) {
+  const f = useFetcher();
+  const busy = f.state !== "idle";
+  const value = busy ? f.formData.get("on") === "true" : on;
+  return (
+    <div style={{ marginBottom: "12px" }}>
+      <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+        <input
+          type="checkbox"
+          checked={value}
+          disabled={!canManage || busy}
+          onChange={(e) => f.submit({ intent: "closeOnRelease", on: String(e.target.checked) }, { method: "post" })}
+          style={{ marginTop: "2px" }}
+        />
+        <span>
+          <strong>Close pre-orders on the release date</strong>
+          <span style={{ ...small, display: "block" }}>
+            Each countdown closes at 11:59 PM PT on its product's release date, and moves when that date changes in Shopify
+            (checked hourly and whenever this page loads). Products given their own closing time in Edit keep it.
+          </span>
+        </span>
+      </label>
+      {f.data?.intent === "closeOnRelease" && f.data.ok && (
+        <div style={{ ...small, color: "#1a5e20", marginTop: "4px" }}>
+          {f.data.changed ? `${f.data.changed} closing time${f.data.changed === 1 ? "" : "s"} moved to the release date.` : "Saved."}
+        </div>
+      )}
+      {(f.data?.problems ?? problems ?? []).length > 0 && (
+        <div style={{ ...small, color: "#b42318", marginTop: "4px" }}>
+          {(f.data?.problems ?? problems).map((p) => (
+            <div key={p}>{p}</div>
+          ))}
+        </div>
+      )}
+      {f.data?.error && <div style={{ ...small, color: "#b42318" }}>{f.data.error}</div>}
+    </div>
+  );
+}
+
+// The same opening time, closing choice and/or release date for every ticked product
+function BulkBar({ windows, onDone }) {
+  const f = useFetcher();
+  const [opens, setOpens] = useState("");
+  const [closesMode, setClosesMode] = useState("keep");
+  const [closes, setCloses] = useState("");
+  const [release, setRelease] = useState("");
+  const busy = f.state !== "idle";
+  const results = f.data?.intent === "bulk" ? f.data.results : null;
+  const failed = results?.filter((r) => !r.ok) ?? [];
+  const nothing = !opens && closesMode === "keep" && !release;
+  const n = windows.length;
+  const apply = () =>
+    f.submit(
+      { intent: "bulk", ids: JSON.stringify(windows.map((w) => w.id)), opens, closesMode, closes: closesMode === "date" ? closes : "", release },
+      { method: "post" },
+    );
+  useEffect(() => {
+    if (results && !failed.length) onDone();
+  }, [f.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <div style={{ position: "sticky", top: 0, zIndex: 4, background: "#fff8fa", border: `1px solid ${PINK}`, borderRadius: "10px", padding: "10px 12px", marginBottom: "10px" }}>
+      <div style={{ fontWeight: 700, marginBottom: "8px" }}>
+        Change {n} product{n === 1 ? "" : "s"} at once <span style={{ ...small, fontWeight: 400 }}>· blank fields stay as they are</span>
+      </div>
+      <div style={{ display: "flex", gap: "14px", alignItems: "flex-end", flexWrap: "wrap" }}>
+        <Field label="Pre-orders open (Pacific)">
+          <input type="datetime-local" aria-label="Bulk opening time" value={opens} onChange={(e) => setOpens(e.target.value)} style={input} />
+        </Field>
+        <Field label="Pre-orders close">
+          <select aria-label="Bulk closing" value={closesMode} onChange={(e) => setClosesMode(e.target.value)} style={input}>
+            <option value="keep">Keep as is</option>
+            <option value="release">On each one's release date</option>
+            <option value="date">At this time…</option>
+            <option value="none">No closing time</option>
+          </select>
+        </Field>
+        {closesMode === "date" && (
+          <Field label="Closing time (Pacific)">
+            <input type="datetime-local" aria-label="Bulk closing time" value={closes} onChange={(e) => setCloses(e.target.value)} style={input} />
+          </Field>
+        )}
+        <Field label="Release date (in Shopify)">
+          <input type="date" aria-label="Bulk release date" value={release} onChange={(e) => setRelease(e.target.value)} style={input} />
+        </Field>
+        <s-button variant="primary" onClick={apply} disabled={nothing || (closesMode === "date" && !closes) || undefined} {...(busy ? { loading: true } : {})}>
+          Apply to {n}
+        </s-button>
+        <s-button variant="tertiary" onClick={onDone}>
+          Clear selection
+        </s-button>
+      </div>
+      {release && (
+        <div style={{ ...small, marginTop: "6px" }}>
+          Setting a release date also updates each product's GT tag, shipping profile and template, like changing it anywhere else in the app.
+        </div>
+      )}
+      {f.data?.intent === "bulk" && f.data.error && <div style={{ color: "#b42318", marginTop: "8px" }}>{f.data.error}</div>}
+      {failed.length > 0 && (
+        <div style={{ color: "#b42318", marginTop: "8px", fontSize: "13px" }}>
+          {results.length - failed.length} updated. Not updated:
+          {failed.map((r) => (
+            <div key={r.id}>
+              {r.title}: {r.error}
+              {r.done.length > 0 && <span style={small}> (done first: {r.done.join(", ")})</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AddProducts({ canManage }) {
   const search = useFetcher();
   const add = useFetcher();
@@ -985,7 +1207,7 @@ function Page() {
   });
 
   return (
-    <s-page heading="Pre-order countdowns">
+    <s-page heading="Pre-order countdowns" inlineSize="large">
       <style>{MOTION_CSS}</style>
       <div role="tablist" style={{ display: "flex", gap: "4px", borderBottom: "1px solid #e3e3e3", marginBottom: "14px", flexWrap: "wrap" }}>
         {TABS.map((t) => (
@@ -1003,7 +1225,7 @@ function Page() {
         ))}
       </div>
 
-      {tab === "open" && <OpenTab windows={current} now={now} canManage={canManage} />}
+      {tab === "open" && <OpenTab windows={current} now={now} canManage={canManage} settings={data.settings} releaseProblems={data.releaseProblems} />}
       {tab === "history" && <HistoryTab windows={closed} canManage={canManage} />}
       {tab === "emails" && <EmailsTab {...data} />}
     </s-page>

@@ -42,6 +42,7 @@ export async function saveSettings(shop, input) {
       reminderHours: n(input.reminderHours, 0, 24 * 14, current.reminderHours),
       fromName: input.fromName != null ? String(input.fromName).trim().slice(0, 80) || null : current.fromName,
       ...(input.locationId !== undefined ? { locationId: input.locationId || null } : {}),
+      ...(input.closeOnRelease !== undefined ? { closeOnRelease: Boolean(input.closeOnRelease) } : {}),
     },
   });
 }
