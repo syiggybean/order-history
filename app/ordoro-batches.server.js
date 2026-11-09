@@ -246,6 +246,23 @@ async function tidyPreBatches(shop, batch, ids, user) {
   }
 }
 
+// A batch marked Done (or Packed) that still has orders to work: back to work.
+// (Imports before the fix could be closed partway through, while orders came in.)
+async function reopenIfUnfinished(shop, batchId, user = null) {
+  const b = await db.batch.findUnique({ where: { id: batchId } });
+  if (!b || !["done", "packed"].includes(b.status)) return false;
+  const rows = await db.shipment.groupBy({ by: ["state"], where: { batchId }, _count: { _all: true } });
+  const n = (states) => rows.filter((r) => states.includes(r.state)).reduce((t, r) => t + r._count._all, 0);
+  const toPack = n(["batched"]);
+  const toShip = n(["packed", "labeling"]);
+  if (!toPack && !toShip) return false;
+  const status = toPack ? (b.flow || n(["packed", "labeling", "shipped"]) ? "packing" : "open") : "packed";
+  if (status === b.status) return false;
+  await db.batch.update({ where: { id: b.id }, data: { status, ...(toPack ? { packDoneAt: null } : {}) } });
+  await logEvent(shop, { batchId: b.id, type: "batch_reopened", detail: `${b.tag}: ${toPack} still to pack${toShip ? `, ${toShip} to label` : ""}, so it's back to ${status}`, user: user ?? { name: null } });
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Importing (a background job per shop)
 // ---------------------------------------------------------------------------
@@ -266,7 +283,14 @@ async function createBatch(shop, ob, user) {
       name: ob.notes ? String(ob.notes).slice(0, 80) : `Ordoro ${ob.ref}`,
       source: SOURCE,
       externalRef: ob.ref,
-      externalInfo: JSON.stringify({ ref: ob.ref, orders: ob.orderNumbers.length, createdAt: ob.createdAt, importedAt: new Date().toISOString(), importedBy: user?.name ?? null }),
+      externalInfo: JSON.stringify({
+        ref: ob.ref,
+        orders: ob.orderNumbers.length,
+        createdAt: ob.createdAt,
+        importedAt: new Date().toISOString(),
+        importedBy: user?.name ?? null,
+        importingSince: new Date().toISOString(), // not closed as "done" while its orders come in
+      }),
       createdBy: user?.name ?? null,
     },
   });
@@ -278,6 +302,11 @@ export async function importBatch(shop, admin, ob, user, step = () => {}) {
   const fresh = !batch;
   if (fresh) batch = await createBatch(shop, ob, user);
   else if (batch.status === "cancelled") return { batch, skipped: true };
+  else
+    batch = await db.batch.update({
+      where: { id: batch.id },
+      data: { externalInfo: JSON.stringify({ ...json(batch.externalInfo, {}), importingSince: new Date().toISOString() }) },
+    });
   const sOrders = await shopifyOrders(admin, [...new Set(ob.orderNumbers.map((n) => `#${orderDigits(n) ?? n}`))]);
   const movedFrom = new Set(); // pre-batches that gave up orders to this one
   let i = 0;
@@ -291,11 +320,12 @@ export async function importBatch(shop, admin, ob, user, step = () => {}) {
     await sleep(testing() ? 0 : 130); // Ordoro allows 500 requests a minute
   }
   await tidyPreBatches(shop, batch, movedFrom, user);
-  const info = json(batch.externalInfo, {});
+  const { importingSince, ...info } = json((await db.batch.findUnique({ where: { id: batch.id } })).externalInfo, {});
   await db.batch.update({
     where: { id: batch.id },
     data: { externalInfo: JSON.stringify({ ...info, orders: ob.orderNumbers.length, refreshedAt: new Date().toISOString(), refreshedBy: user?.name ?? null }) },
   });
+  await reopenIfUnfinished(shop, batch.id, user);
   await logEvent(shop, { batchId: batch.id, type: fresh ? "ordoro_batch_imported" : "ordoro_batch_refreshed", detail: `${batch.tag} ${fresh ? "imported from" : "refreshed from"} Ordoro batch ${ob.ref} (${ob.orderNumbers.length} orders)`, user });
   return { batch, fresh };
 }
@@ -427,6 +457,10 @@ export async function ordoroBatchInfo(shop, batch) {
 // The Ordoro tab: the imported batches with their counts and locks
 // onlyFor: a staff member id ("Only their assigned batches"): just theirs
 export async function listOrdoroBatches(shop, { onlyFor = null } = {}) {
+  // Put right any batch closed while it was still being imported
+  for (const b of await db.batch.findMany({ where: { shop, source: SOURCE, status: { in: ["done", "packed"] } }, select: { id: true } })) {
+    await reopenIfUnfinished(shop, b.id).catch((e) => console.error("[ordoro-batches] reopen:", errorMessage(e)));
+  }
   let batches = await db.batch.findMany({ where: { shop, source: SOURCE }, orderBy: { number: "desc" }, take: 500 });
   if (onlyFor != null) batches = batches.filter((b) => json(b.assignees, []).some((a) => a.id === Number(onlyFor)));
   const ids = batches.map((b) => b.id);

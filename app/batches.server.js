@@ -352,12 +352,12 @@ async function statsFor(batchIds) {
 // show: "live" (still to ship) | "done" | "cancelled"
 // onlyFor: a staff member id; just the batches assigned to them
 // Batches imported from Ordoro have their own tab and stay off these lists
-// (ordoro: true lists only them)
+// (ordoro: true lists only them; "too" lists them alongside, e.g. someone's own batches)
 export async function listBatches(shop, { show = "live", onlyFor = null, ordoro = false } = {}) {
   if (show === "live") await closeFinishedBatches(shop).catch((e) => console.error(`[batches] closing finished (${shop}):`, errorMessage(e)));
   const status = show === "cancelled" ? ["cancelled"] : show === "done" ? ["done"] : LIVE;
   let batches = await db.batch.findMany({
-    where: { shop, status: { in: status }, source: ordoro ? ORDORO : { not: ORDORO } },
+    where: { shop, status: { in: status }, ...(ordoro === "too" ? {} : { source: ordoro ? ORDORO : { not: ORDORO } }) },
     orderBy: { number: show === "live" ? "asc" : "desc" },
     take: 500,
   });
@@ -1062,8 +1062,21 @@ export async function exportBins(shop) {
 // Batches whose orders have all left (shipped, or fulfilled/cancelled in Shopify or
 // another app, e.g. labels bought on Shopify's own pages): Shipped, or Cancelled
 // if none of them shipped. Runs after every refresh and when the Batches tab opens.
+// An Ordoro import marks its batch while it adds the orders (for up to 30 minutes, in case it stopped)
+const importing = (b) => {
+  if (b.source !== ORDORO || !b.externalInfo) return false;
+  try {
+    const since = JSON.parse(b.externalInfo).importingSince;
+    return Boolean(since) && Date.now() - Date.parse(since) < 30 * 60 * 1000;
+  } catch {
+    return false;
+  }
+};
+
 export async function closeFinishedBatches(shop) {
-  const live = await db.batch.findMany({ where: { shop, status: { in: LIVE } }, select: { id: true, tag: true, status: true, packDoneAt: true } });
+  const live = (
+    await db.batch.findMany({ where: { shop, status: { in: LIVE } }, select: { id: true, tag: true, status: true, packDoneAt: true, source: true, externalInfo: true } })
+  ).filter((b) => !importing(b)); // an Ordoro batch still coming in isn't finished, whatever it holds so far
   if (!live.length) return [];
   const rows = await db.shipment.groupBy({ by: ["batchId", "state"], where: { shop, batchId: { in: live.map((b) => b.id) } }, _count: { _all: true } });
   const counts = new Map();

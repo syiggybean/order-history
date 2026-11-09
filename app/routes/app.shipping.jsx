@@ -178,7 +178,8 @@ export const loader = async ({ request }) => {
         : null,
     tab === "settings" ? recentEvents(shop, 60) : null,
     tab === "batches" && !batchId && !hiddenBatch
-      ? listBatches(shop, { show: params.get("show") || "live", onlyFor: restricted || mine ? user.id : null })
+      ? // Someone's own batches ("Only mine", or only-assigned staff): their Ordoro batches too
+        listBatches(shop, { show: params.get("show") || "live", onlyFor: restricted || mine ? user.id : null, ordoro: restricted || mine ? "too" : false })
       : null,
     batchId && !view ? getBatch(shop, batchId) : null,
     batchId && view === "pick" ? pickList(shop, batchId) : null,
