@@ -103,6 +103,19 @@ export function PickList({ data, canPick, lock = null }) {
   const pct = units ? Math.round((picked / units) * 100) : 0;
   const short = finish.data?.intent === "finishPicking" && finish.data.short ? finish.data.short : null;
 
+  // Flow mode: no batch pick list; each package is picked on the Pack page
+  if (batch.flow)
+    return (
+      <s-section>
+        <s-banner tone="info" heading={`${batch.tag} is in Flow mode`}>
+          <s-paragraph>Each package is picked, packed and labelled in turn, so there's no pick list for the whole batch.</s-paragraph>
+          <s-button variant="primary" onClick={() => go({ view: "pack" }, { replace: false })}>
+            Go to Flow mode
+          </s-button>
+        </s-banner>
+      </s-section>
+    );
+
   return (
     <s-section>
       <style>{PRINT_CSS}</style>

@@ -12,10 +12,14 @@ import { getShippingSettings, logEvent, syncOrder } from "./shipping.server";
 //   shipped in Ordoro and fulfilled in Shopify → shipped
 //   not shipped, ready in MonkeyBean            → in the batch, not picked yet
 //     (Ordoro doesn't report picking or packing)
+//   not shipped, waiting in MonkeyBean          → in the batch as a pre-batch:
+//     picking waits for the release date (or Pick early), like batching ahead
+// Ordoro takes precedence over MonkeyBean's own pre-batches: an order sitting in
+// one (not yet packed) moves to the Ordoro batch; a pre-batch left empty is cancelled.
 //   shipped in Ordoro, NOT fulfilled in Shopify → flagged, and the batch is
 //     locked (no picking, packing, labels…) until each is reconciled
-// Anything else that doesn't line up (already in another batch, waiting,
-// not found, cancelled) is noted on the batch without locking it.
+// Anything else that doesn't line up (already in another batch, not found,
+// cancelled) is noted on the batch without locking it.
 // ---------------------------------------------------------------------------
 
 export class OrdoroBatchError extends Error {}
@@ -34,7 +38,11 @@ export const ISSUE_KINDS = {
   not_found: { label: "Not found in Shopify", blocking: false },
   cancelled: { label: "Cancelled", blocking: false },
   in_work: { label: "Already being worked", blocking: false },
+  moved: { label: "Moved from a pre-batch", blocking: false },
 };
+
+// MonkeyBean's pre-batches (auto-batched ahead of a release): Ordoro's batch wins
+const isPreBatch = (b) => Boolean(b?.source?.startsWith("auto:release:"));
 
 // ---------------------------------------------------------------------------
 // Reading Ordoro
@@ -130,7 +138,7 @@ function matchShipments(shipments, o) {
 
 // Works out (and applies) one Ordoro order's shipments for the batch.
 // Returns the notes it left: [{ kind, shipmentId, detail, tracking }]
-async function applyOrder(shop, admin, batch, number, o, sOrder, user) {
+async function applyOrder(shop, admin, batch, number, o, sOrder, user, movedFrom = new Set()) {
   const notes = [];
   const note = (kind, detail, extra = {}) => notes.push({ kind, detail, shipmentId: null, tracking: null, ...extra });
   if (!o) {
@@ -164,9 +172,16 @@ async function applyOrder(shop, admin, batch, number, o, sOrder, user) {
 
   for (const s of shipments) {
     const fulfilled = SHIPPED.includes(s.state) || sOrder.foStatus.get(s.fulfillmentOrderId) === "CLOSED";
-    const elsewhere = s.batchId && s.batchId !== batch.id ? await db.batch.findUnique({ where: { id: s.batchId }, select: { tag: true, status: true } }) : null;
-    const otherLive = elsewhere && elsewhere.status !== "cancelled";
+    const elsewhere = s.batchId && s.batchId !== batch.id ? await db.batch.findUnique({ where: { id: s.batchId }, select: { id: true, tag: true, status: true, source: true, pickedAt: true } }) : null;
     const part = s.partCount > 1 ? ` (part ${s.partIndex} of ${s.partCount})` : "";
+    // In a MonkeyBean pre-batch and not packed yet: comes here instead
+    const fromPre = Boolean(elsewhere && elsewhere.status !== "cancelled" && isPreBatch(elsewhere) && s.state === "batched");
+    if (fromPre) {
+      const started = elsewhere.status !== "open" || elsewhere.pickedAt;
+      note("moved", `${name}${part} moved here from ${elsewhere.tag} (a pre-batch)${started ? `; picking had started there, so check ${elsewhere.tag}'s tote for its items` : ""}.`, { shipmentId: s.id });
+      movedFrom.add(elsewhere.id);
+    }
+    const otherLive = elsewhere && elsewhere.status !== "cancelled" && !fromPre;
     if (o.shipped && !fulfilled) {
       // Shipped in Ordoro but open in Shopify: the batch holds it and is locked
       note("shipped_unfulfilled", `${name}${part} shipped in Ordoro${tracking ? ` (tracking ${tracking})` : ""}, but it's not fulfilled in Shopify.`, { shipmentId: s.id, tracking });
@@ -183,10 +198,9 @@ async function applyOrder(shop, admin, batch, number, o, sOrder, user) {
     // Not shipped anywhere: it's still to do
     if (otherLive) {
       note("other_batch", `${name}${part} is already in ${elsewhere.tag}; left there.`, { shipmentId: s.id });
-    } else if (s.state === "ready" || (s.state === "batched" && s.batchId === batch.id)) {
+    } else if (["ready", "waiting"].includes(s.state) || fromPre || (s.state === "batched" && s.batchId === batch.id)) {
+      // Waiting ones are pre-batched: in the batch now, picked once released
       await db.shipment.update({ where: { id: s.id }, data: { batchId: batch.id, state: "batched", flag: null } });
-    } else if (s.state === "waiting") {
-      note("waiting", `${name}${part} is waiting in MonkeyBean${s.waitingReason ? `: ${s.waitingReason}` : ""}. Left out of the batch.`, { shipmentId: s.id });
     } else if (s.batchId === batch.id) {
       // packed etc. in this batch already (re-import): leave as it is
     } else {
@@ -214,6 +228,21 @@ async function saveNotes(shop, batch, number, { notes, orderName, orderId }) {
     const data = { orderName, orderId, shipmentId: n.shipmentId, kind: n.kind, blocking: ISSUE_KINDS[n.kind]?.blocking ?? false, detail: n.detail, tracking: n.tracking };
     if (same) await db.ordoroBatchIssue.update({ where: { id: same.id }, data: { ...data, status: "open", resolvedAt: null, resolvedBy: null } });
     else await db.ordoroBatchIssue.create({ data: { shop, batchId: batch.id, orderNumber: number, ...data } });
+  }
+}
+
+// Pre-batches that gave orders up: logged; cancelled when nothing is left in them
+async function tidyPreBatches(shop, batch, ids, user) {
+  for (const id of ids) {
+    const pre = await db.batch.findUnique({ where: { id } });
+    if (!pre || pre.status === "cancelled") continue;
+    const left = await db.shipment.count({ where: { batchId: id, state: { in: ["batched", "packed", "labeling", "shipped"] } } });
+    if (left === 0) {
+      await db.batch.update({ where: { id }, data: { status: "cancelled", cancelledAt: new Date() } });
+      await logEvent(shop, { batchId: id, type: "batch_cancelled", detail: `${pre.tag} cancelled: all its orders moved to ${batch.tag} (Ordoro import)`, user });
+    } else {
+      await logEvent(shop, { batchId: id, type: "batch_removed", detail: `Orders moved from ${pre.tag} to ${batch.tag} (Ordoro import)`, user });
+    }
   }
 }
 
@@ -250,16 +279,18 @@ export async function importBatch(shop, admin, ob, user, step = () => {}) {
   if (fresh) batch = await createBatch(shop, ob, user);
   else if (batch.status === "cancelled") return { batch, skipped: true };
   const sOrders = await shopifyOrders(admin, [...new Set(ob.orderNumbers.map((n) => `#${orderDigits(n) ?? n}`))]);
+  const movedFrom = new Set(); // pre-batches that gave up orders to this one
   let i = 0;
   for (const number of ob.orderNumbers) {
     i++;
     await step(`${batch.tag}: order ${i} of ${ob.orderNumbers.length}`);
     const o = await fetchOrdoroOrder(number);
     const sOrder = sOrders.get(`#${orderDigits(o?.parent ?? o?.number ?? number) ?? number}`.toLowerCase()) ?? null;
-    const res = await applyOrder(shop, admin, batch, number, o, sOrder, user);
+    const res = await applyOrder(shop, admin, batch, number, o, sOrder, user, movedFrom);
     await saveNotes(shop, batch, number, res);
     await sleep(testing() ? 0 : 130); // Ordoro allows 500 requests a minute
   }
+  await tidyPreBatches(shop, batch, movedFrom, user);
   const info = json(batch.externalInfo, {});
   await db.batch.update({
     where: { id: batch.id },
@@ -272,7 +303,7 @@ export async function importBatch(shop, admin, ob, user, step = () => {}) {
 export function startImport(shop, user, { admin = null, refs = null } = {}) {
   if (!ordoroConfigured()) throw new OrdoroBatchError("Add ORDORO_API_KEY and ORDORO_API_SECRET in Railway first.");
   if (jobs.get(shop)?.running) throw new OrdoroBatchError("An import is already running.");
-  const job = { running: true, step: "Reading Ordoro's batches", startedAt: new Date().toISOString(), startedBy: user?.name ?? null, result: null, error: null };
+  const job = { running: true, step: "Reading Ordoro's batches", startedAt: new Date().toISOString(), startedBy: user?.name ?? null, refs, result: null, error: null };
   jobs.set(shop, job);
   const p = (async () => {
     try {
@@ -292,7 +323,13 @@ export function startImport(shop, user, { admin = null, refs = null } = {}) {
       job.result = result;
     } catch (e) {
       console.error(`[ordoro-batches] ${shop}:`, errorMessage(e));
-      job.error = e instanceof OrdoroError || e instanceof OrdoroBatchError ? e.message : errorMessage(e);
+      const msg = errorMessage(e);
+      job.error =
+        e instanceof OrdoroError || e instanceof OrdoroBatchError
+          ? e.message
+          : /\b401\b|Unauthorized/i.test(msg)
+            ? "Shopify didn't accept MonkeyBean's connection. Reload the page and import again (batches already done are kept)."
+            : msg;
     } finally {
       job.running = false;
       job.step = null;
@@ -301,6 +338,20 @@ export function startImport(shop, user, { admin = null, refs = null } = {}) {
   })();
   if (testing()) return p;
   return null;
+}
+
+// Ordoro's active batches, to choose from (no importing): newest first, with
+// the MonkeyBean batch each one already became
+export async function listRemoteBatches(shop) {
+  if (!ordoroConfigured()) throw new OrdoroBatchError("Add ORDORO_API_KEY and ORDORO_API_SECRET in Railway first.");
+  const [remote, here] = await Promise.all([
+    fetchActiveBatches(),
+    db.batch.findMany({ where: { shop, source: SOURCE }, select: { id: true, tag: true, externalRef: true, status: true } }),
+  ]);
+  const byRef = new Map(here.map((b) => [b.externalRef, b]));
+  return remote
+    .map((b) => ({ ref: b.ref, notes: b.notes, orders: b.orderNumbers.length, createdAt: b.createdAt, here: byRef.get(b.ref) ?? null }))
+    .sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
 }
 
 // ---------------------------------------------------------------------------
@@ -413,8 +464,10 @@ export async function recheckIssue(shop, admin, issueId, user) {
   const o = await fetchOrdoroOrder(x.orderNumber);
   const name = `#${orderDigits(o?.parent ?? o?.number ?? x.orderNumber) ?? x.orderNumber}`;
   const sOrder = (await shopifyOrders(admin, [name])).get(name.toLowerCase()) ?? null;
-  const res = await applyOrder(shop, admin, batch, x.orderNumber, o, sOrder, user);
+  const movedFrom = new Set();
+  const res = await applyOrder(shop, admin, batch, x.orderNumber, o, sOrder, user, movedFrom);
   await saveNotes(shop, batch, x.orderNumber, res);
+  await tidyPreBatches(shop, batch, movedFrom, user);
   const after = await db.ordoroBatchIssue.findUnique({ where: { id: x.id } });
   return { status: after?.status ?? "fixed", detail: after?.detail ?? null };
 }

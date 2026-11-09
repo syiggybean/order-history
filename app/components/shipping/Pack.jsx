@@ -301,6 +301,8 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
   const go = useParamSetter();
   const revalidator = useRevalidator();
   const { batch, boxes, totals } = data;
+  // Flow mode: each package is picked, then packed, then labelled, before the next
+  const flow = Boolean(batch.flow);
   const pkgCfg = data.pkg ?? { step: "off", boxes: [], weightUnit: "lb", dimUnit: "in" };
   const [pkgFocus, setPkgFocus] = useState(false); // weight box takes the focus right after packing
   const [current, setCurrent] = useState(boxData);
@@ -345,6 +347,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
       return true;
     }
   });
+  const labelAfter = flow || autoLabel;
   const toggleAuto = (on) => {
     setAutoLabel(on);
     try {
@@ -436,7 +439,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
     const bx = current ? { ...current, pkg } : null;
     setCurrent(bx);
     revalidator.revalidate();
-    if (bx && autoLabel && !sandbox && lab?.boxId === bx.id && lab.status === "ready") buyFor(bx);
+    if (bx && labelAfter && !sandbox && lab?.boxId === bx.id && lab.status === "ready") buyFor(bx);
     inputRef.current?.focus?.();
   };
   const scanFromPackage = (c) => {
@@ -451,6 +454,26 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
     go({ box: id }, { replace: false });
   };
   const nextBox = boxes.find((b) => b.state === "batched" && b.id !== current?.id);
+  // Flow mode: where this package is (pick → pack → label → done)
+  const stepOf = (bx) => (!bx ? null : bx.state === "shipped" ? "done" : bx.state !== "batched" ? "label" : bx.flow?.pickedAt ? "pack" : "pick");
+  const flowStep = flow ? stepOf(current) : null;
+  // Label bought: on to the next package by itself
+  useEffect(() => {
+    if (!flow || !current || !nextBox) return undefined;
+    if (!(lab?.boxId === current.id && lab.status === "done")) return undefined;
+    const t = setTimeout(() => openBox(nextBox.id), 1500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flow, lab?.status, lab?.boxId, current?.id, nextBox?.id]);
+  const pickAllF = useFetcher();
+  useEffect(() => {
+    if (pickAllF.data?.intent === "flowPickAll" && pickAllF.data.ok) {
+      setCurrent((bx) => (bx ? { ...bx, flow: { ...(bx.flow ?? {}), pickedAt: new Date().toISOString() }, lines: bx.lines.map((l) => ({ ...l, picked: l.qty })) } : bx));
+      setLast({ ok: true, text: "Marked picked. Now scan each item as it goes in the box." });
+      revalidator.revalidate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickAllF.data]);
 
   const pump = () => {
     if (scanner.state !== "idle" || !queue.current.length) return;
@@ -504,6 +527,27 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
         beep(false);
         return;
       }
+      // Flow mode, step 1: a pick off the shelf
+      if (r.flowStep === "pick") {
+        if (!r.ok) {
+          beep(false);
+          setLast({ ok: false, key: r.key, text: r.error });
+          return;
+        }
+        beep(true);
+        setCurrent((bx) =>
+          bx
+            ? {
+                ...bx,
+                lines: bx.lines.map((l) => (l.key === r.key ? { ...l, picked: r.picked } : l)),
+                flow: r.pickComplete ? { ...(bx.flow ?? {}), pickedAt: new Date().toISOString() } : bx.flow,
+              }
+            : bx,
+        );
+        setLast({ ok: true, key: r.key, text: r.pickComplete ? "Picked ✓ Now scan each item as it goes in the box." : `Picked ${r.title}: ${r.picked} of ${r.qty}` });
+        if (r.pickComplete) revalidator.revalidate();
+        return;
+      }
       if (r.ok) {
         beep(true);
         const sealed = r.intent === "sealBox";
@@ -539,7 +583,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
             // Box and weight first; the label opens when they're saved
             setPkgFocus(true);
             setLabel({ boxId: current.id, orderName: current.orderName, orderNumber: current.orderNumber, status: "ready" });
-          } else if (autoLabel && current) buyFor(current);
+          } else if (labelAfter && current) buyFor(current);
           // Straight on to the label for this box
           else if (current) setLabel({ boxId: current.id, orderName: current.orderName, orderNumber: current.orderNumber, status: "ready" });
         }
@@ -585,11 +629,14 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
         </button>
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "10px" }}>
-        <h2 style={{ margin: 0, fontSize: "20px" }}>Pack · {batchTitle(batch)}</h2>
+        <h2 style={{ margin: 0, fontSize: "20px" }}>
+          {flow ? "Flow mode" : "Pack"} · {batchTitle(batch)}
+        </h2>
         {batch.assignees?.length > 0 && <span style={small}>Assigned to {batch.assignees.map((a) => a.name).join(", ")}</span>}
         <StatusPill status={batch.status} />
         <span style={{ flex: 1 }} />
-        {!sandbox && (
+        {!sandbox && flow && <span style={small}>The label page opens after each package</span>}
+        {!sandbox && !flow && (
           <>
             <label
               style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "13px" }}
@@ -658,7 +705,13 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                 type="text"
                 value={code}
                 onChange={(e) => setCode(e.target.value)}
-                placeholder={b && b.state === "batched" ? `Scan items for ${b.orderName}` : "Scan a packing slip barcode"}
+                placeholder={
+                  flowStep === "pick"
+                    ? `Scan each item off the shelf for ${b.orderName}`
+                    : b && b.state === "batched"
+                      ? `Scan items for ${b.orderName}`
+                      : "Scan a packing slip barcode"
+                }
                 aria-label="Scan"
                 autoComplete="off"
                 style={{ font: "inherit", fontSize: "16px", padding: "10px 12px", borderRadius: "10px", border: `2px solid ${PINK}`, flex: "1 1 280px", maxWidth: "420px" }}
@@ -674,9 +727,17 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                   fontWeight: last ? 600 : 400,
                 }}
               >
-                {last ? last.text : b ? "Scan each item as it goes in the box." : "Scan a packing slip, or pick an order from the list."}
+                {last
+                  ? last.text
+                  : flowStep === "pick"
+                    ? "Step 1: pick. Scan each item as you take it off the shelf."
+                    : b
+                      ? "Scan each item as it goes in the box."
+                      : flow
+                        ? "Start with the next package, or scan its packing slip."
+                        : "Scan a packing slip, or pick an order from the list."}
               </div>
-              {b && b.state === "batched" && b.scanned >= b.units && (
+              {b && b.state === "batched" && b.scanned >= b.units && flowStep !== "pick" && (
                 <button
                   type="button"
                   onClick={() => {
@@ -726,6 +787,10 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                             <span style={small}>
                               {x.scanned}/{x.units}
                             </span>
+                          ) : flow && x.flowPicked ? (
+                            <span style={small}>
+                              {x.flowPicked < x.units ? `picking ${x.flowPicked}/${x.units}` : "picked"}
+                            </span>
                           ) : null}
                           {x.state === "batched" && x.label?.status === "bought" && (
                             <div style={{ ...small, color: "#1a5e20", fontWeight: 600 }} title="Label bought before packing">
@@ -747,9 +812,9 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                 <div style={{ ...box, padding: "24px", textAlign: "center", color: "#616161" }}>
                   {nextBox ? (
                     <>
-                      <div style={{ marginBottom: "10px" }}>Scan a packing slip or choose an order.</div>
+                      <div style={{ marginBottom: "10px" }}>{flow ? "One package at a time: pick it, pack it, then buy its label." : "Scan a packing slip or choose an order."}</div>
                       <s-button variant="primary" onClick={() => openBox(nextBox.id)}>
-                        Start with the oldest: {nextBox.orderName}
+                        {flow ? `Start: ${nextBox.orderName}` : `Start with the oldest: ${nextBox.orderName}`}
                       </s-button>
                     </>
                   ) : (
@@ -792,6 +857,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                     {[b.customerName, [b.province, b.country].filter(Boolean).join(", ")].filter(Boolean).join(" · ")}
                   </div>
 
+                  {flow && <FlowSteps step={flowStep} />}
                   {b.notice && b.packAcked && (
                     <div style={{ marginTop: "10px", padding: "8px 10px", borderRadius: "8px", background: NOTICE_BG, borderLeft: `4px solid ${NOTICE_EDGE}`, fontSize: "13px" }}>
                       {b.notice.address && <div style={{ fontWeight: 700 }}>⚠ {b.notice.address.text}</div>}
@@ -848,7 +914,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                     <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "14px" }}>
                       <thead>
                         <tr>
-                          {["Item", "Bin", "Qty", "Scanned"].map((h) => (
+                          {["Item", "Bin", "Qty", flowStep === "pick" ? "Picked" : "Scanned"].map((h) => (
                             <th key={h} style={head}>
                               {h}
                             </th>
@@ -857,7 +923,9 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                       </thead>
                       <tbody>
                         {b.lines.map((l) => {
-                          const done = l.scanned >= l.qty || b.state !== "batched";
+                          const picking = flowStep === "pick";
+                          const n = picking ? l.picked ?? 0 : l.scanned;
+                          const done = n >= l.qty || b.state !== "batched";
                           return (
                             <tr key={l.key} className={last?.key === l.key ? "sh-rise" : undefined} style={{ background: done ? "#f3faf1" : undefined }}>
                               <td style={cell}>
@@ -876,7 +944,7 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                               <td style={{ ...cell, fontWeight: 700, fontSize: "18px" }}>{l.qty}</td>
                               <td style={{ ...cell, fontWeight: 700, color: done ? "#1a7f37" : "#303030", fontVariantNumeric: "tabular-nums" }}>
                                 {done ? "✓ " : ""}
-                                {b.state !== "batched" ? l.qty : l.scanned}/{l.qty}
+                                {b.state !== "batched" ? l.qty : n}/{l.qty}
                               </td>
                             </tr>
                           );
@@ -887,8 +955,17 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
 
                   <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginTop: "12px" }}>
                     {b.state !== "batched" && nextBox && (
-                      <s-button variant="primary" onClick={() => openBox(nextBox.id)}>
-                        Next: {nextBox.orderName}
+                      <s-button variant={flow && b.state !== "shipped" ? "secondary" : "primary"} onClick={() => openBox(nextBox.id)}>
+                        {flow && b.state !== "shipped" ? `Skip to the next package: ${nextBox.orderName}` : `Next: ${nextBox.orderName}`}
+                      </s-button>
+                    )}
+                    {flowStep === "pick" && can.override && (!b.notice || b.packAcked) && (
+                      <s-button
+                        variant="tertiary"
+                        onClick={() => pickAllF.submit({ intent: "flowPickAll", id: String(batch.id), shipmentId: String(b.id) }, { method: "post" })}
+                        {...(pickAllF.state !== "idle" ? { loading: true } : {})}
+                      >
+                        Mark all picked (no scan)
                       </s-button>
                     )}
                     {b.state === "batched" && b.notice && can.pack && (
@@ -1118,5 +1195,41 @@ function BulkLabelDebug({ debug }) {
         </div>
       )}
     </details>
+  );
+}
+
+// Flow mode: pick → pack → label for the package on screen
+function FlowSteps({ step }) {
+  const steps = [
+    ["pick", "1 Pick"],
+    ["pack", "2 Pack"],
+    ["label", "3 Label"],
+  ];
+  const at = step === "done" ? 3 : steps.findIndex(([k]) => k === step);
+  return (
+    <div aria-label="Flow mode steps" style={{ display: "flex", gap: "6px", marginTop: "10px", flexWrap: "wrap" }}>
+      {steps.map(([k, t], i) => {
+        const done = i < at;
+        const now = i === at;
+        return (
+          <span
+            key={k}
+            aria-current={now ? "step" : undefined}
+            style={{
+              padding: "4px 12px",
+              borderRadius: "999px",
+              fontSize: "13px",
+              fontWeight: 700,
+              background: now ? "#5b21b6" : done ? "#e3f1df" : "#f1f1f1",
+              color: now ? "#fff" : done ? "#1a5e20" : "#616161",
+            }}
+          >
+            {done ? "✓ " : ""}
+            {t}
+          </span>
+        );
+      })}
+      {step === "done" && <span style={{ ...pill("#e3f1df", "#1a5e20"), alignSelf: "center" }}>Shipped ✓</span>}
+    </div>
   );
 }

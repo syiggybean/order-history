@@ -315,6 +315,7 @@ const viewBatch = (b, stats) => ({
   name: b.name,
   source: b.source,
   status: b.status,
+  flow: Boolean(b.flow),
   priority: b.priority ?? 1,
   createdBy: b.createdBy,
   createdAt: b.createdAt.toISOString(),
@@ -477,7 +478,14 @@ async function updatePicked(batch, change) {
 const norm = (s) => String(s ?? "").trim().toLowerCase();
 
 // A scan (barcode or SKU) on the pick list: one more of that item picked
+// Flow mode batches have no batch pick list: each package is picked on its own
+async function notInFlow(shop, batchId) {
+  const b = await db.batch.findFirst({ where: { shop, id: Number(batchId) }, select: { tag: true, flow: true } });
+  if (b?.flow) throw new ShippingError(`${b.tag} is in Flow mode: each package is picked, packed and labelled in turn on its Pack page.`);
+}
+
 export async function scanPick(shop, batchId, code, user) {
+  await notInFlow(shop, batchId);
   const list = await pickList(shop, batchId);
   if (!list) throw new ShippingError("That batch couldn't be found.");
   if (!["open", "picking"].includes(list.batch.status)) throw new ShippingError(`${list.batch.tag} is already picked.`);
@@ -494,6 +502,7 @@ export async function scanPick(shop, batchId, code, user) {
 
 // Set a count by hand (the +/− buttons or "all picked")
 export async function setPicked(shop, batchId, key, qty) {
+  await notInFlow(shop, batchId);
   const list = await pickList(shop, batchId);
   if (!list) throw new ShippingError("That batch couldn't be found.");
   if (!["open", "picking"].includes(list.batch.status)) throw new ShippingError(`${list.batch.tag} is already picked.`);
@@ -506,6 +515,7 @@ export async function setPicked(shop, batchId, key, qty) {
 }
 
 export async function finishPicking(shop, batchId, user, { force = false } = {}) {
+  await notInFlow(shop, batchId);
   const list = await pickList(shop, batchId);
   if (!list) throw new ShippingError("That batch couldn't be found.");
   if (!["open", "picking"].includes(list.batch.status)) throw new ShippingError(`${list.batch.tag} is already picked.`);

@@ -537,7 +537,10 @@ export async function refreshReadiness(shop, admin) {
   const items = shipments.flatMap((s) => linesOf(s).filter((l) => l.tracked && l.inventoryItemId).map((l) => l.inventoryItemId));
   const stock = items.length ? await loadStock(admin, items) : {};
   const products = await loadProductInfo(admin, shipments.flatMap((s) => linesOf(s).map((l) => l.productId)));
-  const ahead = new Set((await db.batch.findMany({ where: { shop, source: { startsWith: "auto:release:" } }, select: { id: true } })).map((b) => b.id));
+  // Batched ahead of a release: auto-batched upcoming releases, and Ordoro batches (their waiting orders are pre-batched)
+  const ahead = new Set(
+    (await db.batch.findMany({ where: { shop, OR: [{ source: { startsWith: "auto:release:" } }, { source: "ordoro" }] }, select: { id: true } })).map((b) => b.id),
+  );
   const { readyBeforeReleaseHours } = await getShippingSettings(shop);
   const { changes } = allocate(shipments, stock, new Date(), products, { aheadBatchIds: ahead, earlyHours: readyBeforeReleaseHours ?? 48 });
   for (const [id, data] of changes) await db.shipment.update({ where: { id }, data });
@@ -719,7 +722,7 @@ const viewShipment = (s) => ({
   merge: s.mergeGroupId
     ? s.mergedInto
       ? { role: "part", into: s.mergedInto, groupId: s.mergeGroupId }
-      : { role: "box", groupId: s.mergeGroupId, items: json(s.mergedLines, []).map((l) => ({ title: l.title, variantTitle: l.variantTitle, quantity: l.quantity, from: l.fromOrderName })) }
+      : { role: "box", groupId: s.mergeGroupId, items: json(s.mergedLines, []).map((l) => ({ title: l.title, variantTitle: l.variantTitle, quantity: l.quantity, from: l.fromOrderName, sku: l.sku, imageUrl: l.imageUrl, productId: l.productId })), orders: [] }
     : null,
   readyAt: s.readyAt?.toISOString() ?? null,
   units: s.units,
@@ -758,7 +761,12 @@ export function shipmentWhere(shop, filter = {}) {
   if (filter.batchId) {
     where.batchId = Number(filter.batchId);
     where.state = { in: ACTIVE_STATES.concat(["shipped"]) };
+  } else {
+    // Orders merged into another order's box show on that box's row, not their own
+    where.mergedInto = null;
   }
+  // A product anywhere in the box: its own items, or ones merged in from other orders
+  const has = (frag) => ({ OR: [{ lines: { contains: frag } }, { mergedLines: { contains: frag } }] });
   if (filter.method) where.shippingMethod = filter.method;
   if (filter.country === "domestic") where.country = "US";
   if (filter.country === "international") where.NOT = { country: "US" };
@@ -768,16 +776,19 @@ export function shipmentWhere(shop, filter = {}) {
       { orderName: { contains: q, mode: "insensitive" } },
       { customerName: { contains: q, mode: "insensitive" } },
       { lines: { contains: q, mode: "insensitive" } },
+      // the merged-in orders' names and items (mergedLines carries fromOrderName)
+      { mergedLines: { contains: q, mode: "insensitive" } },
     ];
   }
   const and = [];
-  if (filter.product) and.push({ lines: { contains: `"productId":"${filter.product}"` } });
+  if (filter.product) and.push(has(`"productId":"${filter.product}"`));
   // Combinations: shipments that also contain every one of these products
-  for (const id of comboIds(filter.with)) and.push({ lines: { contains: `"productId":"${id}"` } });
-  if (filter.variant) and.push({ lines: { contains: `"variantId":"${filter.variant}"` } });
-  if (filter.singles) where.units = 1;
+  for (const id of comboIds(filter.with)) and.push(has(`"productId":"${id}"`));
+  if (filter.variant) and.push(has(`"variantId":"${filter.variant}"`));
+  // A merged box holds more than its own units, so it's never a single or a double
+  if (filter.singles) Object.assign(where, { units: 1, mergedLines: null });
   else if (filter.doubles) {
-    where.units = 2;
+    Object.assign(where, { units: 2, mergedLines: null });
     const pair = String(filter.pair ?? "").split("|").filter(Boolean).slice(0, 2);
     for (const v of pair) and.push({ lines: { contains: `"variantId":"${v}"` } });
     // Two of one item: a single line (lines are stored as a JSON array, so two lines contain "},{")
@@ -829,11 +840,11 @@ export async function suggestProducts(shop, { q = "", state = "ready", singles =
 export async function productTiles(shop, filter = {}, { limit = 8 } = {}) {
   const chosen = new Set([filter.product, ...comboIds(filter.with)].filter(Boolean));
   const where = shipmentWhere(shop, { ...filter, pair: "" });
-  const rows = await db.shipment.findMany({ where, select: { lines: true }, take: 20000 });
+  const rows = await db.shipment.findMany({ where, select: { lines: true, mergedLines: true }, take: 20000 });
   const found = new Map();
   for (const r of rows) {
     const seen = new Set();
-    for (const l of json(r.lines, [])) {
+    for (const l of [...json(r.lines, []), ...json(r.mergedLines, [])]) {
       if (!l.productId || seen.has(l.productId) || chosen.has(l.productId)) continue;
       seen.add(l.productId);
       const p = found.get(l.productId) ?? { productId: l.productId, title: l.title, imageUrl: l.imageUrl ?? null, shipments: 0 };
@@ -885,11 +896,11 @@ export async function doublePairs(shop, filter = {}, { limit = 12 } = {}) {
 export async function productVariants(shop, filter = {}) {
   if (!filter.product) return [];
   const where = shipmentWhere(shop, { ...filter, variant: "", pair: "" });
-  const rows = await db.shipment.findMany({ where, select: { lines: true }, take: 20000 });
+  const rows = await db.shipment.findMany({ where, select: { lines: true, mergedLines: true }, take: 20000 });
   const found = new Map();
   for (const r of rows) {
     const seen = new Set();
-    for (const l of json(r.lines, [])) {
+    for (const l of [...json(r.lines, []), ...json(r.mergedLines, [])]) {
       if (l.productId !== filter.product || !l.variantId || seen.has(l.variantId)) continue;
       seen.add(l.variantId);
       const v = found.get(l.variantId) ?? { variantId: l.variantId, title: l.variantTitle || l.title, sku: l.sku ?? null, shipments: 0 };
@@ -928,15 +939,50 @@ export async function listShipments(shop, filter = {}, { page = 1, pageSize = 50
       db.shipment.count({ where }),
     ]);
   }
-  const shipments = (await withNotices(shop, await withFlags(shop, rows.map(viewShipment)), viewer)).map((x) => (understock ? x : { ...x, understocked: null }));
+  const shipments = (await withNotices(shop, await withFlags(shop, await withMergedOrders(shop, rows.map(viewShipment))), viewer)).map((x) =>
+    understock ? x : { ...x, understocked: null, merge: x.merge?.orders ? { ...x.merge, orders: x.merge.orders.map((o) => ({ ...o, understocked: null })) } : x.merge },
+  );
   return { shipments, total, page, hasMore: page * pageSize < total };
+}
+
+// A merged box's row stands for every order in it: the merged-in orders (links,
+// what each still waits for, understocked items) go on the box's row
+async function withMergedOrders(shop, views) {
+  const groups = [...new Set(views.filter((v) => v.merge?.role === "box").map((v) => v.merge.groupId))];
+  if (!groups.length) return views;
+  const riders = await db.shipment.findMany({
+    where: { shop, mergeGroupId: { in: groups }, mergedInto: { not: null } },
+    select: { id: true, mergeGroupId: true, orderId: true, orderName: true, state: true, waitingReason: true, understocked: true, orderCreatedAt: true },
+    orderBy: { orderCreatedAt: "asc" },
+  });
+  return views.map((v) =>
+    v.merge?.role === "box"
+      ? {
+          ...v,
+          merge: {
+            ...v.merge,
+            orders: riders
+              .filter((r) => r.mergeGroupId === v.merge.groupId)
+              .map((r) => ({
+                shipmentId: r.id,
+                orderId: r.orderId,
+                orderName: r.orderName,
+                orderNumber: r.orderId.split("/").pop(),
+                state: r.state,
+                waitingReason: r.state === "waiting" ? r.waitingReason : null,
+                understocked: json(r.understocked, null),
+              })),
+          },
+        }
+      : v,
+  );
 }
 
 // Counts, shipping methods, and a per-product stock picture
 export async function shippingOverview(shop) {
   const [counts, methods, active, settings] = await Promise.all([
-    db.shipment.groupBy({ by: ["state"], where: { shop }, _count: { _all: true } }),
-    db.shipment.groupBy({ by: ["shippingMethod"], where: { shop, state: { in: ["waiting", "ready"] } }, _count: { _all: true } }),
+    db.shipment.groupBy({ by: ["state"], where: { shop, mergedInto: null }, _count: { _all: true } }),
+    db.shipment.groupBy({ by: ["shippingMethod"], where: { shop, state: { in: ["waiting", "ready"] }, mergedInto: null }, _count: { _all: true } }),
     db.shipment.findMany({ where: { shop, state: { in: ["waiting", "ready", "batched", "packed", "labeling"] } }, select: { state: true, lines: true } }),
     getShippingSettings(shop),
   ]);
@@ -1320,7 +1366,7 @@ const pendingOrders = new Map(); // shop -> Set(orderId)
 const readinessTimers = new Map(); // shop -> pending refresh
 
 async function counts(shop) {
-  const rows = await db.shipment.groupBy({ by: ["state"], where: { shop, state: { in: ["waiting", "ready"] } }, _count: { _all: true } });
+  const rows = await db.shipment.groupBy({ by: ["state"], where: { shop, state: { in: ["waiting", "ready"] }, mergedInto: null }, _count: { _all: true } });
   const n = Object.fromEntries(rows.map((c) => [c.state, c._count._all]));
   return { ready: n.ready ?? 0, waiting: n.waiting ?? 0 };
 }

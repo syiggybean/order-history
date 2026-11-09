@@ -476,6 +476,9 @@ model Shipment {
   noticeCheckedAt    DateTime?
   // Packing: {itemKey: units scanned}
   packed             String?
+  // Flow mode: items picked off the shelf for this package (JSON counts), and when all were
+  flowPicked    String?
+  flowPickedAt  DateTime?
   packedAt           DateTime?
   packedBy           String?
   // Notice acknowledged at the pack bench (must match noticeKey to pack)
@@ -595,6 +598,8 @@ model Batch {
   packStartedAt DateTime?
   packDoneAt    DateTime?
   cancelledAt   DateTime?
+  // Flow mode: each package picked, packed and labelled in turn (no batch pick list)
+  flow          Boolean   @default(false)
   // Imported from Ordoro (source "ordoro"): its reference there, and import details (JSON)
   externalRef   String?
   externalInfo  String?

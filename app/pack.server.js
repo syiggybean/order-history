@@ -265,7 +265,13 @@ export async function packQueue(shop, batchId, { debug = false } = {}) {
     orderBy: shipmentOrder("oldest"),
   });
   const [flags, bins] = await Promise.all([flagsFor(shop, [...new Set(rows.map((r) => r.orderId))]), binsFor(shop, rows)]);
-  const boxes = rows.map((s) => viewBox(s, flags, bins));
+  const boxes = rows.map((s) => {
+    const v = viewBox(s, flags, bins);
+    if (!b.flow) return v;
+    // Flow mode: how far each package's pick has got
+    const p = json(s.flowPicked, {});
+    return { ...v, flowPicked: s.flowPickedAt || s.state !== "batched" ? v.units : v.lines.reduce((n, l) => n + Math.min(p[l.key] ?? 0, l.qty), 0) };
+  });
   const settings = await getShippingSettings(shop);
   const toLabel = rows.filter((r) => r.state === "packed" || r.state === "labeling");
   // Same items in every box? (bulk labels make sense then: one package, one weight)
@@ -354,16 +360,20 @@ export async function packQueue(shop, batchId, { debug = false } = {}) {
       unlabelled: rows.filter((r) => ["batched", "packed"].includes(r.state) && r.labelStatus !== "bought").length,
       labelled: rows.filter((r) => r.labelStatus === "bought").length,
     },
-    batch: { id: b.id, tag: b.tag, name: b.name, status: b.status, number: b.number, source: b.source, assignees: json(b.assignees, []), packStartedAt: b.packStartedAt?.toISOString() ?? null, packDoneAt: b.packDoneAt?.toISOString() ?? null },
+    batch: { id: b.id, tag: b.tag, name: b.name, status: b.status, number: b.number, source: b.source, flow: Boolean(b.flow), assignees: json(b.assignees, []), packStartedAt: b.packStartedAt?.toISOString() ?? null, packDoneAt: b.packDoneAt?.toISOString() ?? null },
     boxes,
     totals: { shipments: boxes.length, packed: boxes.filter((x) => x.state !== "batched").length },
-    canPack: PACKABLE.includes(b.status),
+    canPack: packable(b),
   };
 }
 
+// Flow mode batches are worked package by package from the start: no batch pick first
+const packable = (b) => PACKABLE.includes(b.status) || (b.flow && FLOW_OPEN.includes(b.status));
+const FLOW_OPEN = ["open", "picking"];
+
 async function loadBox(shop, batchId, shipmentId) {
   const b = await batchFor(shop, batchId);
-  if (!PACKABLE.includes(b.status)) throw new ShippingError(`${b.tag} needs to be picked before packing.`);
+  if (!packable(b)) throw new ShippingError(`${b.tag} needs to be picked before packing.`);
   const s = await db.shipment.findFirst({ where: { shop, id: Number(shipmentId), batchId: b.id } });
   if (!s) throw new ShippingError(`That shipment isn't in ${b.tag}.`);
   return { b, s };
@@ -384,9 +394,17 @@ export async function findBox(shop, batchId, code) {
 }
 
 export async function getBox(shop, batchId, shipmentId) {
-  const { s } = await loadBox(shop, batchId, shipmentId);
+  const { b, s } = await loadBox(shop, batchId, shipmentId);
   const [flags, bins] = await Promise.all([flagsFor(shop, [s.orderId]), binsFor(shop, [s])]);
-  return viewBox(s, flags, bins);
+  const v = viewBox(s, flags, bins);
+  if (!b.flow) return v;
+  // Flow mode: what's been picked for this package, item by item
+  const picked = json(s.flowPicked, {});
+  return {
+    ...v,
+    flow: { pickedAt: s.flowPickedAt?.toISOString() ?? null },
+    lines: v.lines.map((l) => ({ ...l, picked: s.flowPickedAt || s.state !== "batched" ? l.qty : Math.min(picked[l.key] ?? 0, l.qty) })),
+  };
 }
 
 async function startPackingBatch(b) {
@@ -450,6 +468,8 @@ export async function packScan(shop, batchId, shipmentId, code, user, { via = "b
   const matches = byKey ? lines.filter((l) => itemKey(l) === byKey) : lines.filter((l) => norm(l.barcode) === c || norm(l.sku) === c);
   if (byKey && !matches.length) return { ok: false, code, error: `That item isn't in ${s.orderName}.` };
   if (!matches.length) return { ok: false, code, error: `${code} isn't in ${s.orderName}. Don't pack it.` };
+  // Flow mode, step 1: until every item is off the shelf, a scan is a pick
+  if (b.flow && !s.flowPickedAt) return flowPick(shop, b, s, lines, matches, code, user);
   const line = matches.find((l) => (packed[itemKey(l)] ?? 0) < l.quantity) ?? matches[0];
   const key = itemKey(line);
   if ((packed[key] ?? 0) >= line.quantity) return { ok: false, code, key, error: `Already have all ${line.quantity} × ${label(line)} for ${s.orderName}.` };
@@ -476,10 +496,74 @@ export async function packScan(shop, batchId, shipmentId, code, user, { via = "b
   return { ok: true, code, key, scanned: saved[key], qty: line.quantity, title: label(line), complete, via, packedAt: packedAt?.toISOString() ?? null };
 }
 
+// ---------------------------------------------------------------------------
+// Flow mode: one package at a time, pick → pack → label
+// ---------------------------------------------------------------------------
+
+// A flow batch is under way from its first pick: it goes straight to packing
+async function startFlow(b) {
+  if (FLOW_OPEN.includes(b.status)) await db.batch.update({ where: { id: b.id }, data: { status: "packing", packStartedAt: b.packStartedAt ?? new Date() } });
+}
+
+async function flowPick(shop, b, s, lines, matches, code, user) {
+  const line = matches.find((l) => (json(s.flowPicked, {})[itemKey(l)] ?? 0) < l.quantity) ?? matches[0];
+  const key = itemKey(line);
+  let saved = null;
+  let row = s;
+  for (let attempt = 0; attempt < 6 && !saved; attempt++) {
+    const counts = json(row.flowPicked, {});
+    if ((counts[key] ?? 0) >= line.quantity) return { ok: false, code, key, flowStep: "pick", error: `Already picked all ${line.quantity} × ${label(line)} for ${s.orderName}.` };
+    counts[key] = (counts[key] ?? 0) + 1;
+    const r = await db.shipment.updateMany({ where: { id: s.id, updatedAt: row.updatedAt, state: "batched", flowPickedAt: null }, data: { flowPicked: JSON.stringify(counts) } });
+    if (r.count) saved = counts;
+    else row = await db.shipment.findUnique({ where: { id: s.id } });
+  }
+  if (!saved) throw new ShippingError("Couldn't save that scan; please scan again.");
+  await startFlow(b);
+  const pickComplete = lines.every((l) => (saved[itemKey(l)] ?? 0) >= l.quantity);
+  if (pickComplete) {
+    await db.shipment.update({ where: { id: s.id }, data: { flowPickedAt: new Date() } });
+    await logEvent(shop, { shipmentId: s.id, batchId: b.id, orderName: s.orderName, type: "flow_picked", detail: `${b.tag}: every item picked (Flow mode)`, user });
+  }
+  return { ok: true, code, key, flowStep: "pick", picked: saved[key], qty: line.quantity, title: label(line), pickComplete, complete: false };
+}
+
+// Picked the package's items without scanning each (a leader's call, like Override)
+export async function flowPickAll(shop, batchId, shipmentId, user) {
+  const { b, s } = await loadBox(shop, batchId, shipmentId);
+  if (!b.flow) throw new ShippingError(`${b.tag} isn't in Flow mode.`);
+  if (s.state !== "batched" || s.flowPickedAt) return { ok: true };
+  const counts = Object.fromEntries(boxLinesOf(s).map((l) => [itemKey(l), l.quantity]));
+  await db.shipment.update({ where: { id: s.id }, data: { flowPicked: JSON.stringify(counts), flowPickedAt: new Date() } });
+  await startFlow(b);
+  await logEvent(shop, { shipmentId: s.id, batchId: b.id, orderName: s.orderName, type: "flow_picked", detail: `${b.tag}: marked picked without scanning (Flow mode)`, user });
+  return { ok: true };
+}
+
+// Turns Flow mode on (before any picking) or off (before any package is started)
+export async function setFlowMode(shop, batchId, on, user) {
+  const b = await batchFor(shop, batchId);
+  const want = Boolean(on);
+  if (b.flow === want) return { ok: true, flow: want };
+  if (want) {
+    const picked = Object.values(json(b.picked, {})).some((n) => n > 0);
+    if (b.status !== "open" || picked)
+      throw new ShippingError(`${b.tag} has started the usual way (${b.status === "open" ? "items picked" : b.status}). Flow mode can only be turned on before picking starts.`);
+  } else {
+    const started = await db.shipment.count({ where: { batchId: b.id, OR: [{ flowPicked: { not: null } }, { state: { in: ["packed", "labeling", "shipped"] } }] } });
+    if (started)
+      throw new ShippingError(`${started} package${started === 1 ? " has" : "s have"} been started in Flow mode, so ${b.tag} stays in it. Finish them here (or unpack them) first.`);
+  }
+  await db.batch.update({ where: { id: b.id }, data: { flow: want, ...(want ? {} : { status: "open", packStartedAt: null }) } });
+  await logEvent(shop, { batchId: b.id, type: want ? "flow_on" : "flow_off", detail: `${b.tag}: Flow mode ${want ? "on (pick, pack and label each package in turn)" : "off (back to the usual pick list)"}`, user });
+  return { ok: true, flow: want };
+}
+
 // "Packing complete": every item is scanned and the box is sealed (on camera)
 export async function sealBox(shop, batchId, shipmentId, user) {
   const { b, s } = await loadBox(shop, batchId, shipmentId);
   if (s.state !== "batched") return { ok: false, error: `${s.orderName} is already packed.` };
+  if (b.flow && !s.flowPickedAt) return { ok: false, error: "Pick every item for this package first." };
   if (s.noticeKey && s.packAckKey !== s.noticeKey) return { ok: false, needsAck: true, error: "Read and acknowledge the note / address change first." };
   const counts = json(s.packed, {});
   const missing = boxLinesOf(s).filter((l) => (counts[itemKey(l)] ?? 0) < l.quantity);

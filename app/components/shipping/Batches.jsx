@@ -517,7 +517,7 @@ export function BatchList({ batches, show, canBatches, autoBatch, restricted = f
 // One batch
 // ---------------------------------------------------------------------------
 
-export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null, canPriority = false, lock = null, canComplete = false }) {
+export function BatchHeader({ batch, canBatches, canPick, canPack = false, staff = [], me = null, canPriority = false, lock = null, canComplete = false }) {
   const go = useParamSetter();
   const fetcher = useFetcher();
   const [renaming, setRenaming] = useState(false);
@@ -560,9 +560,14 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null,
           </span>
         )}
         <StatusPill status={batch.status} />
+        {batch.flow && (
+          <span style={pill("#f3e8ff", "#5b21b6")} title="Each package is picked, packed and labelled in turn">
+            Flow mode
+          </span>
+        )}
         {batch.status !== "cancelled" && batch.status !== "done" ? <PriorityControl batch={batch} canPriority={canPriority} /> : <PriorityPill priority={batch.priority} />}
       </div>
-      {lock && <LockNote text={["open", "picking"].includes(batch.status) ? lock.pick : ["picked", "packing"].includes(batch.status) ? lock.pack : null} />}
+      {lock && <LockNote text={batch.flow ? lock.pack ?? lock.pick : ["open", "picking"].includes(batch.status) ? lock.pick : ["picked", "packing"].includes(batch.status) ? lock.pack : null} />}
       {lock?.releaseDay && !lock.pick && <div style={{ ...small, marginTop: "6px" }}>Batched ahead of a release ({lock.releaseDay}); you can pick it early.</div>}
       <div style={{ ...small, marginTop: "6px" }}>
         {batch.shipments} shipment{batch.shipments === 1 ? "" : "s"} · {batch.units} unit{batch.units === 1 ? "" : "s"} · created {fmtDate(batch.createdAt, true)}
@@ -571,7 +576,12 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null,
       </div>
       {batch.status !== "cancelled" && <AssignControl batch={batch} staff={staff} canAssign={canBatches} me={me} />}
       <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "12px" }}>
-        {batch.status !== "cancelled" && (
+        {batch.flow && batch.status !== "cancelled" && (
+          <s-button variant={["done", "packed"].includes(batch.status) ? "secondary" : "primary"} onClick={() => go({ view: "pack" }, { replace: false })}>
+            {batch.status === "open" ? "Start Flow mode" : ["done", "packed"].includes(batch.status) ? "Flow mode (all done)" : `Continue Flow mode${batch.packed ? ` · ${batch.packed}/${batch.shipments} packed` : ""}`}
+          </s-button>
+        )}
+        {!batch.flow && batch.status !== "cancelled" && (
           <s-button
             variant={["picked", "packing"].includes(batch.status) ? "primary" : "secondary"}
             onClick={() => go({ view: "pack" }, { replace: false })}
@@ -579,7 +589,7 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null,
             {batch.status === "packed" ? "Packing (all done)" : `Pack this batch${batch.packed ? ` · ${batch.packed}/${batch.shipments} packed` : ""}`}
           </s-button>
         )}
-        {batch.status !== "cancelled" && (
+        {!batch.flow && batch.status !== "cancelled" && (
           <s-button variant={["open", "picking"].includes(batch.status) ? "primary" : "secondary"} onClick={() => go({ view: "pick" }, { replace: false })}>
             {canPick && ["open", "picking"].includes(batch.status) ? "Pick this batch" : "Pick list"}
           </s-button>
@@ -593,6 +603,7 @@ export function BatchHeader({ batch, canBatches, canPick, staff = [], me = null,
           Orders in Shopify
         </s-button>
         {canComplete && ["open", "picking", "picked", "packing"].includes(batch.status) && <CompleteBatch batch={batch} />}
+        {canPick && canPack && (batch.flow ? batch.status === "open" || (batch.status === "packing" && !batch.packed) : batch.status === "open") && <FlowToggle batch={batch} />}
         {canBatches && batch.editable && !confirmCancel && (
           <s-button variant="tertiary" tone="critical" onClick={() => setConfirmCancel(true)}>
             Cancel batch
@@ -701,5 +712,25 @@ function CompleteBatch({ batch }) {
       </div>
       {fetcher.data?.error && <div style={{ color: "#b42318", marginTop: "6px" }}>{fetcher.data.error}</div>}
     </div>
+  );
+}
+
+// Flow mode on/off: on before any picking, off before any package is started
+function FlowToggle({ batch }) {
+  const f = useFetcher();
+  const on = Boolean(batch.flow);
+  const busy = f.state !== "idle";
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
+      <s-button
+        variant="tertiary"
+        onClick={() => f.submit({ intent: "setFlow", id: String(batch.id), on: String(!on) }, { method: "post" })}
+        {...(busy ? { loading: true } : {})}
+      >
+        {on ? "Switch back to the usual pick list" : "Use Flow mode"}
+      </s-button>
+      {!on && !busy && <span style={small}>Pick, pack and label one package at a time</span>}
+      {f.data?.intent === "setFlow" && f.data.error && <span style={{ ...small, color: "#b42318" }}>{f.data.error}</span>}
+    </span>
   );
 }

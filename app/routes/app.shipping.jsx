@@ -40,7 +40,7 @@ import { FlagMarker, ReviewTab } from "../components/shipping/Review";
 import { NOTICE_BG, NOTICE_EDGE, NoticeModal, NoticeTag, ShopAdminContext } from "../components/shipping/Notice";
 import { PackStation } from "../components/shipping/Pack";
 import { Slips } from "../components/shipping/Slips";
-import { completeBatch, logBulkLabelOverride, findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
+import { completeBatch, flowPickAll, logBulkLabelOverride, setFlowMode, findBox, getBox, labelCheck, overridePack, packQueue, packScan, packingSlips, savePackage, sealBox, savePackageSettings, unpack } from "../pack.server";
 import { createPortal } from "react-dom";
 import { assertInBatch, batchLabelFile, bulkStatus, buyLabel, labelFile, startBulkLabels } from "../labels.server";
 import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "../flags.server";
@@ -51,6 +51,7 @@ import { OrdoroBatchPanel, OrdoroTab } from "../components/shipping/OrdoroBatche
 import {
   OrdoroBatchError,
   importStatus as ordoroImportStatus,
+  listRemoteBatches as listOrdoroRemote,
   listOrdoroBatches,
   ordoroBlock,
   reconcileIssue as reconcileOrdoroIssue,
@@ -334,10 +335,14 @@ const NEEDS = {
   savePackage: "pack",
   packageSettings: "settings",
   overridePack: "override",
+  // Flow mode: turned on/off by someone who can both pick and pack (checked below)
+  setFlow: "pack",
+  flowPickAll: "override",
   completeBatch: "completeBatch",
   bulkLabelsOverride: "bulkLabels",
   // Ordoro batches: import, and reconciling what didn't line up
   ordoroImport: "batches",
+  ordoroRemote: "batches",
   ordoroRecheck: "batches",
   ordoroReconcile: "batches",
   ordoroReopen: "batches",
@@ -486,9 +491,13 @@ export const action = async ({ request }) => {
     if (intent === "bulkLabelsOverride") return { intent, ok: true, ...(await logBulkLabelOverride(shop, id, user)) };
     if (intent === "ordoroImport") {
       if (sandboxOn) return { intent, error: "Importing from Ordoro is off in sandbox." };
-      await startOrdoroImport(shop, user);
+      // The page's own Shopify connection (just refreshed): the saved offline one can be stale
+      // refs: just these Ordoro batches (e.g. the urgent one first); none = every active one
+      const refs = form.get("refs") ? JSON.parse(String(form.get("refs"))) : null;
+      await startOrdoroImport(shop, user, { admin, refs });
       return { intent, ok: true, started: true };
     }
+    if (intent === "ordoroRemote") return { intent, ok: true, batches: await listOrdoroRemote(shop) };
     if (intent === "ordoroRecheck") {
       const issueId = Number(form.get("issueId"));
       return { intent, ok: true, issueId, ...(await recheckOrdoroIssue(shop, admin, issueId, user)) };
@@ -508,6 +517,11 @@ export const action = async ({ request }) => {
       return { intent, ok: true, ...(await completeBatch(shop, id, form.get("reason"), user)) };
     }
     if (intent === "overridePack") return { intent, ...(await overridePack(shop, id, Number(form.get("shipmentId")), form.get("reason"), user)) };
+    if (intent === "flowPickAll") return { intent, ...(await flowPickAll(shop, id, Number(form.get("shipmentId")), user)) };
+    if (intent === "setFlow") {
+      if (!can(user, "shipping", "pick")) return { intent, error: "Flow mode needs both the Pick and Pack permissions." };
+      return { intent, ...(await setFlowMode(shop, id, form.get("on") === "true", user)) };
+    }
     if (intent === "labelCheck") return { intent, ...(await labelCheck(shop, admin, id, Number(form.get("shipmentId")))) };
     if (intent === "buyLabel") {
       const sid = Number(form.get("shipmentId"));
@@ -689,9 +703,9 @@ const PICK_INTENTS = new Set(["scan", "setPicked", "finishPicking"]);
 const ORDORO_HELD = new Set([
   "addToBatch", "scan", "setPicked", "finishPicking", "reopenPicking", "assignBatch", "setPriority",
   "packScan", "sealBox", "unpack", "overridePack", "labelCheck", "savePackage", "buyLabel", "buyLabels",
-  "completeBatch", "bulkLabelsOverride", "cameraLink", "pickPhoneLink",
+  "completeBatch", "bulkLabelsOverride", "cameraLink", "pickPhoneLink", "setFlow", "flowPickAll",
 ]);
-const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack"]);
+const PACK_INTENTS = new Set(["packScan", "sealBox", "overridePack", "flowPickAll"]);
 
 // Actions on a batch (its id is in "id"): people limited to their assigned batches only get theirs
 const BATCH_INTENTS = new Set([
@@ -1837,7 +1851,7 @@ function BatchDetail({ batch, list, filter, allowed, staff, me, lock }) {
   const bf = { batchId: batch.id, sort: filter.sort };
   return (
     <s-section>
-      <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} staff={staff} me={me} canPriority={allowed.priority} lock={lock} canComplete={allowed.completeBatch} />
+      <BatchHeader batch={batch} canBatches={allowed.batches} canPick={allowed.pick} canPack={allowed.pack} staff={staff} me={me} canPriority={allowed.priority} lock={lock} canComplete={allowed.completeBatch} />
       {batch.ordoro && <OrdoroBatchPanel batch={batch} canReconcile={allowed.batches} />}
       {editable && (
         <RemoveBar

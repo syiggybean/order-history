@@ -25,7 +25,8 @@ export function OrdoroTab({ data, canBatches }) {
     <s-section heading="Ordoro batches">
       <s-paragraph>
         Active batches from Ordoro, brought in as Ordoro-Batch-NNNN and kept apart from MonkeyBean's own. Orders shipped in Ordoro and fulfilled in
-        Shopify come in as shipped; the rest come in ready to pick (Ordoro doesn't say what's been picked or packed). If Ordoro shipped something
+        Shopify come in as shipped; the rest come in to pick (Ordoro doesn't say what's been picked or packed). Orders still waiting here, like
+        pre-orders, are pre-batched: picking waits for their release date, as with batching ahead. If Ordoro shipped something
         Shopify hasn't, that batch is put on hold until it's reconciled.
       </s-paragraph>
       <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", margin: "10px 0 14px" }}>
@@ -40,7 +41,12 @@ export function OrdoroTab({ data, canBatches }) {
           </s-button>
         )}
         {!data.configured && <span style={{ ...small, color: "#b42318" }}>Ordoro isn't connected: add ORDORO_API_KEY and ORDORO_API_SECRET in Railway.</span>}
-        {job?.running && <span style={small}>{job.step ?? "Working…"}</span>}
+        {job?.running && (
+          <span style={small}>
+            {job.refs?.length ? `Importing ${job.refs.join(", ")}: ` : ""}
+            {job.step ?? "Working…"}
+          </span>
+        )}
         {!job?.running && job?.result && (
           <span style={{ ...small, color: "#1a5e20" }}>
             Last import {job.finishedAt ? ago(job.finishedAt) : ""}: {job.result.found} active in Ordoro · {job.result.imported} new · {job.result.refreshed} refreshed
@@ -50,6 +56,7 @@ export function OrdoroTab({ data, canBatches }) {
         {!job?.running && job?.error && <span style={{ ...small, color: "#b42318" }}>Import stopped: {job.error}</span>}
         {err && <span style={{ ...small, color: "#b42318" }}>{err}</span>}
       </div>
+      {canBatches && data.configured && <ChooseBatches disabled={running} />}
       {canBatches && data.batches.length > 0 && (
         <div style={{ ...small, marginBottom: "8px" }}>
           Importing again refreshes batches already here (new orders, anything shipped since) and adds new ones. Batches you've cancelled here stay cancelled.
@@ -110,6 +117,94 @@ export function OrdoroTab({ data, canBatches }) {
         </div>
       )}
     </s-section>
+  );
+}
+
+// Ordoro's active batches, newest first: import just the ones needed now
+function ChooseBatches({ disabled }) {
+  const list = useFetcher();
+  const imp = useFetcher();
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const rows = list.data?.intent === "ordoroRemote" ? list.data.batches ?? [] : null;
+  const loading = list.state !== "idle";
+  const shown = (rows ?? []).filter((b) => !q || `${b.ref} ${b.notes ?? ""}`.toLowerCase().includes(q.toLowerCase()));
+  const load = () => {
+    setOpen(true);
+    list.submit({ intent: "ordoroRemote" }, { method: "post" });
+  };
+  if (!open)
+    return (
+      <div style={{ margin: "-4px 0 12px" }}>
+        <s-button variant="secondary" onClick={load}>
+          Choose a batch to import first…
+        </s-button>
+      </div>
+    );
+  return (
+    <div style={{ border: "1px solid #e3e3e3", borderRadius: "10px", padding: "10px 12px", margin: "0 0 14px" }}>
+      <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", marginBottom: "8px" }}>
+        <strong>Ordoro's active batches</strong>
+        <input
+          aria-label="Find an Ordoro batch"
+          placeholder="Find (e.g. Nov 10)"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          style={{ padding: "6px 8px", border: "1px solid #c9cccf", borderRadius: "6px", fontSize: "13px", minWidth: "220px" }}
+        />
+        <s-button variant="tertiary" onClick={load} {...(loading ? { loading: true } : {})}>
+          Reload
+        </s-button>
+        <s-button variant="tertiary" onClick={() => setOpen(false)}>
+          Close
+        </s-button>
+      </div>
+      {list.data?.error && <div style={{ color: "#b42318", fontSize: "13px" }}>{list.data.error}</div>}
+      {imp.data?.error && <div style={{ color: "#b42318", fontSize: "13px" }}>{imp.data.error}</div>}
+      {loading && !rows && <div style={small}>Reading Ordoro…</div>}
+      {rows && (
+        <div style={{ maxHeight: "360px", overflow: "auto" }}>
+          <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
+            <thead>
+              <tr>
+                {["Ordoro batch", "Notes", "Orders", "Created", "Here", ""].map((h) => (
+                  <th key={h} style={head}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((b) => (
+                <tr key={b.ref}>
+                  <td style={{ ...cell, fontWeight: 600 }}>{b.ref}</td>
+                  <td style={cell}>{b.notes ?? "—"}</td>
+                  <td style={cell}>{b.orders}</td>
+                  <td style={cell}>{b.createdAt ? fmtDate(b.createdAt) : "—"}</td>
+                  <td style={cell}>{b.here ? `${b.here.tag}${b.here.status === "cancelled" ? " (cancelled)" : ""}` : <span style={small}>Not yet</span>}</td>
+                  <td style={{ ...cell, textAlign: "right" }}>
+                    <s-button
+                      variant={b.here ? "secondary" : "primary"}
+                      disabled={disabled || imp.state !== "idle" || b.here?.status === "cancelled" || undefined}
+                      onClick={() => imp.submit({ intent: "ordoroImport", refs: JSON.stringify([b.ref]) }, { method: "post" })}
+                    >
+                      {b.here ? "Refresh" : "Import"}
+                    </s-button>
+                  </td>
+                </tr>
+              ))}
+              {shown.length === 0 && (
+                <tr>
+                  <td style={cell} colSpan={6}>
+                    <span style={small}>{rows.length ? "No match." : "No active batches in Ordoro."}</span>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 

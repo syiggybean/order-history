@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
 import { ProductLink } from "../QuickView";
@@ -41,18 +41,48 @@ export function largeImage(url, width = 640) {
 const PREVIEW = 300; // px
 const GAP = 18; // distance from the cursor
 
+// Only one preview on screen at a time: showing one hides whichever was showing
+let hideShown = null;
+
 // A product thumbnail that shows a large view under the cursor on hover
 export function ProductThumb({ src, size, style }) {
   const [at, setAt] = useState(null); // { x, y } while hovering
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
+  const ref = useRef(null);
   const box = { ...thumb, ...(size ? { width: `${size}px`, height: `${size}px` } : {}), ...style };
   useEffect(() => {
     if (!at) return;
     const hide = () => setAt(null);
+    if (hideShown && hideShown !== hide) hideShown();
+    hideShown = hide;
+    // The browser doesn't always say the pointer left (the row re-rendered or moved
+    // under a still cursor, a panel opened over it, the window lost focus), so also
+    // hide when the pointer is over anything else, or on a click, key, scroll or blur
+    const away = (e) => {
+      const path = e.composedPath?.() ?? [e.target];
+      if (!ref.current || !path.includes(ref.current)) hide();
+    };
+    const onVisibility = () => document.hidden && hide();
+    const opts = { capture: true, passive: true };
+    document.addEventListener("pointermove", away, opts);
+    document.addEventListener("pointerdown", hide, opts);
+    document.addEventListener("keydown", hide, true);
+    document.addEventListener("mouseleave", hide);
+    document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("scroll", hide, true);
-    return () => window.removeEventListener("scroll", hide, true);
-  }, [at]);
+    window.addEventListener("blur", hide);
+    return () => {
+      if (hideShown === hide) hideShown = null;
+      document.removeEventListener("pointermove", away, opts);
+      document.removeEventListener("pointerdown", hide, opts);
+      document.removeEventListener("keydown", hide, true);
+      document.removeEventListener("mouseleave", hide);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("scroll", hide, true);
+      window.removeEventListener("blur", hide);
+    };
+  }, [Boolean(at)]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!src) return <span style={{ ...box, display: "inline-block" }} />;
   const move = (e) => {
     if (e.pointerType && e.pointerType !== "mouse") return;
@@ -98,7 +128,7 @@ export function ProductThumb({ src, size, style }) {
   }
   return (
     <>
-      <img src={src} alt="" style={{ ...box, cursor: "zoom-in" }} onPointerEnter={move} onPointerMove={move} onPointerLeave={() => setAt(null)} />
+      <img ref={ref} src={src} alt="" style={{ ...box, cursor: "zoom-in" }} onPointerEnter={move} onPointerMove={move} onPointerLeave={() => setAt(null)} />
       {pop}
     </>
   );
@@ -176,6 +206,7 @@ export function Items({ lines }) {
             <strong>{l.quantity} ×</strong> <ProductName id={l.productId}>{l.title}</ProductName>
             {l.variantTitle && <span style={muted}> · {l.variantTitle}</span>}
             {l.sku && <span style={small}> · {l.sku}</span>}
+            {l.from && <span style={small}> · from {l.from}</span>}
           </span>
         </div>
       ))}
