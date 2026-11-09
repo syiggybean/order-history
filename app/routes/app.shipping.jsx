@@ -200,7 +200,7 @@ export const loader = async ({ request }) => {
         ? { plan: await customerPlan(shop, mergeAdmin, params.get("customer")), merges: [] }
         : { ...(await mergeCandidates(shop, mergeAdmin)), merges: await listMerges(shop) }
       : null;
-  const ordoroBatches = await listOrdoroBatches(shop);
+  const ordoroBatches = await listOrdoroBatches(shop, { onlyFor: restricted ? user.id : null });
   return {
     merge,
     ordoro:
@@ -232,7 +232,7 @@ export const loader = async ({ request }) => {
     hiddenBatch,
     me: user?.id ?? null,
     // People a batch can be assigned to: on a batch, and on the batch list (To ship)
-    staff: canBatches && ((batchId && !view) || (tab === "batches" && !batchId && (params.get("show") || "live") === "live")) ? await assignableStaff(shop) : [],
+    staff: canBatches && ((batchId && !view) || tab === "ordoro" || (tab === "batches" && !batchId && (params.get("show") || "live") === "live")) ? await assignableStaff(shop) : [],
     sandbox: sandboxOn ? await sandboxSummary(session.shop) : null,
     // For "Review in Shopify": the order page in Shopify admin
     shopAdmin: `https://admin.shopify.com/store/${session.shop.replace(/\.myshopify\.com$/, "")}`,
@@ -699,9 +699,10 @@ async function printOnStation({ shop, printShop, admin, user, form, id }) {
 
 // Picking and packing steps (blocked by a release date still to come, or a higher-priority batch)
 const PICK_INTENTS = new Set(["scan", "setPicked", "finishPicking"]);
-// Everything that works a batch (not renaming, cancelling or taking orders out)
+// Everything that works a batch (not planning it: renaming, assigning, priority,
+// cancelling or taking orders out)
 const ORDORO_HELD = new Set([
-  "addToBatch", "scan", "setPicked", "finishPicking", "reopenPicking", "assignBatch", "setPriority",
+  "addToBatch", "scan", "setPicked", "finishPicking", "reopenPicking",
   "packScan", "sealBox", "unpack", "overridePack", "labelCheck", "savePackage", "buyLabel", "buyLabels",
   "completeBatch", "bulkLabelsOverride", "cameraLink", "pickPhoneLink", "setFlow", "flowPickAll",
 ]);
@@ -2067,7 +2068,7 @@ function Page() {
       {tab === "batches" && !batches && !batch && !pick && !pack && !slips && (
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
       )}
-      {tab === "ordoro" && ordoro && <OrdoroTab data={ordoro} canBatches={allowed.batches} />}
+      {tab === "ordoro" && ordoro && <OrdoroTab data={ordoro} canBatches={allowed.batches} canPriority={allowed.priority} staff={staff} me={me} />}
       {tab === "review" && flags && <ReviewTab flags={flags} status={flagStatus} canReview={allowed.review} />}
       {tab === "merge" && (allowed.merge ? <MergeTab data={merge} /> : <s-paragraph>Order Merge needs the "Merge orders" permission.</s-paragraph>)}
       {tab === "stock" && <StockTab overview={overview} />}

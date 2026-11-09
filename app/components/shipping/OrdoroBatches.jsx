@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useFetcher, useRevalidator } from "react-router";
+import { AssignControl, PriorityControl } from "./Batches";
 import { OrderLink } from "./OrderLink";
 import { ago, box, cell, fmtDate, head, pill, small, useParamSetter } from "./ui";
 
@@ -8,7 +9,7 @@ import { ago, box, cell, fmtDate, head, pill, small, useParamSetter } from "./ui
 // MonkeyBean's own). Each one opens like any batch, with what didn't line up.
 // ---------------------------------------------------------------------------
 
-export function OrdoroTab({ data, canBatches }) {
+export function OrdoroTab({ data, canBatches, canPriority = false, staff = [], me = null }) {
   const f = useFetcher();
   const go = useParamSetter();
   const revalidator = useRevalidator();
@@ -69,7 +70,7 @@ export function OrdoroTab({ data, canBatches }) {
           <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "13px" }}>
             <thead>
               <tr>
-                {["Batch", "In Ordoro", "Orders", "Shipped", "To do", "Status", ""].map((h) => (
+                {["Batch", "In Ordoro", "Orders", "Shipped", "To do", "Priority", "Assigned", "Status", ""].map((h) => (
                   <th key={h} style={head}>
                     {h}
                   </th>
@@ -96,6 +97,22 @@ export function OrdoroTab({ data, canBatches }) {
                   <td style={cell}>
                     {b.toDo}
                     {b.packed ? <div style={small}>{b.packed} packed</div> : null}
+                  </td>
+                  <td style={cell}>
+                    {["done", "cancelled"].includes(b.status) ? (
+                      <span style={small}>{["Low", "Normal", "High", "Urgent"][b.priority] ?? "Normal"}</span>
+                    ) : (
+                      <PriorityControl batch={b} canPriority={canPriority} />
+                    )}
+                  </td>
+                  <td style={cell}>
+                    {canBatches && !["done", "cancelled"].includes(b.status) ? (
+                      <AssignControl batch={b} staff={staff} canAssign me={me} compact />
+                    ) : b.assignees.length ? (
+                      b.assignees.map((a) => a.name).join(", ")
+                    ) : (
+                      <span style={small}>—</span>
+                    )}
                   </td>
                   <td style={cell}>
                     {b.blocking > 0 ? (

@@ -425,8 +425,10 @@ export async function ordoroBatchInfo(shop, batch) {
 }
 
 // The Ordoro tab: the imported batches with their counts and locks
-export async function listOrdoroBatches(shop) {
-  const batches = await db.batch.findMany({ where: { shop, source: SOURCE }, orderBy: { number: "desc" }, take: 500 });
+// onlyFor: a staff member id ("Only their assigned batches"): just theirs
+export async function listOrdoroBatches(shop, { onlyFor = null } = {}) {
+  let batches = await db.batch.findMany({ where: { shop, source: SOURCE }, orderBy: { number: "desc" }, take: 500 });
+  if (onlyFor != null) batches = batches.filter((b) => json(b.assignees, []).some((a) => a.id === Number(onlyFor)));
   const ids = batches.map((b) => b.id);
   const [byState, issues, locks] = await Promise.all([
     ids.length ? db.shipment.groupBy({ by: ["batchId", "state"], where: { batchId: { in: ids } }, _count: { _all: true } }) : [],
@@ -443,6 +445,8 @@ export async function listOrdoroBatches(shop) {
       name: b.name,
       ref: b.externalRef,
       status: b.status,
+      priority: b.priority ?? 1,
+      assignees: json(b.assignees, []),
       orders: info.orders ?? null,
       importedAt: info.importedAt ?? null,
       refreshedAt: info.refreshedAt ?? null,
