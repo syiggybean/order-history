@@ -533,9 +533,9 @@ export function BatchHeader({ batch, canBatches, canPick, canPack = false, staff
       <button
         type="button"
         style={{ ...linkBtn, fontWeight: 500, marginBottom: "8px" }}
-        onClick={() => go({ ...(batch.ordoro ? { tab: "ordoro" } : {}), batch: null, view: null, box: null, slips: null }, { replace: false })}
+        onClick={() => go({ batch: null, view: null, box: null, slips: null }, { replace: false })}
       >
-        {batch.ordoro ? "← All Ordoro batches" : "← All batches"}
+        ← All batches
       </button>
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "10px" }}>
         <h2 style={{ margin: 0, fontSize: "20px" }}>{batch.tag}</h2>

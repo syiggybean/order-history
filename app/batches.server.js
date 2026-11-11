@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { SOURCE as ORDORO, ordoroBatchInfo, ordoroLocks } from "./ordoro-batches.server";
 import db from "./db.server";
 import { PACKED_TAG, bulkLabelQuery } from "./pack.server";
 import { dayInStore, errorMessage, gql, TIME_ZONE, todayInStore } from "./preorders.server";
@@ -275,11 +274,6 @@ export async function batchLocks(shop, batches, user, { early = false } = {}) {
     };
     out.set(b.id, { pick: held ?? above(TO_PICK), pack: held ?? above(TO_PACK), releaseDay });
   }
-  // Imported from Ordoro with orders shipped there but not in Shopify: on hold until reconciled
-  const rows = await db.batch.findMany({ where: { shop, id: { in: batches.map((b) => b.id) } }, select: { id: true, tag: true, source: true } });
-  for (const [id, why] of await ordoroLocks(shop, rows)) {
-    out.set(id, { ...(out.get(id) ?? { releaseDay: null }), pick: why, pack: why, ordoro: why });
-  }
   return out;
 }
 
@@ -351,13 +345,11 @@ async function statsFor(batchIds) {
 
 // show: "live" (still to ship) | "done" | "cancelled"
 // onlyFor: a staff member id; just the batches assigned to them
-// Batches imported from Ordoro have their own tab and stay off these lists
-// (ordoro: true lists only them; "too" lists them alongside, e.g. someone's own batches)
-export async function listBatches(shop, { show = "live", onlyFor = null, ordoro = false } = {}) {
+export async function listBatches(shop, { show = "live", onlyFor = null } = {}) {
   if (show === "live") await closeFinishedBatches(shop).catch((e) => console.error(`[batches] closing finished (${shop}):`, errorMessage(e)));
   const status = show === "cancelled" ? ["cancelled"] : show === "done" ? ["done"] : LIVE;
   let batches = await db.batch.findMany({
-    where: { shop, status: { in: status }, ...(ordoro === "too" ? {} : { source: ordoro ? ORDORO : { not: ORDORO } }) },
+    where: { shop, status: { in: status } },
     orderBy: { number: show === "live" ? "asc" : "desc" },
     take: 500,
   });
@@ -385,7 +377,6 @@ export async function getBatch(shop, batchId) {
   const { packedTag } = await getShippingSettings(shop);
   return {
     ...viewBatch(b, stats.get(b.id)),
-    ordoro: await ordoroBatchInfo(shop, b),
     editable: EDITABLE.includes(b.status),
     removable: REMOVABLE.includes(b.status),
     tagIssues,
@@ -1062,21 +1053,8 @@ export async function exportBins(shop) {
 // Batches whose orders have all left (shipped, or fulfilled/cancelled in Shopify or
 // another app, e.g. labels bought on Shopify's own pages): Shipped, or Cancelled
 // if none of them shipped. Runs after every refresh and when the Batches tab opens.
-// An Ordoro import marks its batch while it adds the orders (for up to 30 minutes, in case it stopped)
-const importing = (b) => {
-  if (b.source !== ORDORO || !b.externalInfo) return false;
-  try {
-    const since = JSON.parse(b.externalInfo).importingSince;
-    return Boolean(since) && Date.now() - Date.parse(since) < 30 * 60 * 1000;
-  } catch {
-    return false;
-  }
-};
-
 export async function closeFinishedBatches(shop) {
-  const live = (
-    await db.batch.findMany({ where: { shop, status: { in: LIVE } }, select: { id: true, tag: true, status: true, packDoneAt: true, source: true, externalInfo: true } })
-  ).filter((b) => !importing(b)); // an Ordoro batch still coming in isn't finished, whatever it holds so far
+  const live = await db.batch.findMany({ where: { shop, status: { in: LIVE } }, select: { id: true, tag: true, status: true, packDoneAt: true } });
   if (!live.length) return [];
   const rows = await db.shipment.groupBy({ by: ["batchId", "state"], where: { shop, batchId: { in: live.map((b) => b.id) } }, _count: { _all: true } });
   const counts = new Map();
@@ -1121,4 +1099,47 @@ onAfterRun(async (shop, admin, step) => {
   await closeFinishedBatches(shop);
   step("Updating batch tags on orders");
   await syncBatchTags(shop, admin);
+});
+
+// ---------------------------------------------------------------------------
+// Ordoro batch import was removed (Nov 2026). Once, on the first refresh after
+// that: batches brought in from Ordoro are deleted. Their unshipped orders go
+// back to Ready to ship (re-checked into Waiting where they belong), shipped
+// ones keep their state, and the Ordoro-Batch tags come off in Shopify as the
+// tag sync sees the orders are no longer in a batch.
+// ---------------------------------------------------------------------------
+export async function removeOrdoroBatches(shop) {
+  const gone = await db.batch.findMany({ where: { shop, source: "ordoro" }, select: { id: true, tag: true } });
+  if (!gone.length) return { removed: 0 };
+  const ids = gone.map((b) => b.id);
+  const rows = await db.shipment.findMany({ where: { shop, batchId: { in: ids } }, select: { id: true, orderName: true, state: true } });
+  const packed = rows.filter((r) => ["packed", "labeling"].includes(r.state));
+  const back = rows.filter((r) => ["batched", "packed", "labeling"].includes(r.state));
+  if (back.length)
+    await db.shipment.updateMany({
+      where: { id: { in: back.map((r) => r.id) } },
+      data: {
+        state: "ready", flag: null, packed: null, packedAt: null, packedBy: null, packOverride: null, packAckKey: null,
+        flowPicked: null, flowPickedAt: null,
+      },
+    });
+  // Out of the batches, whatever their state (tags come off on the next tag sync)
+  await db.shipment.updateMany({ where: { id: { in: rows.map((r) => r.id) } }, data: { batchId: null } });
+  await db.ordoroBatchIssue.deleteMany({ where: { shop, batchId: { in: ids } } });
+  await db.batch.deleteMany({ where: { shop, id: { in: ids } } });
+  await logEvent(shop, {
+    type: "ordoro_batches_removed",
+    detail:
+      `Ordoro batch import removed: deleted ${gone.length} batch${gone.length === 1 ? "" : "es"} (${gone.map((b) => b.tag).join(", ")}); ` +
+      `${back.length} unshipped order${back.length === 1 ? "" : "s"} back to Ready to ship` +
+      (packed.length ? `, including ${packed.length} that had been packed (unpack: ${packed.slice(0, 30).map((r) => r.orderName).join(", ")}${packed.length > 30 ? ", …" : ""})` : ""),
+    user: { name: "MonkeyBean" },
+  });
+  return { removed: gone.length, back: back.length, packed: packed.length };
+}
+
+onAfterRun(async (shop, admin, step) => {
+  if (!(await db.batch.count({ where: { shop, source: "ordoro" } }))) return;
+  step("Removing Ordoro batches");
+  await removeOrdoroBatches(shop);
 });

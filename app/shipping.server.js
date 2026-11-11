@@ -537,9 +537,9 @@ export async function refreshReadiness(shop, admin) {
   const items = shipments.flatMap((s) => linesOf(s).filter((l) => l.tracked && l.inventoryItemId).map((l) => l.inventoryItemId));
   const stock = items.length ? await loadStock(admin, items) : {};
   const products = await loadProductInfo(admin, shipments.flatMap((s) => linesOf(s).map((l) => l.productId)));
-  // Batched ahead of a release: auto-batched upcoming releases, and Ordoro batches (their waiting orders are pre-batched)
+  // Batched ahead of a release: auto-batched upcoming releases
   const ahead = new Set(
-    (await db.batch.findMany({ where: { shop, OR: [{ source: { startsWith: "auto:release:" } }, { source: "ordoro" }] }, select: { id: true } })).map((b) => b.id),
+    (await db.batch.findMany({ where: { shop, source: { startsWith: "auto:release:" } }, select: { id: true } })).map((b) => b.id),
   );
   const { readyBeforeReleaseHours } = await getShippingSettings(shop);
   const { changes } = allocate(shipments, stock, new Date(), products, { aheadBatchIds: ahead, earlyHours: readyBeforeReleaseHours ?? 48 });
