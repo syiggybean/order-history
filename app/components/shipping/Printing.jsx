@@ -45,7 +45,7 @@ export function PrintProvider({ printing, children }) {
 export function usePrinterFor(role) {
   const { station } = usePrinting();
   if (!station) return null;
-  const printer = role === "slip" ? station.slipPrinter : station.labelPrinter;
+  const printer = role === "slip" ? station.slipPrinter : role === "barcode" ? station.barcodePrinter : station.labelPrinter;
   return printer ? { station, printer } : null;
 }
 
@@ -217,19 +217,36 @@ function StationCard({ st, install, canSettings, canTest, isThis }) {
   const save = useFetcher();
   const act = useFetcher();
   const test = useAgentTest(st);
-  const [f, setF] = useState({ name: st.name, labelPrinter: st.labelPrinter ?? "", slipPrinter: st.slipPrinter ?? "", slipSize: st.slipSize, labelOptions: st.labelOptions, slipOptions: st.slipOptions });
+  const [f, setF] = useState({
+    name: st.name,
+    labelPrinter: st.labelPrinter ?? "",
+    slipPrinter: st.slipPrinter ?? "",
+    barcodePrinter: st.barcodePrinter ?? "",
+    slipSize: st.slipSize,
+    labelOptions: st.labelOptions,
+    slipOptions: st.slipOptions,
+  });
   const [confirmRemove, setConfirmRemove] = useState(false);
   useEffect(() => {
     // Printers picked automatically on first connect arrive with the refresh
-    setF((x) => ({ ...x, labelPrinter: x.labelPrinter || st.labelPrinter || "", slipPrinter: x.slipPrinter || st.slipPrinter || "" }));
-  }, [st.labelPrinter, st.slipPrinter]);
+    setF((x) => ({
+      ...x,
+      labelPrinter: x.labelPrinter || st.labelPrinter || "",
+      slipPrinter: x.slipPrinter || st.slipPrinter || "",
+      barcodePrinter: x.barcodePrinter || st.barcodePrinter || "",
+    }));
+  }, [st.labelPrinter, st.slipPrinter, st.barcodePrinter]);
   const dirty =
-    f.name !== st.name || f.labelPrinter !== (st.labelPrinter ?? "") || f.slipPrinter !== (st.slipPrinter ?? "") || f.slipSize !== st.slipSize || f.labelOptions !== st.labelOptions || f.slipOptions !== st.slipOptions;
-  const printerSelect = (k, label) => (
+    f.name !== st.name ||
+    f.labelPrinter !== (st.labelPrinter ?? "") ||
+    f.slipPrinter !== (st.slipPrinter ?? "") ||
+    f.barcodePrinter !== (st.barcodePrinter ?? "") ||
+    f.slipSize !== st.slipSize || f.labelOptions !== st.labelOptions || f.slipOptions !== st.slipOptions;
+  const printerSelect = (k, label, none = "None (use the print dialog)") => (
     <label style={{ display: "grid", gap: "4px", fontSize: "13px" }}>
       <span style={{ fontWeight: 600 }}>{label}</span>
       <select value={f[k]} disabled={!canSettings} onChange={(e) => setF({ ...f, [k]: e.target.value })} style={{ ...input, maxWidth: "320px" }}>
-        <option value="">None (use the print dialog)</option>
+        <option value="">{none}</option>
         {st.printers.map((p) => (
           <option key={p.name} value={p.name}>
             {p.description || p.name}
@@ -243,7 +260,7 @@ function StationCard({ st, install, canSettings, canTest, isThis }) {
   );
   // A command made here (Reinstall / New install command); hidden once the Mac has used it
   const fresh = act.data?.intent === "installCode" && act.data.command ? act.data : null;
-  const paused = st.printers.filter((p) => p.state === "disabled" && [st.labelPrinter, st.slipPrinter].includes(p.name));
+  const paused = st.printers.filter((p) => p.state === "disabled" && [st.labelPrinter, st.slipPrinter, st.barcodePrinter].includes(p.name));
 
   return (
     <div style={{ border: "1px solid #e3e3e3", borderRadius: "10px", padding: "12px 14px", background: "#fff" }}>
@@ -268,6 +285,7 @@ function StationCard({ st, install, canSettings, canTest, isThis }) {
         <div style={{ display: "flex", flexWrap: "wrap", gap: "16px", marginTop: "10px", alignItems: "flex-end" }}>
           {printerSelect("labelPrinter", "Shipping labels")}
           {printerSelect("slipPrinter", "Packing slips")}
+          {printerSelect("barcodePrinter", "Barcode labels (2 × 1 Zebra)", "None")}
           <label style={{ display: "grid", gap: "4px", fontSize: "13px" }}>
             <span style={{ fontWeight: 600 }}>Slip paper</span>
             <select value={f.slipSize} disabled={!canSettings} onChange={(e) => setF({ ...f, slipSize: e.target.value })} style={input}>
@@ -278,6 +296,9 @@ function StationCard({ st, install, canSettings, canTest, isThis }) {
         </div>
       )}
       {st.paired && !st.printers.length && <div style={{ ...small, marginTop: "8px" }}>No printers reported yet. Add the printers in the Mac's System Settings → Printers & Scanners, then Refresh printers.</div>}
+      {st.barcodePrinter && !st.barcodeZebra && (
+        <div style={{ fontSize: "12px", color: "#8a6100", marginTop: "6px" }}>⚠ Barcode labels are sent as raw ZPL, which only a Zebra printer understands. Choose the ZD410 here.</div>
+      )}
       {st.labelZebra && <div style={{ ...small, marginTop: "6px" }}>Zebra label printer: labels in ZPL format print natively; PDF labels print through its Mac driver.</div>}
       {paused.length > 0 && (
         <div style={{ fontSize: "12px", color: "#8a6100", marginTop: "6px" }}>
@@ -325,6 +346,11 @@ function StationCard({ st, install, canSettings, canTest, isThis }) {
             <button type="button" style={btn} disabled={!st.slipPrinter || dirty} onClick={() => test.run("slip")} title={dirty ? "Save first" : ""}>
               Test slip
             </button>
+            {st.barcodePrinter && (
+              <button type="button" style={btn} disabled={dirty} onClick={() => test.run("barcode")} title={dirty ? "Save first" : ""}>
+                Test barcode label
+              </button>
+            )}
           </>
         )}
         {canSettings && st.paired && (

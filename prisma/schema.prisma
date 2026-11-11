@@ -1291,6 +1291,7 @@ model PrintStation {
   slipPrinter   String?
   slipOptions   String?
   slipSize      String?   // letter | 4x6
+  barcodePrinter String?  // Zebra for 2 × 1 product barcode labels (raw ZPL)
   createdAt     DateTime  @default(now())
   createdBy     String?
 
@@ -1301,8 +1302,8 @@ model PrintJob {
   id        Int       @id @default(autoincrement())
   shop      String
   stationId Int
-  kind      String    // label | labels | slips | test-label | test-slip
-  role      String    // label | slip (which of the station's printers)
+  kind      String    // label | labels | slips | barcode | test-label | test-slip | test-barcode
+  role      String    // label | slip | barcode (which of the station's printers)
   title     String
   printer   String
   options   String?

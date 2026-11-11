@@ -21,6 +21,7 @@ export default function App() {
         {/* Home first, then the rest A–Z */}
         <s-link href="/app">Home</s-link>
         <s-link href="/app/my-views">My Views</s-link>
+        {allows(user, "barcodeLabels") && <s-link href="/app/barcode-labels">Barcode labels</s-link>}
         {allows(user, "blocklist") && <s-link href="/app/blocked">Blocked customers</s-link>}
         {allows(user, "debug") && <s-link href="/app/debug">Debug</s-link>}
         {allows(user, "inventory") && <s-link href="/app/inventory">Inventory history</s-link>}

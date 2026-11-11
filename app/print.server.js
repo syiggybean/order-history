@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import db from "./db.server";
+import { buildZpl } from "./barcode-labels";
 import agentScript from "./print-agent/agent.sh?raw";
 import installTemplate from "./print-agent/install.sh?raw";
 import uninstallScript from "./print-agent/uninstall.sh?raw";
@@ -129,6 +130,8 @@ export function stationView(st) {
     slipPrinter: st.slipPrinter ?? null,
     slipOptions: st.slipOptions ?? "",
     slipSize: SLIP_SIZES.includes(st.slipSize) ? st.slipSize : "letter",
+    barcodePrinter: st.barcodePrinter ?? null,
+    barcodeZebra: Boolean(printers.find((p) => p.name === st.barcodePrinter)?.zebra),
     labelZebra: Boolean(printers.find((p) => p.name === st.labelPrinter)?.zebra),
   };
 }
@@ -174,7 +177,7 @@ export async function saveStation(shop, id, input) {
     data.name = n;
   }
   const names = new Set(parse(st.printers, []).map((p) => p.name));
-  for (const k of ["labelPrinter", "slipPrinter"]) {
+  for (const k of ["labelPrinter", "slipPrinter", "barcodePrinter"]) {
     if (input[k] === undefined) continue;
     const v = input[k] ? String(input[k]) : null;
     if (v && !names.has(v)) throw new PrintError(`“${v}” isn't one of this Mac's printers. Refresh its printers and choose again.`);
@@ -257,8 +260,8 @@ export async function stationReady(shop, stationId, role) {
   const st = await db.printStation.findFirst({ where: { shop, id: Number(stationId) } });
   if (!st) return { ready: false, reason: "removed" };
   if (!online(st)) return { ready: false, reason: "offline", station: st.name };
-  const printer = role === "slip" ? st.slipPrinter : st.labelPrinter;
-  if (!printer) return { ready: false, reason: "noPrinter", station: st.name };
+  const printer = role === "slip" ? st.slipPrinter : role === "barcode" ? st.barcodePrinter : st.labelPrinter;
+  if (!printer) return { ready: false, reason: role === "barcode" ? "noBarcodePrinter" : "noPrinter", station: st.name };
   return { ready: true, station: st, printer };
 }
 
@@ -267,6 +270,7 @@ export const FALLBACK_TEXT = {
   removed: "The packing computer chosen here was removed",
   offline: "{station} isn't connected (is the Mac on?)",
   noPrinter: "{station} has no printer chosen for this",
+  noBarcodePrinter: "{station} has no barcode printer chosen (Shipping → Settings → Packing computers)",
 };
 export const fallbackText = (r) => (FALLBACK_TEXT[r?.reason] ?? "Direct printing isn't available").replace("{station}", r?.station ?? "The packing computer");
 
@@ -284,6 +288,7 @@ export async function queuePrint(shop, stationId, doc, user) {
       title: oneLine(doc.title, 120) || "MonkeyBean",
       printer: r.printer,
       options: doc.format === "ZPL" ? null : cleanOptions(doc.role === "slip" ? st.slipOptions : st.labelOptions) || null,
+      // ZPL carries its own label count (^PQ); copies are for PDFs
       format: doc.format === "ZPL" ? "ZPL" : "PDF",
       copies: Math.min(Math.max(Number(doc.copies) || 1, 1), 20),
       data: Buffer.from(doc.bytes),
@@ -326,6 +331,11 @@ export async function retryJob(shop, id, user) {
 export async function testPrint(shop, stationId, role, user) {
   const r = await stationReady(shop, stationId, role);
   if (!r.ready) return { fallback: r.reason, text: fallbackText(r) };
+  if (role === "barcode") {
+    // One 2 × 1 label in native ZPL, with a valid UPC so the scanner can check it
+    const bytes = Buffer.from(buildZpl({ title: "MonkeyBean test label", sku: r.station.name, barcode: "036000291452" }, 1), "utf8");
+    return queuePrint(shop, r.station.id, { role, kind: "test-barcode", title: "Test barcode label", format: "ZPL", bytes }, user);
+  }
   const { PDFDocument, StandardFonts } = await import("pdf-lib");
   const st = r.station;
   const slip = role === "slip";
@@ -401,6 +411,11 @@ export async function agentHello(st, form) {
   if (!st.labelPrinter || !names.has(st.labelPrinter)) {
     const thermal = printers.filter((p) => p.thermal);
     if (!st.labelPrinter && thermal.length === 1) data.labelPrinter = thermal[0].name;
+  }
+  // A ZD410 that isn't the shipping-label printer is the barcode printer
+  if (!st.barcodePrinter) {
+    const zd = printers.filter((p) => /zd\s?41\d/i.test(`${p.name} ${p.description ?? ""}`) && p.name !== (data.labelPrinter ?? st.labelPrinter));
+    if (zd.length === 1) data.barcodePrinter = zd[0].name;
   }
   if (!st.slipPrinter) {
     const plain = printers.filter((p) => !p.thermal);
