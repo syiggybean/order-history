@@ -276,6 +276,12 @@ function LabelPanel({ box: b, batchId, label, sandbox, canShip, canPrint, buying
           "In Shopify: Create shipping label → buy → print."
         )}
       </div>
+      {b.mergedWith?.length > 0 && !IN_APP_LABELS && (
+        <div style={{ fontSize: "13px", marginTop: "6px", color: "#1c4a9c" }}>
+          This box also holds {b.mergedWith.join(", ")}'s items. Shopify's label page only lists {b.orderName}, so weigh the whole box; once the label's
+          bought, {b.mergedWith.length === 1 ? "that order is" : "those orders are"} marked shipped with the same tracking.
+        </div>
+      )}
       {err && <div style={{ fontSize: "13px", marginTop: "6px", color: "#b42318" }}>{err}</div>}
       {st === "none" && <div style={{ fontSize: "13px", marginTop: "6px", color: "#7a4f01" }}>No label on this order yet.</div>}
       {st === "blocked" && (

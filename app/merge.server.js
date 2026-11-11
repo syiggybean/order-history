@@ -1,6 +1,6 @@
 import db from "./db.server";
 import { gql } from "./preorders.server";
-import { ShippingError, isSandboxShop, kick, linesOf, logEvent, onAfterRun, releaseHold, syncOrder } from "./shipping.server";
+import { ShippingError, isSandboxShop, kick, linesOf, logEvent, onAfterRun, onOrdersSynced, releaseHold, syncOrder } from "./shipping.server";
 
 // ---------------------------------------------------------------------------
 // Order Merge: open orders for the same customer and address shipped in one box.
@@ -522,8 +522,9 @@ const FULFILL = `#graphql
 
 // After each refresh: merged boxes whose main order has shipped → fulfill the other
 // orders' items with the same tracking. Main order cancelled → the merge ends.
-export async function shipMergedBoxes(shop, admin) {
-  const open = await db.mergeGroup.findMany({ where: { shop, status: "open" } });
+// groupIds: just these boxes (when one's label has just been bought)
+export async function shipMergedBoxes(shop, admin, { groupIds = null } = {}) {
+  const open = await db.mergeGroup.findMany({ where: { shop, status: "open", ...(groupIds ? { id: { in: groupIds } } : {}) } });
   const done = [];
   for (const g of open) {
     const main = await db.shipment.findFirst({ where: { id: g.mainShipmentId } });
@@ -547,7 +548,10 @@ export async function shipMergedBoxes(shop, admin) {
       if (r.done) continue;
       const s = await db.shipment.findFirst({ where: { id: r.shipmentId } });
       try {
-        if (!sandbox && s) {
+        // Already fulfilled another way (e.g. marked shipped by hand in Shopify): nothing to send
+        const fo = !sandbox ? await gql(admin, TRACKING, { id: r.fulfillmentOrderId }).catch(() => null) : null;
+        const already = s?.state === "shipped" || fo?.fulfillmentOrder?.status === "CLOSED";
+        if (!sandbox && s && !already) {
           if (s.appHoldId) await releaseHold(admin, s);
           const res = await gql(admin, FULFILL, {
             fulfillment: {
@@ -599,3 +603,29 @@ onAfterRun(async (shop, admin, step) => {
   step("Merged boxes");
   await shipMergedBoxes(shop, admin);
 });
+
+// Straight after Shopify says an order changed: a merged box whose main order
+// just shipped sends the others' items at once (not after the next full read)
+onOrdersSynced(async (shop, admin, orderIds) => {
+  const groups = await db.shipment.findMany({
+    where: { shop, orderId: { in: orderIds }, mergeGroupId: { not: null }, mergedInto: null, state: "shipped" },
+    select: { mergeGroupId: true },
+  });
+  if (groups.length) await shipMergedBoxes(shop, admin, { groupIds: [...new Set(groups.map((g) => g.mergeGroupId))] });
+});
+
+// "Ship outside a batch": check Shopify now for that order (label bought?), and
+// send a merged box's other orders if so
+export async function checkShipped(shop, admin, shipmentId) {
+  const s = await db.shipment.findFirst({ where: { shop, id: Number(shipmentId) } });
+  if (!s) throw new ShippingError("That shipment isn't here any more.");
+  await syncOrder(shop, admin, s.orderId);
+  const fresh = await db.shipment.findUnique({ where: { id: s.id } });
+  let merged = [];
+  if (fresh?.state === "shipped" && fresh.mergeGroupId && !fresh.mergedInto) {
+    const g = await db.mergeGroup.findUnique({ where: { id: fresh.mergeGroupId } });
+    await shipMergedBoxes(shop, admin, { groupIds: [fresh.mergeGroupId] });
+    merged = json(g?.riders, []).map((r) => r.orderName);
+  }
+  return { shipped: fresh?.state === "shipped", state: fresh?.state ?? "closed", merged };
+}

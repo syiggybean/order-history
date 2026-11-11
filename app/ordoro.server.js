@@ -37,6 +37,7 @@ export const STATUSES = { open: "Open", resolved: "Resolved", ignored: "Ignored"
 
 const clean = (v) => (v === null || v === undefined || String(v).trim() === "" ? null : String(v).trim());
 const money = (n) => Math.round(Number(n || 0) * 100) / 100;
+const num = (n) => (n === null || n === undefined || n === "" || Number.isNaN(Number(n)) ? null : money(n));
 
 // ---------------------------------------------------------------------------
 // Ordoro
@@ -97,6 +98,12 @@ export function normalizeOrdoro(o) {
       country_code: countryCode(a.country),
     },
     total: o.financial?.grand_total != null ? money(o.financial.grand_total) : null,
+    // Its parts, where Ordoro gives them (to explain a total that differs)
+    money: {
+      shipping: num(o.financial?.shipping_amount ?? o.financial?.shipping),
+      tax: num(o.financial?.tax_amount ?? o.financial?.tax),
+      discount: num(o.financial?.discount_amount ?? o.financial?.discount),
+    },
     channel: o.sales_channel?.id != null ? String(o.sales_channel.id) : null,
   };
 }
@@ -124,6 +131,8 @@ export function combineSplits(list) {
       tracking: [...new Set(parts.flatMap((p) => p.tracking))],
       lines: [...lines.entries()].map(([sku, qty]) => ({ sku: sku === "(no SKU)" ? null : sku, qty })),
       total: main.total ?? parts.reduce((t, p) => t + (p.total ?? 0), 0),
+      // Ordoro may give each part its own share of the order's total
+      partsTotal: parts.every((p) => p.total !== null) ? money(parts.filter((p) => !p.cancelled || parts.every((x) => x.cancelled)).reduce((t, p) => t + p.total, 0)) : null,
       cartOrderId: parts.map((p) => p.cartOrderId).find(Boolean) ?? null,
     };
   });
@@ -166,6 +175,11 @@ const shopifyOrdersQuery = (fromDay, toDay) => `{
         test
         displayFulfillmentStatus
         currentTotalPriceSet { shopMoney { amount } }
+        totalPriceSet { shopMoney { amount } }
+        totalRefundedSet { shopMoney { amount } }
+        totalShippingPriceSet { shopMoney { amount } }
+        totalTaxSet { shopMoney { amount } }
+        totalDiscountsSet { shopMoney { amount } }
         shippingAddress { name address1 address2 city provinceCode zip countryCodeV2 }
         fulfillments { status trackingInfo { number } }
         lineItems { edges { node { sku currentQuantity requiresShipping name } } }
@@ -204,6 +218,12 @@ export async function fetchShopify(admin, fromDay, toDay, step) {
       ],
       address: r.shippingAddress ?? null,
       total: money(r.currentTotalPriceSet?.shopMoney?.amount),
+      // The other totals Ordoro might have: as placed, after refunds; and the parts
+      original: r.totalPriceSet ? money(r.totalPriceSet.shopMoney?.amount) : null,
+      refunded: money(r.totalRefundedSet?.shopMoney?.amount),
+      shipping: money(r.totalShippingPriceSet?.shopMoney?.amount),
+      tax: money(r.totalTaxSet?.shopMoney?.amount),
+      discounts: money(r.totalDiscountsSet?.shopMoney?.amount),
       allLines: [],
     });
   }
@@ -248,9 +268,39 @@ export function compareOrders(s, o) {
     const sk = addressKey(s.address);
     const ok = addressKey(o.address);
     if (sk && ok && sk !== ok) add("address", addressText(s.address), addressText(o.address));
-    if (o.total !== null && Math.abs(s.total - o.total) > 0.01) add("total", `$${s.total.toFixed(2)}`, `$${o.total.toFixed(2)}`);
+    const t = totalCheck(s, o);
+    if (t) add("total", t.shopify, t.ordoro);
   }
   return issues;
+}
+
+// Order totals: only a real difference is a problem. Shopify's current total
+// moves with refunds and edits, and Ordoro may count shipping, tax or discounts
+// differently, so a total that matches Shopify's as placed, after refunds, or
+// differs by exactly one of those parts isn't flagged. What's left says why.
+const near = (a, b) => a !== null && b !== null && Math.abs(a - b) <= 0.02;
+const usd = (n) => `$${(n ?? 0).toFixed(2)}`;
+export function totalCheck(s, o) {
+  if (o.total === null) return null;
+  const ord = [o.total, o.partsTotal].filter((x) => x !== null && x !== undefined);
+  const placed = s.original ?? s.total;
+  const shop = [s.total, placed, placed !== null ? money(placed - (s.refunded ?? 0)) : null].filter((x) => x !== null);
+  // Same total, one way or another
+  if (ord.some((a) => shop.some((b) => near(a, b)))) return null;
+  // Differs by exactly a part Shopify counts and Ordoro may not (or the other way)
+  const parts = [s.shipping, s.tax, s.discounts, s.refunded, money((s.shipping ?? 0) + (s.tax ?? 0))].filter((x) => x);
+  if (ord.some((a) => shop.some((b) => parts.some((p) => near(Math.abs(b - a), p))))) return null;
+  const bits = [`total ${usd(s.total)}`];
+  if (s.original !== null && !near(s.original, s.total)) bits.push(`placed at ${usd(s.original)}`);
+  if (s.refunded) bits.push(`${usd(s.refunded)} refunded`);
+  bits.push(`shipping ${usd(s.shipping)}`, `tax ${usd(s.tax)}`);
+  if (s.discounts) bits.push(`discounts ${usd(s.discounts)}`);
+  const obits = [`total ${usd(o.total)}`];
+  if (o.partsTotal !== null && o.partsTotal !== undefined && !near(o.partsTotal, o.total)) obits.push(`its parts add to ${usd(o.partsTotal)}`);
+  if (o.money?.shipping !== null && o.money?.shipping !== undefined) obits.push(`shipping ${usd(o.money.shipping)}`);
+  if (o.money?.tax !== null && o.money?.tax !== undefined) obits.push(`tax ${usd(o.money.tax)}`);
+  const diff = money(s.total - o.total);
+  return { shopify: `${bits.join(" · ")}`, ordoro: `${obits.join(" · ")} (${diff > 0 ? "Shopify is" : "Ordoro is"} ${usd(Math.abs(diff))} higher)` };
 }
 
 // Both lists → [{ key, shopify, ordoro, issues }] for the ones that differ

@@ -671,6 +671,11 @@ export async function labelCheck(shop, admin, batchId, shipmentId) {
   let tracking = [];
   let voided = 0;
   let labels = 0;
+  if (fresh.state === "shipped" && fresh.mergeGroupId && !fresh.mergedInto) {
+    // A merged box: the other orders' items go out on this label's tracking now
+    const { shipMergedBoxes } = await import("./merge.server");
+    await shipMergedBoxes(shop, admin, { groupIds: [fresh.mergeGroupId] }).catch((e) => console.error("[pack] merged box:", e?.message ?? e));
+  }
   if (fresh.state === "shipped") {
     const justNow = s.state !== "shipped";
     const data = await gql(admin, FO_TRACKING, { id: s.fulfillmentOrderId }).catch(() => null);

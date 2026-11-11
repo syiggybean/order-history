@@ -1360,6 +1360,11 @@ const afterRun = [];
 export const onAfterRun = (fn) => {
   if (!afterRun.includes(fn)) afterRun.push(fn);
 };
+// Right after orders Shopify told us about are re-read (before anything slower)
+const ordersSynced = [];
+export const onOrdersSynced = (fn) => {
+  if (!ordersSynced.includes(fn)) ordersSynced.push(fn);
+};
 const progress = new Map(); // shop -> what the run is doing now
 const lastRun = new Map(); // shop -> how the last full read went
 const pendingOrders = new Map(); // shop -> Set(orderId)
@@ -1389,6 +1394,14 @@ async function work(shop, full, manual) {
     const s = await getShippingSettings(shop);
     const fullDue = full || !s.lastFullSyncAt || Date.now() - s.lastFullSyncAt.getTime() > 30 * 60 * 1000;
     let read = null;
+    // Orders Shopify just told us about come first: a full read can take minutes
+    const changed = [...(pendingOrders.get(shop) ?? [])];
+    pendingOrders.delete(shop);
+    if (changed.length) {
+      step(`Re-reading ${changed.length} changed order${changed.length === 1 ? "" : "s"}`);
+      for (const id of changed) await syncOrder(shop, admin, id).catch((e) => console.error("[shipping] order sync:", errorMessage(e)));
+      for (const hook of ordersSynced) await hook(shop, admin, changed).catch((e) => console.error("[shipping] orders synced:", errorMessage(e)));
+    }
     if (fullDue) {
       p.full = true;
       // Quick pass first, so stock and pre-order changes show without waiting for the full read

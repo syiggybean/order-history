@@ -24,7 +24,7 @@ import {
   uninstallCommand,
 } from "../print.server";
 import { slipsPdf } from "../slips-pdf.server";
-import { createMerge, customerPlan, listMerges, mergeCandidates, saveBoxes, searchCustomers, undoMerge } from "../merge.server";
+import { checkShipped, createMerge, customerPlan, listMerges, mergeCandidates, saveBoxes, searchCustomers, undoMerge } from "../merge.server";
 import { MergeTab } from "../components/shipping/Merge";
 import { benchContext, benchLink, benchTakeScans, benchUnlink, pickPhoneLink, videosFor } from "../camera.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
@@ -85,7 +85,7 @@ import {
   scanPick,
   setPicked,
 } from "../batches.server";
-import { Items, MOTION_CSS, PINK, ProductName, QuickViewContext, STORE_TZ, ago, box, cell, fmtDate, head, input, muted, pill, small, thumb, useParamSetter } from "../components/shipping/ui";
+import { GreenButton, Items, MOTION_CSS, PINK, ProductName, QuickViewContext, STORE_TZ, ago, box, cell, fmtDate, head, input, muted, pill, small, thumb, useParamSetter } from "../components/shipping/ui";
 import {
   ShippingError,
   allowOutsideBatch,
@@ -289,6 +289,7 @@ const NEEDS = {
   order: "view",
   outside: "shipOutside",
   clearOutside: "shipOutside",
+  outsideCheck: "shipOutside",
   settings: "settings",
   sync: "settings",
   autoSettings: "settings",
@@ -433,6 +434,8 @@ export const action = async ({ request }) => {
       await clearOutsideBatch(shop, id, user);
       return { intent, ok: true, id };
     }
+    // Shipped outside a batch: has Shopify got the label yet? (and a merged box's other orders go with it)
+    if (intent === "outsideCheck") return { intent, ok: true, id, ...(await checkShipped(shop, admin, id)) };
     if (intent === "readyBeforeRelease") {
       await saveReadyBeforeRelease(shop, form.get("hours"), user);
       runNow(shop, { full: false }).catch(() => {});
@@ -548,14 +551,14 @@ export const action = async ({ request }) => {
     if (intent === "printStations") return { intent, stations: await listStations(session.shop), ...(form.get("jobs") === "1" ? { jobs: await recentJobs(session.shop) } : {}) };
     if (intent === "setMyStation") return (await rememberStation(session.shop, staffKeyOf(user), Number(form.get("stationId")) || null), { intent, ok: true });
     if (intent === "retryPrint") return { intent, ...(await retryJob(session.shop, id, user)) };
-    if (intent === "testPrint") return { intent, role: String(form.get("role")), ...(await testPrint(session.shop, id, form.get("role") === "slip" ? "slip" : "label", user)) };
+    if (intent === "testPrint") return { intent, role: String(form.get("role")), ...(await testPrint(session.shop, id, ["slip", "barcode"].includes(form.get("role")) ? String(form.get("role")) : "label", user)) };
     if (intent === "addStation") return { intent, ok: true, ...(await addStation(session.shop, form.get("name"), user, appUrl(request))) };
     if (intent === "installCode") return { intent, ok: true, ...(await newInstallCode(session.shop, id, appUrl(request))) };
     if (intent === "removeStation") return { intent, ok: true, ...(await removeStation(session.shop, id)) };
     if (intent === "refreshPrinters") return { intent, ok: true, ...(await refreshPrinters(session.shop, id)) };
     if (intent === "saveStation") {
       const input = {};
-      for (const k of ["name", "labelPrinter", "slipPrinter", "labelOptions", "slipOptions", "slipSize"]) if (form.has(k)) input[k] = String(form.get(k));
+      for (const k of ["name", "labelPrinter", "slipPrinter", "barcodePrinter", "labelOptions", "slipOptions", "slipSize"]) if (form.has(k)) input[k] = String(form.get(k));
       return { intent, ok: true, station: await saveStation(session.shop, id, input) };
     }
     if (intent === "methodRules") {
@@ -780,16 +783,46 @@ function LastRead({ last }) {
 
 function OutsideBatch({ s, gate = (fn) => fn() }) {
   const fetcher = useFetcher();
+  const admin = useContext(ShopAdminContext);
   const [open, setOpen] = useState(false);
   const [reason, setReason] = useState("");
   const busy = fetcher.state !== "idle";
   if (s.override) {
+    const others = s.merge?.role === "box" ? (s.merge.orders ?? []).map((o) => o.orderName) : [];
+    const checked = fetcher.data?.intent === "outsideCheck" ? fetcher.data : null;
     return (
-      <div>
+      <div style={{ display: "flex", flexDirection: "column", gap: "4px", maxWidth: "240px" }}>
         <span style={pill("#e8f0fe", "#1c4a9c")}>Let through</span>
         <div style={small}>
           {s.override.by ?? "Staff"}: {s.override.reason}
         </div>
+        {/* Buying the label: on the order in Shopify, like from a batch's Pack page */}
+        {admin && (
+          <GreenButton href={`${admin}/orders/${s.orderNumber}`} target="_blank">
+            Buy label in Shopify ↗
+          </GreenButton>
+        )}
+        {others.length > 0 && (
+          <div style={small}>
+            This box also holds {others.join(", ")}'s items. Shopify's label page only lists {s.orderName}; they're marked shipped with the same tracking once
+            the label's bought.
+          </div>
+        )}
+        <s-button
+          variant="tertiary"
+          onClick={() => fetcher.submit({ intent: "outsideCheck", id: String(s.id) }, { method: "post" })}
+          {...(busy && fetcher.formData?.get("intent") === "outsideCheck" ? { loading: true } : {})}
+        >
+          Bought it? Check Shopify
+        </s-button>
+        {checked && (
+          <div style={{ ...small, color: checked.shipped ? "#1a5e20" : "#7a4f01" }}>
+            {checked.shipped
+              ? `Shipped ✓${checked.merged.length ? ` · ${checked.merged.join(", ")} marked shipped too` : ""}`
+              : "Shopify doesn't show a label for it yet."}
+          </div>
+        )}
+        {fetcher.data?.error && <span style={{ color: "#b42318", fontSize: "12px" }}>{fetcher.data.error}</span>}
         <s-button variant="tertiary" onClick={() => gate(() => fetcher.submit({ intent: "clearOutside", id: String(s.id) }, { method: "post" }))}>
           Undo
         </s-button>
