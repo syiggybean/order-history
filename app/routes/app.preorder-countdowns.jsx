@@ -382,14 +382,26 @@ function Sold({ m }) {
   );
 }
 
-function ProductCell({ title, imageUrl, productId }) {
+// With onOpen the name opens the countdown's flyout (which links to Shopify);
+// without it the name goes straight to the product in Shopify
+function ProductCell({ title, imageUrl, productId, onOpen }) {
   const numeric = productId?.split("/").pop();
   return (
     <div style={{ display: "flex", gap: "10px", alignItems: "center", minWidth: "180px" }}>
       {imageUrl ? <img src={imageUrl} alt="" style={thumb} /> : <div style={thumb} />}
-      <a href={`shopify:admin/products/${numeric}`} target="_top" style={{ color: "#005bd3" }}>
-        {title}
-      </a>
+      {onOpen ? (
+        <button
+          type="button"
+          onClick={onOpen}
+          style={{ appearance: "none", border: 0, background: "none", padding: 0, font: "inherit", color: "#005bd3", textDecoration: "underline", cursor: "pointer", textAlign: "left" }}
+        >
+          {title}
+        </button>
+      ) : (
+        <a href={`shopify:admin/products/${numeric}`} target="_top" style={{ color: "#005bd3" }}>
+          {title}
+        </a>
+      )}
     </div>
   );
 }
@@ -690,7 +702,7 @@ function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect, onOpen
         </td>
       )}
       <td style={{ ...cell, ...stickL, left: canManage ? `${CHECK_W}px` : 0 }}>
-        <ProductCell {...w} />
+        <ProductCell {...w} onOpen={onOpen} />
         <div style={{ display: "flex", gap: "4px", marginTop: "4px", flexWrap: "wrap" }}>
           {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Auto</span>}
           {!w.opensAt && !w.closesAt && <span style={pill("#fff1e3", "#8a4b00")}>Not set up</span>}

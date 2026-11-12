@@ -33,18 +33,9 @@ const TOOLS = [
     title: "Pre-orders",
     feature: "preorders",
     description:
-      "GT tags and shipping profiles, kept in sync with each product's release date. Runs every morning and whenever a product is edited.",
+      "GT tags and shipping profiles, kept in sync with each product's release date. Runs every morning and whenever a product is edited. Countdowns are a tab inside.",
     href: "/app/preorders",
     action: "Open pre-orders",
-    status: "live",
-  },
-  {
-    title: "Pre-order countdowns",
-    feature: "preorders",
-    description:
-      "Part of Pre-orders. Products with an upcoming release date can get a countdown automatically; set when pre-orders open and close, and buying is blocked outside the window.",
-    href: "/app/preorder-countdowns",
-    action: "Open countdowns",
     status: "live",
   },
   {
