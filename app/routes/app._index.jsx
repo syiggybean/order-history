@@ -42,7 +42,7 @@ const TOOLS = [
     title: "Pre-order countdowns",
     feature: "preorders",
     description:
-      "Pick products and set when pre-orders open and close. The product page shows a flip-clock countdown, and buying is blocked outside the window.",
+      "Part of Pre-orders. Products with an upcoming release date can get a countdown automatically; set when pre-orders open and close, and buying is blocked outside the window.",
     href: "/app/preorder-countdowns",
     action: "Open countdowns",
     status: "live",

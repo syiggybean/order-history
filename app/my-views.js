@@ -20,6 +20,7 @@ export const VIEWS = [
   { id: "countdowns-open", page: "preorder-countdowns", param: ["tab", "open"], label: "Open and upcoming", group: "Pre-order countdowns", need: ["preorders", "view"], isDefault: true },
   { id: "countdowns-history", page: "preorder-countdowns", param: ["tab", "history"], label: "History", group: "Pre-order countdowns", need: ["preorders", "view"] },
   { id: "countdowns-emails", page: "preorder-countdowns", param: ["tab", "emails"], label: "Emails and settings", group: "Pre-order countdowns", need: ["preorders", "view"] },
+  { id: "countdowns-auto", page: "preorder-countdowns", param: ["tab", "auto"], label: "Automatic", group: "Pre-order countdowns", need: ["preorders", "view"] },
   { id: "po-list", page: "purchase-orders", param: ["view", "list"], label: "Purchase orders", group: "Purchase orders", need: ["purchaseOrders", "view"], isDefault: true },
   { id: "po-suppliers", page: "purchase-orders", param: ["view", "suppliers"], label: "Suppliers", group: "Purchase orders", need: ["purchaseOrders", "view"] },
   { id: "po-template", page: "purchase-orders", param: ["view", "template"], label: "PO template", group: "Purchase orders", need: ["purchaseOrders", "view"] },

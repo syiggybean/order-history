@@ -29,7 +29,6 @@ export default function App() {
         {allows(user, "loyalty") && <s-link href="/app/loyalty">Loyalty</s-link>}
         {allows(user, "reconciliation") && <s-link href="/app/ordoro">Ordoro reconciliation</s-link>}
         {user?.isAdmin && <s-link href="/app/permissions">Permissions</s-link>}
-        {allows(user, "preorders") && <s-link href="/app/preorder-countdowns">Pre-order countdowns</s-link>}
         {allows(user, "preorders") && <s-link href="/app/preorders">Pre-orders</s-link>}
         {allows(user, "purchaseOrders") && <s-link href="/app/purchase-orders">Purchase orders</s-link>}
         {allows(user, "receiving") && <s-link href="/app/receiving">Receiving</s-link>}

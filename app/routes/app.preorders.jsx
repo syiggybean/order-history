@@ -5,6 +5,7 @@ import { ProductLink, QuickView } from "../components/QuickView";
 import db from "../db.server";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { NoAccess } from "../components/NoAccess";
+import { PreorderTabs } from "../components/PreorderTabs";
 import {
   DAILY_HOUR,
   buildPlan,
@@ -285,6 +286,7 @@ function PreordersPage() {
 
   return (
     <s-page heading="Pre-orders">
+      <PreorderTabs />
       {error && (
         <s-banner tone="critical" heading="Something went wrong">
           <s-paragraph>{error}</s-paragraph>

@@ -290,6 +290,13 @@ model PreorderWindow {
   closesRule       String?
   // Release (publication) date last read from Shopify, "YYYY-MM-DD"
   releaseDay       String?
+  // Added by automatic countdowns (products with an upcoming release date)
+  auto             Boolean   @default(false)
+  // After pre-orders close: take the countdown off the page and keep
+  // "Continue selling when out of stock" on, instead of "Pre-Orders Closed"
+  keepSelling      Boolean   @default(false)
+  // Skip the "pre-orders are open" email on first opening (already on pre-order)
+  quietOpen        Boolean   @default(false)
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @default(now()) @updatedAt
 
@@ -308,7 +315,30 @@ model PreorderSettings {
   // Countdowns close at the end of each product's release (publication) date,
   // unless a product is set to its own closing time
   closeOnRelease   Boolean  @default(false)
+  // Automatic countdowns: products with an upcoming release date get one.
+  // Off until someone approves the preview.
+  autoCountdowns   Boolean   @default(false)
+  autoApprovedAt   DateTime?
+  autoApprovedBy   String?
+  // JSON arrays: vendor (publisher) names, and supplier ids (from purchase orders)
+  autoExcludeVendors   String?
+  autoExcludeSuppliers String?
+  autoLastRunAt    DateTime?
+  autoLastSummary  String?
   updatedAt        DateTime @default(now()) @updatedAt
+}
+
+// Products automatic countdowns leave alone: unticked in a preview, or taken
+// out of the countdowns by someone
+model PreorderAutoSkip {
+  shop      String
+  productId String
+  title     String?
+  reason    String?
+  by        String?
+  createdAt DateTime @default(now())
+
+  @@id([shop, productId])
 }
 
 // Customers who asked to be emailed about a product

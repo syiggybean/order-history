@@ -87,7 +87,8 @@ export function templatePlan(p, today, inCountdown = false) {
 // Products with countdown times set (they need the preorder template too)
 export async function countdownProductIds(shop) {
   const rows = await db.preorderWindow.findMany({
-    where: { shop, OR: [{ opensAt: { not: null } }, { closesAt: { not: null } }] },
+    // Finished ones (closed, kept selling) are back to normal product pages
+    where: { shop, OR: [{ opensAt: { not: null } }, { closesAt: { not: null } }], NOT: { keepSelling: true, appliedPhase: "closed" } },
     select: { productId: true },
   });
   return new Set(rows.map((r) => r.productId));
