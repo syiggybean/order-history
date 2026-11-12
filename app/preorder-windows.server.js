@@ -94,6 +94,12 @@ export const limitsOf = (w) => {
   return l && Object.keys(l).length ? l : null;
 };
 
+// Countdowns never change "Continue selling when out of stock" on their own.
+// It only changes when someone sets it in the countdown's flyout or bulk edit.
+
+// Closed and set to show the normal "Add to cart": the countdown is off the page
+export const finished = (w, phase = phaseOf(w)) => phase === "closed" && Boolean(w.keepSelling);
+
 // ---------------------------------------------------------------------------
 // Shopify calls
 // ---------------------------------------------------------------------------
@@ -330,12 +336,6 @@ export async function enforce(admin, w, now = Date.now()) {
     const locationId = limits ? w.locationId ?? (await sellingLocation(w.shop, admin)) : null;
     const product = await loadProduct(admin, w.productId, locationId);
 
-    const want = !limits && phase === "open" ? "CONTINUE" : "DENY";
-    const policyChanges = product.variants
-      .filter((v) => v.inventoryPolicy !== want)
-      .map((v) => ({ id: v.id, inventoryPolicy: want }));
-    if (policyChanges.length) await setPolicies(admin, w.productId, policyChanges);
-
     const held = json(w.held);
     const stock = json(w.stock);
     const data = {};
@@ -376,10 +376,15 @@ export async function enforce(admin, w, now = Date.now()) {
     }
     if (phase === "closed" && prev !== "closed") data.closedAt = new Date();
 
+    // Set to show "Add to cart" after closing: the countdown comes off the page
+    // instead of showing "Pre-Orders Closed"
+    if (finished(w, phase)) await writeMetafields(admin, w.productId, { opensAt: null, closesAt: null, limited: false });
+
     const saved = await db.preorderWindow.update({
       where: { id: w.id },
       data: {
         ...data,
+        ...(firstOpen && w.quietOpen ? { quietOpen: false } : {}),
         appliedPhase: phase,
         appliedAt: new Date(),
         lastError: null,
@@ -389,8 +394,15 @@ export async function enforce(admin, w, now = Date.now()) {
       },
     });
 
-    // Emails
-    if (firstOpen) {
+    // The page goes back to the normal product template once it's finished
+    if (finished(w, phase) && prev !== "closed") {
+      await syncTemplate(w.shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
+    }
+
+    // Emails (none for automatic countdowns on products already on pre-order)
+    if (firstOpen && w.quietOpen) {
+      // nothing to announce
+    } else if (firstOpen) {
       await sendCampaign(w.shop, admin, saved, product, "opened", `opened:${w.id}:${saved.firstOpenedAt.toISOString()}`);
     } else if (reopened) {
       const settings = await getSettings(w.shop);
@@ -399,7 +411,7 @@ export async function enforce(admin, w, now = Date.now()) {
         await sendCampaign(w.shop, admin, saved, product, "reopened", `reopened:${w.id}:${Date.now()}`);
       }
     }
-    return { phase, changed: policyChanges.length };
+    return { phase, changed: 0 };
   } catch (e) {
     await db.preorderWindow.update({ where: { id: w.id }, data: { lastError: errorMessage(e).slice(0, 500) } });
     throw e;
@@ -430,6 +442,10 @@ const view = (w, now = Date.now(), metrics = null) => {
     closesInput: toStoreInput(w.closesAt),
     closesRule: w.closesRule ?? null,
     releaseDay: w.releaseDay ?? null,
+    auto: Boolean(w.auto),
+    keepSelling: Boolean(w.keepSelling),
+    finished: finished(w, phase),
+    addedBy: w.addedBy ?? null,
     phase,
     appliedPhase: w.appliedPhase,
     limited: Boolean(limits),
@@ -490,7 +506,33 @@ export async function windowVariants(shop, admin, id) {
     tracked: v.tracked,
     available: v.available,
     limit: limits[v.id] ?? null,
+    continueSelling: v.inventoryPolicy === "CONTINUE",
   }));
+}
+
+// "Continue selling when out of stock" for every variant of a countdown's
+// product. Only ever called when a person changes it.
+export async function setContinueSelling(shop, admin, id, on, user) {
+  const w = await db.preorderWindow.findFirst({ where: { shop, id } });
+  if (!w) throw new WindowError("That product isn't in the group anymore.");
+  if (on && limitsOf(w)) throw new WindowError("A product with a sales limit can't continue selling when out of stock. Untick “Limit pre-orders” first.");
+  const product = await loadProduct(admin, w.productId);
+  const want = on ? "CONTINUE" : "DENY";
+  const changes = product.variants.filter((v) => v.inventoryPolicy !== want).map((v) => ({ id: v.id, inventoryPolicy: want }));
+  if (!changes.length) return 0;
+  await setPolicies(admin, w.productId, changes);
+  await db.preorderLog
+    .create({
+      data: {
+        shop,
+        productId: w.productId,
+        title: w.title,
+        action: "countdown",
+        detail: `Continue selling when out of stock turned ${on ? "on" : "off"}${user?.name ? ` by ${user.name}` : ""}`,
+      },
+    })
+    .catch(() => null);
+  return changes.length;
 }
 
 const parseLimits = (input) => {
@@ -509,9 +551,11 @@ const parseLimits = (input) => {
 // opens/closes: Pacific "YYYY-MM-DDTHH:mm" (blank = none); limits: {variantId: n} or null
 // closesRule: "release" closes at the end of the product's release date (read
 // from Shopify now), "manual" uses `closes`, undefined leaves the rule as it is
-export async function saveWindow(shop, admin, id, { opens, closes, limits, closesRule }, user) {
+// keepSelling: true/false to change it, undefined leaves it as it is
+export async function saveWindow(shop, admin, id, { opens, closes, limits, closesRule, keepSelling }, user) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) throw new WindowError("That product isn't in the group anymore.");
+  const keep = keepSelling === undefined ? Boolean(w.keepSelling) : Boolean(keepSelling);
   let releaseDay = w.releaseDay;
   if (closesRule === "release") {
     releaseDay = (await releaseDays(admin, [w.productId]))[w.productId] ?? null;
@@ -553,6 +597,7 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
         updatedBy: user?.name ?? null,
         ...(closesRule === "release" || closesRule === "manual" ? { closesRule } : {}),
         releaseDay,
+        keepSelling: keep,
       },
     });
     await enforce(admin, saved);
@@ -630,13 +675,15 @@ export async function syncReleaseCloses(shop, admin, { ids = null, user = null }
 // Bulk edit: the same times, closing rule and/or release date for several products
 // opens: "" = keep; closesMode: keep | release | date | none; release: "YYYY-MM-DD" or ""
 // ---------------------------------------------------------------------------
-export async function bulkEdit(shop, admin, ids, { opens = "", closesMode = "keep", closes = "", release = "" }, user) {
+export async function bulkEdit(shop, admin, ids, { opens = "", closesMode = "keep", closes = "", release = "", selling = "keep" }, user) {
   const rows = await db.preorderWindow.findMany({ where: { shop, id: { in: ids } } });
   if (!rows.length) throw new WindowError("Pick at least one product.");
   if (opens && !fromStoreInput(opens)) throw new WindowError("The opening time isn't a valid date and time.");
   if (closesMode === "date" && !fromStoreInput(closes)) throw new WindowError("The closing time isn't a valid date and time.");
   if (release && !/^\d{4}-\d{2}-\d{2}$/.test(release)) throw new WindowError("Enter the release date as a date.");
-  if (!opens && closesMode === "keep" && !release) throw new WindowError("Nothing to change: set an opening time, a closing choice or a release date.");
+  if (!opens && closesMode === "keep" && !release && selling === "keep") {
+    throw new WindowError("Nothing to change: set an opening time, a closing choice, a release date or continue selling.");
+  }
   const results = [];
   for (const w of rows) {
     const done = [];
@@ -658,6 +705,10 @@ export async function bulkEdit(shop, admin, ids, { opens = "", closesMode = "kee
       } else if (release) {
         // A new release date moves the closing time of products that follow it
         await syncReleaseCloses(shop, admin, { ids: [w.id], user });
+      }
+      if (selling === "on" || selling === "off") {
+        await setContinueSelling(shop, admin, w.id, selling === "on", user);
+        done.push(`continue selling ${selling}`);
       }
       results.push({ id: w.id, title: w.title, ok: true, done });
     } catch (e) {
@@ -705,12 +756,20 @@ export async function reopenWindow(shop, admin, id, { closes, addUnits = 0 }, us
   );
 }
 
-// Takes a product out of the group: countdown off, selling setting put back
-export async function removeProduct(shop, admin, id) {
+// Takes a product out of the group: countdown off, selling setting put back.
+// Automatic countdowns won't add it again (it can be allowed again from the
+// Automatic tab).
+export async function removeProduct(shop, admin, id, user = null) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) return;
+  await db.preorderAutoSkip
+    .upsert({
+      where: { shop_productId: { shop, productId: w.productId } },
+      create: { shop, productId: w.productId, title: w.title, reason: "removed", by: user?.name ?? null },
+      update: {},
+    })
+    .catch((e) => console.error(`[preorder-windows] skip ${w.productId}:`, errorMessage(e)));
   await writeMetafields(admin, w.productId, { opensAt: null, closesAt: null, limited: false });
-  const original = json(w.originalPolicies);
   const held = json(w.held);
   const locationId = w.locationId;
   const product = await loadProduct(admin, w.productId, sum(held) && locationId ? locationId : null).catch(() => null);
@@ -721,14 +780,7 @@ export async function removeProduct(shop, admin, id) {
       if (extra > 0) await setAvailable(admin, w, v, locationId, v.available + extra).catch(() => null);
     }
   }
-  if (product) {
-    // Variants added since default to selling, like the rest of the pre-orders
-    const changes = product.variants
-      .map((v) => ({ id: v.id, inventoryPolicy: original[v.id] ?? "CONTINUE", was: v.inventoryPolicy }))
-      .filter((v) => v.inventoryPolicy !== v.was)
-      .map(({ id: vid, inventoryPolicy }) => ({ id: vid, inventoryPolicy }));
-    if (changes.length) await setPolicies(admin, w.productId, changes);
-  }
+  // "Continue selling when out of stock" is left as it is
   await db.preorderWindow.delete({ where: { id: w.id } });
   // Back to the default template, unless its release date is still to come
   await syncTemplate(shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
@@ -934,21 +986,9 @@ async function maybeRemind(w, now) {
 }
 
 // Someone may change "Continue selling" by hand; put it back if it matters
-export async function recheckProduct(shop, productId) {
-  const w = await db.preorderWindow.findUnique({ where: { shop_productId: { shop, productId } } });
-  if (!w || (!w.opensAt && !w.closesAt) || busy.has(w.id)) return;
-  if (w.appliedPhase !== phaseOf(w)) return; // the next check handles it
-  busy.add(w.id);
-  try {
-    const { admin } = await unauthenticated.admin(shop);
-    const product = await loadProduct(admin, w.productId);
-    const want = !limitsOf(w) && w.appliedPhase === "open" ? "CONTINUE" : "DENY";
-    const changes = product.variants.filter((v) => v.inventoryPolicy !== want).map((v) => ({ id: v.id, inventoryPolicy: want }));
-    if (changes.length) await setPolicies(admin, w.productId, changes);
-  } finally {
-    busy.delete(w.id);
-  }
-}
+// Product saved in Shopify: nothing to put back. Countdowns don't override
+// "Continue selling when out of stock" (kept so the webhook can still call it).
+export async function recheckProduct() {}
 
 if (!globalThis.__preorderWindowTimer && process.env.NODE_ENV !== "test") {
   const tick = () => checkWindows().catch((e) => console.error("[preorder-windows] check:", errorMessage(e)));

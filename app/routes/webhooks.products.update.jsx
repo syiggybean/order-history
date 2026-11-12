@@ -1,6 +1,5 @@
 import { authenticate } from "../shopify.server";
 import { errorMessage, syncProduct } from "../preorders.server";
-import { recheckProduct } from "../preorder-windows.server";
 import { productChanged } from "../shipping.server";
 import { wishProductChanged } from "../wishlist.server";
 import { productNotified } from "../catalog.server";
@@ -24,10 +23,6 @@ export const action = async ({ request }) => {
     }
     syncProduct(shop, productId).catch((e) =>
       console.error(`[preorders] product edit ${productId}:`, errorMessage(e)),
-    );
-    // Products in the countdown group: keep "Continue selling" matching the window
-    recheckProduct(shop, productId).catch((e) =>
-      console.error(`[preorder-windows] product edit ${productId}:`, errorMessage(e)),
     );
     // Shipping hub: tags or release date may have changed what's ready
     productChanged(shop, productId).catch((e) =>

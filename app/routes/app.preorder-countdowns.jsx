@@ -3,6 +3,8 @@ import { useFetcher, useLoaderData, useRevalidator, useSearchParams } from "reac
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { NoAccess } from "../components/NoAccess";
+import { PreorderTabs } from "../components/PreorderTabs";
+import { Flyout, useFlyoutClose } from "../components/Flyout";
 import {
   WindowError,
   addProduct,
@@ -16,8 +18,21 @@ import {
   sellingLocation,
   syncReleaseCloses,
   windowVariants,
+  setContinueSelling,
 } from "../preorder-windows.server";
 import { NotifyError, getSettings, recentSends, saveSettings, sendTestEmail } from "../preorder-notify.server";
+import { setReleaseDate } from "../preorders.server";
+import {
+  allowAgain,
+  approve as approveAuto,
+  autoJob,
+  autoSettings,
+  buildPreview,
+  listSkips,
+  listSuppliers,
+  saveExclusions,
+  turnOff as turnOffAuto,
+} from "../preorder-auto.server";
 import { mailStatus } from "../mailer.server";
 
 export const loader = async ({ request }) => {
@@ -26,12 +41,14 @@ export const loader = async ({ request }) => {
   const shop = session.shop;
   // Closing times that follow release dates catch up with Shopify first
   const releaseSync = await syncReleaseCloses(shop, admin).catch((e) => ({ changed: [], problems: [`Couldn't read release dates: ${e?.message ?? e}`] }));
-  const [windows, settings, mail, sends, locations] = await Promise.all([
+  const [windows, settings, mail, sends, locations, suppliers, skips] = await Promise.all([
     listWindows(shop),
     getSettings(shop),
     mailStatus(),
     recentSends(shop, 30),
     listLocations(admin).catch(() => []),
+    listSuppliers(shop),
+    listSkips(shop),
   ]);
   return {
     canManage: can(user, "preorders", "manage"),
@@ -48,6 +65,10 @@ export const loader = async ({ request }) => {
     mail,
     sends,
     staffEmail: user?.email ?? "",
+    auto: autoSettings(settings),
+    autoJob: autoJob(shop),
+    suppliers,
+    skips,
   };
 };
 
@@ -62,6 +83,20 @@ const NEEDS = {
   testEmail: "manage",
   bulk: "manage",
   closeOnRelease: "manage",
+  autoPreview: "view",
+  autoJob: "view",
+  autoApprove: "manage",
+  autoOff: "manage",
+  autoExclusions: "manage",
+  autoAllow: "manage",
+};
+const jsonList = (form, key) => {
+  try {
+    const v = JSON.parse(String(form.get(key) ?? "[]"));
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
 };
 
 export const action = async ({ request }) => {
@@ -87,6 +122,15 @@ export const action = async ({ request }) => {
     }
     if (intent === "save") {
       const limits = form.get("limits") ? JSON.parse(String(form.get("limits"))) : null;
+      // A new release date goes to Shopify first, so "close on its release date" uses it
+      const release = String(form.get("release") ?? "");
+      const productId = String(form.get("productId") ?? "");
+      if (release && productId && release !== String(form.get("releaseWas") ?? "")) {
+        await setReleaseDate(admin, shop, productId, release, "Countdown");
+      }
+      // "Continue selling when out of stock", only when someone changed it
+      const selling = form.has("continueSelling") ? form.get("continueSelling") === "true" : null;
+      if (selling && limits) throw new WindowError("A product with a sales limit can't continue selling when out of stock. Untick one of them.");
       await saveWindow(
         shop,
         admin,
@@ -96,9 +140,11 @@ export const action = async ({ request }) => {
           closes: String(form.get("closes") ?? ""),
           limits,
           closesRule: ["release", "manual"].includes(String(form.get("closesRule"))) ? String(form.get("closesRule")) : undefined,
+          keepSelling: form.has("keepSelling") ? form.get("keepSelling") === "true" : undefined,
         },
         user,
       );
+      if (selling !== null) await setContinueSelling(shop, admin, id, selling, user);
       return { intent, ok: true, id };
     }
     if (intent === "bulk") {
@@ -112,6 +158,7 @@ export const action = async ({ request }) => {
           closesMode: String(form.get("closesMode") ?? "keep"),
           closes: String(form.get("closes") ?? ""),
           release: String(form.get("release") ?? ""),
+          selling: ["on", "off"].includes(String(form.get("selling"))) ? String(form.get("selling")) : "keep",
         },
         user,
       );
@@ -138,8 +185,39 @@ export const action = async ({ request }) => {
       return { intent, ok: true, to };
     }
     if (intent === "remove") {
-      await removeProduct(shop, admin, id);
+      await removeProduct(shop, admin, id, user);
       return { intent, ok: true, id };
+    }
+    if (intent === "autoPreview") {
+      const preview = await buildPreview(shop, admin, {
+        vendors: form.has("vendors") ? jsonList(form, "vendors").map(String) : null,
+        suppliers: form.has("suppliers") ? jsonList(form, "suppliers").map(Number) : null,
+      });
+      return { intent, ok: true, preview };
+    }
+    if (intent === "autoJob") {
+      return { intent, job: autoJob(shop) };
+    }
+    if (intent === "autoApprove") {
+      const job = await approveAuto(
+        shop,
+        admin,
+        { vendors: jsonList(form, "vendors").map(String), suppliers: jsonList(form, "suppliers").map(Number), untick: jsonList(form, "untick").map(String) },
+        user,
+      );
+      return { intent, ok: true, job };
+    }
+    if (intent === "autoOff") {
+      await turnOffAuto(shop);
+      return { intent, ok: true };
+    }
+    if (intent === "autoExclusions") {
+      await saveExclusions(shop, { vendors: jsonList(form, "vendors").map(String), suppliers: jsonList(form, "suppliers").map(Number) });
+      return { intent, ok: true };
+    }
+    if (intent === "autoAllow") {
+      await allowAgain(shop, jsonList(form, "productIds").map(String));
+      return { intent, ok: true };
     }
     if (intent === "settings") {
       const locationId = String(form.get("locationId") ?? "");
@@ -161,7 +239,7 @@ export const action = async ({ request }) => {
 
 // Reading actions don't need the whole page reloaded
 export const shouldRevalidate = ({ formData, defaultShouldRevalidate }) =>
-  ["search", "variants"].includes(String(formData?.get("intent"))) ? false : defaultShouldRevalidate;
+  ["search", "variants", "autoPreview", "autoJob"].includes(String(formData?.get("intent"))) ? false : defaultShouldRevalidate;
 
 // ---------------------------------------------------------------------------
 // Look
@@ -190,6 +268,8 @@ const num = { fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" };
 const MOTION_CSS = `
 @keyframes pcRise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .pc-rise { animation: pcRise .38s cubic-bezier(.2, .7, .3, 1) both; }
+.pc-row-open { cursor: pointer; }
+.pc-row-open:hover td { background: #fafafa; }
 @media (prefers-reduced-motion: reduce) { .pc-rise { animation: none; } }
 `;
 
@@ -329,198 +409,327 @@ function Field({ label, children }) {
 
 const follows = (w, closeOnRelease) => w.closesRule === "release" || (!w.closesRule && Boolean(closeOnRelease));
 
-function EditPanel({ w, colSpan, onDone, closeOnRelease }) {
+// ---------------------------------------------------------------------------
+// Flyout: everything about one product's countdown
+// ---------------------------------------------------------------------------
+
+const radioRow = { display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px", lineHeight: 1.4 };
+const drawerSection = { padding: "14px 18px", borderBottom: "1px solid #ebebeb", display: "flex", flexDirection: "column", gap: "10px" };
+const sectionTitle = { fontWeight: 650, fontSize: "13px", margin: 0 };
+
+function EditDrawer({ w, onClose, closeOnRelease, canManage }) {
+  return (
+    <Flyout
+      onClose={onClose}
+      label={`Countdown for ${w.title}`}
+      title={canManage ? "Edit countdown" : "Countdown"}
+      width={460}
+      bodyStyle={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}
+    >
+      <DrawerBody w={w} closeOnRelease={closeOnRelease} canManage={canManage} />
+    </Flyout>
+  );
+}
+
+function DrawerBody({ w, closeOnRelease, canManage }) {
+  const onClose = useFlyoutClose();
   const save = useFetcher();
+  const remove = useFetcher();
   const variants = useFetcher();
-  const [opens, setOpens] = useState(w.opensInput);
-  const [closes, setCloses] = useState(w.closesInput);
-  const [onRelease, setOnRelease] = useState(Boolean(w.releaseDay) && follows(w, closeOnRelease));
+  const [release, setRelease] = useState(w.releaseDay ?? "");
+  const [opens, setOpens] = useState(w.opensInput || "");
+  const [closeMode, setCloseMode] = useState(follows(w, closeOnRelease) && w.releaseDay ? "release" : w.closesInput ? "date" : "none");
+  const [closes, setCloses] = useState(w.closesInput || "");
+  const [keepSelling, setKeepSelling] = useState(Boolean(w.keepSelling));
+  // "Continue selling when out of stock" as it is in Shopify now (null until loaded)
+  const [selling, setSelling] = useState(null);
   const [limited, setLimited] = useState(w.limited);
   const [limits, setLimits] = useState({});
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [localError, setLocalError] = useState(null);
   const busy = save.state !== "idle";
 
   useEffect(() => {
-    variants.submit({ intent: "variants", id: String(w.id) }, { method: "post" });
+    if (canManage) variants.submit({ intent: "variants", id: String(w.id) }, { method: "post" });
   }, []);
   const list = variants.data?.intent === "variants" ? variants.data.variants ?? [] : [];
   useEffect(() => {
     if (list.length) setLimits(Object.fromEntries(list.map((v) => [v.id, v.limit ?? ""])));
   }, [variants.data]);
+  const sellingNow = !list.length ? null : list.every((v) => v.continueSelling) ? "on" : list.some((v) => v.continueSelling) ? "mixed" : "off";
+  const sellingShown = selling ?? sellingNow;
   useEffect(() => {
-    if (save.data?.intent === "save" && save.data.ok) onDone();
+    if (save.data?.intent === "save" && save.data.ok) onClose();
   }, [save.data]);
+  useEffect(() => {
+    if (remove.data?.intent === "remove" && remove.data.ok) onClose();
+  }, [remove.data]);
 
   const submit = () => {
-    const payload = { intent: "save", id: String(w.id), opens, closes: onRelease ? "" : closes, closesRule: onRelease ? "release" : "manual" };
+    setLocalError(null);
+    if (closeMode === "release" && !release) return setLocalError("Enter a release date, or pick another closing option.");
+    if (closeMode === "date" && !closes) return setLocalError("Enter a closing time, or pick another closing option.");
+    const payload = {
+      intent: "save",
+      id: String(w.id),
+      productId: w.productId,
+      release,
+      releaseWas: w.releaseDay ?? "",
+      opens,
+      closes: closeMode === "date" ? closes : "",
+      closesRule: closeMode === "release" ? "release" : "manual",
+      keepSelling: String(keepSelling),
+    };
+    // Only sent when someone changed it here
+    if (selling && selling !== sellingNow) payload.continueSelling = String(selling === "on");
     if (limited) {
       const missing = list.some((v) => limits[v.id] === "" || limits[v.id] == null);
-      if (missing) return alertLater("Enter a limit for every variant, or untick “Limit pre-orders”.");
+      if (missing) return setLocalError("Enter a limit for every variant, or untick “Limit pre-orders”.");
       payload.limits = JSON.stringify(Object.fromEntries(list.map((v) => [v.id, Number(limits[v.id])])));
     }
     save.submit(payload, { method: "post" });
   };
-  const [localError, setLocalError] = useState(null);
-  const alertLater = (msg) => setLocalError(msg);
-  const error = localError ?? save.data?.error ?? variants.data?.error;
-
-  return (
-    <tr>
-      <td style={{ ...cell, background: "#fafafa" }} colSpan={colSpan}>
-        {/* Stays in view however far the table is scrolled sideways */}
-        <div style={{ position: "sticky", left: "10px", maxWidth: "calc(100vw - 120px)" }}>
-        <div style={{ display: "flex", gap: "14px", alignItems: "flex-end", flexWrap: "wrap" }}>
-          <Field label="Pre-orders open (Pacific)">
-            <input type="datetime-local" value={opens} onChange={(e) => setOpens(e.target.value)} style={input} />
-          </Field>
-          <Field label="Pre-orders close (optional)">
-            <input
-              type="datetime-local"
-              value={onRelease ? `${w.releaseDay}T23:59` : closes}
-              onChange={(e) => setCloses(e.target.value)}
-              style={{ ...input, ...(onRelease ? { background: "#f1f1f1", color: "#616161" } : {}) }}
-              disabled={onRelease}
-            />
-          </Field>
-          <label
-            style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "13px", paddingBottom: "6px" }}
-            title={w.releaseDay ? "" : "This product has no release date in Shopify yet"}
-          >
-            <input type="checkbox" checked={onRelease} disabled={!w.releaseDay} onChange={(e) => (setOnRelease(e.target.checked), setLocalError(null))} />
-            {w.releaseDay ? `Close at the end of its release date (${fmtDay(w.releaseDay)})` : "Close on its release date (no release date set)"}
-          </label>
-          <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "13px", paddingBottom: "6px" }}>
-            <input type="checkbox" checked={limited} onChange={(e) => (setLimited(e.target.checked), setLocalError(null))} />
-            Limit pre-orders
-          </label>
-        </div>
-
-        {limited && (
-          <div style={{ marginTop: "12px" }}>
-            {variants.state !== "idle" && !list.length ? (
-              <span style={muted}>Loading variants…</span>
-            ) : (
-              <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
-                {list.map((v) => (
-                  <Field key={v.id} label={`${v.title}${w.appliedPhase === "open" ? ` (${v.available} on sale now)` : ""}`}>
-                    <input
-                      type="number"
-                      min="0"
-                      step="1"
-                      value={limits[v.id] ?? ""}
-                      onChange={(e) => (setLimits({ ...limits, [v.id]: e.target.value }), setLocalError(null))}
-                      style={{ ...input, width: "110px" }}
-                      disabled={!v.tracked}
-                    />
-                    {!v.tracked && <span style={{ ...small, color: "#b42318" }}>Turn on “Track quantity” first</span>}
-                  </Field>
-                ))}
-              </div>
-            )}
-            <div style={{ ...small, marginTop: "6px" }}>
-              At opening each variant gets this many units to sell. When they run out the button shows “Pre-Orders Closed”
-              and customers can sign up to hear if more are added.
-              {w.appliedPhase === "open" && " Changing it now adds or removes the difference straight away."}
-            </div>
-          </div>
-        )}
-
-        <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
-          <s-button variant="primary" onClick={submit} {...(busy ? { loading: true } : {})}>
-            Save
-          </s-button>
-          <s-button variant="tertiary" onClick={onDone}>
-            Cancel
-          </s-button>
-        </div>
-        {error && <div style={{ color: "#b42318", marginTop: "8px" }}>{error}</div>}
-        </div>
-      </td>
-    </tr>
-  );
-}
-
-const OPEN_COLUMNS = ["Product", "Opens", "Closes", "Release date", "Status", "Stock", "Sign-ups", "Emails", "From emails", "Sold"];
-
-function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect }) {
-  const fetcher = useFetcher();
-  const [editing, setEditing] = useState(!w.opensAt && !w.closesAt && canManage);
-  const [confirmRemove, setConfirmRemove] = useState(false);
-  const busy = fetcher.state !== "idle";
-  const colSpan = OPEN_COLUMNS.length + (canManage ? 2 : 0);
-  const m = w.metrics;
+  const error = localError ?? save.data?.error ?? remove.data?.error ?? variants.data?.error;
+  const numeric = w.productId?.split("/").pop();
 
   return (
     <>
-      <tr className="pc-rise" style={{ opacity: fetcher.formData?.get("intent") === "remove" ? 0.4 : 1 }}>
-        {canManage && (
-          <td style={{ ...cell, ...stickL, ...checkCol }}>
-            <input type="checkbox" aria-label={`Select ${w.title}`} checked={selected} onChange={(e) => onSelect(e.target.checked)} />
-          </td>
-        )}
-        <td style={{ ...cell, ...stickL, left: canManage ? `${CHECK_W}px` : 0 }}>
-          <ProductCell {...w} />
-          {w.lastError && <div style={{ color: "#b42318", fontSize: "12px", marginTop: "4px" }}>Couldn't update Shopify: {w.lastError}</div>}
-        </td>
-        <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtStore(w.opensAt)}</td>
-        <td style={{ ...cell, whiteSpace: "nowrap" }}>
-          {w.closesAt ? fmtStore(w.closesAt) : <span style={muted}>No end</span>}
-          {follows(w, closeOnRelease) && w.releaseDay && (
-            <div>
-              <span style={pill("#eef3ff", "#1c4a9c")}>On release date</span>
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          <div style={{ display: "flex", gap: "12px", alignItems: "center", padding: "14px 18px", borderBottom: "1px solid #ebebeb" }}>
+            {w.imageUrl ? <img src={w.imageUrl} alt="" style={{ ...thumb, width: "48px", height: "48px" }} /> : <div style={{ ...thumb, width: "48px", height: "48px" }} />}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 650, fontSize: "14px" }}>{w.title}</div>
+              <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap", marginTop: "3px" }}>
+                {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Added automatically</span>}
+                <a href={`shopify:admin/products/${numeric}`} target="_top" style={{ color: "#005bd3", fontSize: "12px" }}>
+                  Open in Shopify ↗
+                </a>
+              </div>
+            </div>
+          </div>
+          <div style={drawerSection}>
+            <p style={sectionTitle}>Release date</p>
+            <input type="date" value={release} onChange={(e) => setRelease(e.target.value)} style={{ ...input, width: "180px" }} disabled={!canManage} />
+            <span style={small}>Saved to the product in Shopify (its publication date), so pre-order tags and shipping follow it too.</span>
+          </div>
+
+          <div style={drawerSection}>
+            <p style={sectionTitle}>Pre-orders open (Pacific)</p>
+            <input type="datetime-local" value={opens} onChange={(e) => setOpens(e.target.value)} style={{ ...input, width: "220px" }} disabled={!canManage} />
+          </div>
+
+          <div style={drawerSection}>
+            <p style={sectionTitle}>Pre-orders close</p>
+            <label style={radioRow}>
+              <input type="radio" name={`close-${w.id}`} checked={closeMode === "release"} onChange={() => setCloseMode("release")} disabled={!canManage} />
+              <span>
+                At the end of the release date{release ? ` (${fmtDay(release)})` : ""}
+                <div style={small}>Moves with the release date if it changes.</div>
+              </span>
+            </label>
+            <label style={radioRow}>
+              <input type="radio" name={`close-${w.id}`} checked={closeMode === "date"} onChange={() => setCloseMode("date")} disabled={!canManage} />
+              <span style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                At a set time
+                {closeMode === "date" && (
+                  <input type="datetime-local" value={closes} onChange={(e) => setCloses(e.target.value)} style={{ ...input, width: "220px" }} disabled={!canManage} />
+                )}
+              </span>
+            </label>
+            <label style={radioRow}>
+              <input type="radio" name={`close-${w.id}`} checked={closeMode === "none"} onChange={() => setCloseMode("none")} disabled={!canManage} />
+              <span>No closing time</span>
+            </label>
+          </div>
+
+          <div style={drawerSection}>
+            <p style={sectionTitle}>Continue selling when out of stock</p>
+            {sellingShown == null ? (
+              <span style={muted}>{canManage ? "Loading…" : "Shown to people who can manage countdowns."}</span>
+            ) : (
+              <label style={{ ...radioRow, opacity: limited ? 0.55 : 1 }}>
+                <input
+                  type="checkbox"
+                  ref={(el) => el && (el.indeterminate = sellingShown === "mixed")}
+                  checked={sellingShown === "on"}
+                  disabled={limited || !canManage}
+                  onChange={(e) => setSelling(e.target.checked ? "on" : "off")}
+                />
+                <span>
+                  {sellingShown === "on" ? "On for every variant" : sellingShown === "off" ? "Off" : "On for some variants (tick to turn on for all)"}
+                  <div style={small}>
+                    The same setting as on the product in Shopify. Countdowns never change it on their own, only here or in bulk edit.
+                    {limited && " Off while there's a sales limit."}
+                    {!limited && sellingShown !== "on" && w.appliedPhase === "open" && " While it's off, pre-orders stop when stock runs out."}
+                  </div>
+                </span>
+              </label>
+            )}
+          </div>
+
+          <div style={drawerSection}>
+            <p style={sectionTitle}>After pre-orders close</p>
+            <label style={radioRow}>
+              <input type="checkbox" checked={keepSelling} disabled={!canManage} onChange={(e) => setKeepSelling(e.target.checked)} />
+              <span>
+                Take the countdown off and show the normal Add to cart
+                <div style={small}>
+                  {keepSelling
+                    ? "The product page goes back to normal. Whether it can be bought with no stock follows the setting above."
+                    : "The product page shows “Pre-Orders Closed”."}
+                </div>
+              </span>
+            </label>
+          </div>
+
+          <div style={drawerSection}>
+            <label style={radioRow}>
+              <input
+                type="checkbox"
+                checked={limited}
+                disabled={!canManage}
+                onChange={(e) => (setLimited(e.target.checked), e.target.checked && sellingShown !== "off" && setSelling("off"), setLocalError(null))}
+              />
+              <span style={sectionTitle}>Limit pre-orders</span>
+            </label>
+            {limited && (
+              <>
+                {variants.state !== "idle" && !list.length ? (
+                  <span style={muted}>Loading variants…</span>
+                ) : (
+                  <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
+                    {list.map((v) => (
+                      <Field key={v.id} label={`${v.title}${w.appliedPhase === "open" ? ` (${v.available} on sale now)` : ""}`}>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={limits[v.id] ?? ""}
+                          onChange={(e) => (setLimits({ ...limits, [v.id]: e.target.value }), setLocalError(null))}
+                          style={{ ...input, width: "110px" }}
+                          disabled={!v.tracked}
+                        />
+                        {!v.tracked && <span style={{ ...small, color: "#b42318" }}>Turn on “Track quantity” first</span>}
+                      </Field>
+                    ))}
+                  </div>
+                )}
+                <div style={small}>
+                  At opening each variant gets this many units to sell. When they run out the button shows “Pre-Orders Closed” and customers can sign up
+                  to hear if more are added.
+                  {w.appliedPhase === "open" && " Changing it now adds or removes the difference straight away."}
+                </div>
+              </>
+            )}
+          </div>
+
+          {canManage && (
+            <div style={{ ...drawerSection, borderBottom: 0 }}>
+              {confirmRemove ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <span style={{ fontSize: "13px" }}>
+                    Take this product out of the countdowns? Its selling setting goes back to how it was
+                    {w.auto ? ", and automatic countdowns won't add it again." : "."}
+                  </span>
+                  <span style={{ display: "flex", gap: "6px" }}>
+                    <s-button
+                      tone="critical"
+                      onClick={() => remove.submit({ intent: "remove", id: String(w.id) }, { method: "post" })}
+                      {...(remove.state !== "idle" ? { loading: true } : {})}
+                    >
+                      Remove
+                    </s-button>
+                    <s-button variant="tertiary" onClick={() => setConfirmRemove(false)}>
+                      Keep
+                    </s-button>
+                  </span>
+                </div>
+              ) : (
+                <span>
+                  <s-button variant="tertiary" tone="critical" onClick={() => setConfirmRemove(true)}>
+                    Remove from countdowns
+                  </s-button>
+                </span>
+              )}
             </div>
           )}
-        </td>
-        <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDay(w.releaseDay) ?? <span style={muted}>Not set</span>}</td>
-        <td style={cell}>
-          <Status w={w} now={now} />
-        </td>
-        <td style={cell}>
-          <Stock w={w} />
-        </td>
-        <td style={{ ...cell, ...num }}>{m?.signups ?? 0}</td>
-        <td style={cell}>
-          <EmailStats m={m} />
-        </td>
-        <td style={cell}>
-          <FromEmails m={m} />
-        </td>
-        <td style={cell}>
-          <Sold m={m} />
-        </td>
-        {canManage && (
-          <td style={{ ...cell, ...stickR, textAlign: "right", whiteSpace: "nowrap" }}>
-            <span style={{ display: "inline-flex", gap: "6px", alignItems: "center" }}>
-            {!editing && (
-              <s-button variant="tertiary" onClick={() => setEditing(true)}>
-                Edit
+        </div>
+
+        <footer style={{ padding: "12px 18px", borderTop: "1px solid #ebebeb", background: "#fafafa" }}>
+          {error && <div style={{ color: "#b42318", marginBottom: "8px", fontSize: "13px" }}>{error}</div>}
+          <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
+            <s-button variant="tertiary" onClick={onClose}>
+              {canManage ? "Cancel" : "Close"}
+            </s-button>
+            {canManage && (
+              <s-button variant="primary" onClick={submit} {...(busy ? { loading: true } : {})}>
+                Save
               </s-button>
             )}
-            {confirmRemove ? (
-              <>
-                <s-button
-                  variant="tertiary"
-                  tone="critical"
-                  onClick={() => fetcher.submit({ intent: "remove", id: String(w.id) }, { method: "post" })}
-                  {...(busy ? { loading: true } : {})}
-                >
-                  Confirm remove
-                </s-button>
-                <s-button variant="tertiary" onClick={() => setConfirmRemove(false)}>
-                  Keep
-                </s-button>
-              </>
-            ) : (
-              <s-button variant="tertiary" tone="critical" onClick={() => setConfirmRemove(true)}>
-                Remove
-              </s-button>
-            )}
-            </span>
-            {fetcher.data?.error && <div style={{ color: "#b42318", fontSize: "12px" }}>{fetcher.data.error}</div>}
-          </td>
-        )}
-      </tr>
-      {editing && canManage && <EditPanel w={w} colSpan={colSpan} closeOnRelease={closeOnRelease} onDone={() => setEditing(false)} />}
+          </div>
+        </footer>
     </>
+  );
+}
+
+const OPEN_COLUMNS = ["Product", "Opens", "Closes", "Release date", "Status", "After closing", "Stock", "Sign-ups", "Emails", "From emails", "Sold"];
+
+function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect, onOpen }) {
+  const m = w.metrics;
+  // A click anywhere on the row opens the flyout, except on links and controls
+  const open = (e) => {
+    if (e.target.closest("a, input, button, s-button, label")) return;
+    onOpen();
+  };
+
+  return (
+    <tr className="pc-rise pc-row-open" onClick={open}>
+      {canManage && (
+        <td style={{ ...cell, ...stickL, ...checkCol }}>
+          <input type="checkbox" aria-label={`Select ${w.title}`} checked={selected} onChange={(e) => onSelect(e.target.checked)} />
+        </td>
+      )}
+      <td style={{ ...cell, ...stickL, left: canManage ? `${CHECK_W}px` : 0 }}>
+        <ProductCell {...w} />
+        <div style={{ display: "flex", gap: "4px", marginTop: "4px", flexWrap: "wrap" }}>
+          {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Auto</span>}
+          {!w.opensAt && !w.closesAt && <span style={pill("#fff1e3", "#8a4b00")}>Not set up</span>}
+        </div>
+        {w.lastError && <div style={{ color: "#b42318", fontSize: "12px", marginTop: "4px" }}>Couldn't update Shopify: {w.lastError}</div>}
+      </td>
+      <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtStore(w.opensAt)}</td>
+      <td style={{ ...cell, whiteSpace: "nowrap" }}>
+        {w.closesAt ? fmtStore(w.closesAt) : <span style={muted}>No end</span>}
+        {follows(w, closeOnRelease) && w.releaseDay && (
+          <div>
+            <span style={pill("#eef3ff", "#1c4a9c")}>On release date</span>
+          </div>
+        )}
+      </td>
+      <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDay(w.releaseDay) ?? <span style={muted}>Not set</span>}</td>
+      <td style={cell}>
+        <Status w={w} now={now} />
+      </td>
+      <td style={{ ...cell, whiteSpace: "nowrap" }}>{w.keepSelling ? "Add to cart" : "Pre-Orders Closed"}</td>
+      <td style={cell}>
+        <Stock w={w} />
+      </td>
+      <td style={{ ...cell, ...num }}>{m?.signups ?? 0}</td>
+      <td style={cell}>
+        <EmailStats m={m} />
+      </td>
+      <td style={cell}>
+        <FromEmails m={m} />
+      </td>
+      <td style={cell}>
+        <Sold m={m} />
+      </td>
+      <td style={{ ...cell, ...stickR, textAlign: "right", whiteSpace: "nowrap" }}>
+        <s-button variant="tertiary" onClick={onOpen}>
+          {canManage ? "Edit" : "Details"}
+        </s-button>
+      </td>
+    </tr>
   );
 }
 
@@ -528,7 +737,6 @@ function OpenTab({ windows, now, canManage, settings, releaseProblems }) {
   const [selected, setSelected] = useState(() => new Set());
   const ids = windows.map((w) => w.id);
   const picked = ids.filter((id) => selected.has(id));
-  const all = ids.length > 0 && picked.length === ids.length;
   const toggle = (id, on) =>
     setSelected((cur) => {
       const next = new Set(cur);
@@ -536,13 +744,58 @@ function OpenTab({ windows, now, canManage, settings, releaseProblems }) {
       return next;
     });
   const closeOnRelease = settings?.closeOnRelease;
+
+  // The flyout: opens by itself for a product just added that isn't set up
+  const [openId, setOpenId] = useState(() => (canManage ? windows.find((w) => !w.opensAt && !w.closesAt)?.id ?? null : null));
+  const seen = useRef(new Set(ids));
+  useEffect(() => {
+    const fresh = windows.find((w) => !seen.current.has(w.id) && !w.opensAt && !w.closesAt);
+    for (const id of ids) seen.current.add(id);
+    if (fresh && canManage) setOpenId(fresh.id);
+  }, [ids.join(",")]);
+  const openW = windows.find((w) => w.id === openId);
+
+  const [filter, setFilter] = useState("all");
+  const autoCount = windows.filter((w) => w.auto).length;
+  const shown = filter === "auto" ? windows.filter((w) => w.auto) : filter === "manual" ? windows.filter((w) => !w.auto) : windows;
+
   return (
     <>
+      {openW && <EditDrawer key={openW.id} w={openW} canManage={canManage} closeOnRelease={closeOnRelease} onClose={() => setOpenId(null)} />}
       <s-section heading="Open and upcoming">
         <CloseOnReleaseSetting on={Boolean(closeOnRelease)} canManage={canManage} problems={releaseProblems} />
         {canManage && picked.length > 0 && <BulkBar windows={windows.filter((w) => selected.has(w.id))} onDone={() => setSelected(new Set())} />}
+        {autoCount > 0 && (
+          <div style={{ display: "flex", gap: "6px", marginBottom: "10px", flexWrap: "wrap" }}>
+            {[
+              ["all", `All (${windows.length})`],
+              ["auto", `Added automatically (${autoCount})`],
+              ["manual", `Added by hand (${windows.length - autoCount})`],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setFilter(id)}
+                style={{
+                  appearance: "none",
+                  font: "inherit",
+                  fontSize: "12px",
+                  fontWeight: 600,
+                  padding: "4px 10px",
+                  borderRadius: "999px",
+                  cursor: "pointer",
+                  border: `1px solid ${filter === id ? "#1a1a1a" : "#d4d4d4"}`,
+                  background: filter === id ? "#1a1a1a" : "#fff",
+                  color: filter === id ? "#fff" : "#303030",
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
         {windows.length === 0 ? (
-          <s-paragraph>Nothing scheduled. Add products below.</s-paragraph>
+          <s-paragraph>Nothing scheduled. Add products below, or turn on automatic countdowns in the Automatic tab.</s-paragraph>
         ) : (
           <div style={box}>
             <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: "13px" }}>
@@ -553,8 +806,8 @@ function OpenTab({ windows, now, canManage, settings, releaseProblems }) {
                       <input
                         type="checkbox"
                         aria-label="Select all"
-                        checked={all}
-                        onChange={(e) => setSelected(e.target.checked ? new Set(ids) : new Set())}
+                        checked={shown.length > 0 && shown.every((w) => selected.has(w.id))}
+                        onChange={(e) => setSelected(e.target.checked ? new Set(shown.map((w) => w.id)) : new Set())}
                       />
                     </th>
                   )}
@@ -563,13 +816,14 @@ function OpenTab({ windows, now, canManage, settings, releaseProblems }) {
                       {h}
                     </th>
                   ))}
-                  {canManage && <th style={{ ...head, ...stickR, background: "#f7f7f7", zIndex: 3 }} />}
+                  <th style={{ ...head, ...stickR, background: "#f7f7f7", zIndex: 3 }} />
                 </tr>
               </thead>
               <tbody>
-                {windows.map((w) => (
+                {shown.map((w) => (
                   <OpenRow
                     key={w.id}
+                    onOpen={() => setOpenId(w.id)}
                     w={w}
                     now={now}
                     canManage={canManage}
@@ -607,6 +861,12 @@ function HistoryRow({ w, canManage }) {
       <tr className="pc-rise">
         <td style={cell}>
           <ProductCell {...w} />
+          {(w.auto || w.finished) && (
+            <div style={{ display: "flex", gap: "4px", marginTop: "4px", flexWrap: "wrap" }}>
+              {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Auto</span>}
+              {w.finished && <span style={pill("#e3f5e8", "#0c5132")}>Countdown taken off</span>}
+            </div>
+          )}
         </td>
         <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtStore(w.firstOpenedAt ?? w.opensAt)}</td>
         <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtStore(w.closedAt ?? w.closesAt)}</td>
@@ -985,14 +1245,15 @@ function BulkBar({ windows, onDone }) {
   const [closesMode, setClosesMode] = useState("keep");
   const [closes, setCloses] = useState("");
   const [release, setRelease] = useState("");
+  const [selling, setSelling] = useState("keep");
   const busy = f.state !== "idle";
   const results = f.data?.intent === "bulk" ? f.data.results : null;
   const failed = results?.filter((r) => !r.ok) ?? [];
-  const nothing = !opens && closesMode === "keep" && !release;
+  const nothing = !opens && closesMode === "keep" && !release && selling === "keep";
   const n = windows.length;
   const apply = () =>
     f.submit(
-      { intent: "bulk", ids: JSON.stringify(windows.map((w) => w.id)), opens, closesMode, closes: closesMode === "date" ? closes : "", release },
+      { intent: "bulk", ids: JSON.stringify(windows.map((w) => w.id)), opens, closesMode, closes: closesMode === "date" ? closes : "", release, selling },
       { method: "post" },
     );
   useEffect(() => {
@@ -1022,6 +1283,13 @@ function BulkBar({ windows, onDone }) {
         )}
         <Field label="Release date (in Shopify)">
           <input type="date" aria-label="Bulk release date" value={release} onChange={(e) => setRelease(e.target.value)} style={input} />
+        </Field>
+        <Field label="Continue selling when out of stock">
+          <select aria-label="Bulk continue selling" value={selling} onChange={(e) => setSelling(e.target.value)} style={input}>
+            <option value="keep">Leave as it is</option>
+            <option value="on">Turn on</option>
+            <option value="off">Turn off</option>
+          </select>
         </Field>
         <s-button variant="primary" onClick={apply} disabled={nothing || (closesMode === "date" && !closes) || undefined} {...(busy ? { loading: true } : {})}>
           Apply to {n}
@@ -1152,6 +1420,377 @@ function AddProducts({ canManage }) {
 }
 
 // ---------------------------------------------------------------------------
+// Automatic countdowns
+// ---------------------------------------------------------------------------
+
+const REASON = {
+  already: "Already has a countdown",
+  vendor: "Vendor left out",
+  supplier: "Supplier left out",
+  removed: "Taken out of countdowns earlier",
+  unticked: "Left out in an earlier preview",
+};
+const reasonFor = (r, vendors, suppliers) => {
+  if (r.inGroup) return "already";
+  if (vendors.has((r.vendor || "").trim().toLowerCase())) return "vendor";
+  if (r.supplierIds.some((id) => suppliers.has(id))) return "supplier";
+  return r.skip;
+};
+const sameSet = (a, b) => a.size === b.size && [...a].every((x) => b.has(x));
+
+function Exclusions({ vendorsAll, vendors, setVendors, suppliersAll, suppliers, setSuppliers, canManage }) {
+  const [q, setQ] = useState("");
+  const lower = (x) => (x || "").trim().toLowerCase();
+  const shownVendors = vendorsAll.filter((v) => !q || lower(v.name).includes(lower(q)));
+  const toggleVendor = (name, on) =>
+    setVendors((cur) => {
+      const next = new Set(cur);
+      on ? next.add(lower(name)) : next.delete(lower(name));
+      return next;
+    });
+  const toggleSupplier = (id, on) =>
+    setSuppliers((cur) => {
+      const next = new Set(cur);
+      on ? next.add(id) : next.delete(id);
+      return next;
+    });
+  const box2 = { border: "1px solid #e3e3e3", borderRadius: "8px", maxHeight: "240px", overflowY: "auto", padding: "6px 0" };
+  const item = { display: "flex", gap: "8px", alignItems: "center", padding: "4px 12px", fontSize: "13px" };
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "16px" }}>
+      <div>
+        <div style={{ fontWeight: 650, fontSize: "13px", marginBottom: "4px" }}>Vendors (publishers) to leave out</div>
+        <div style={{ ...small, marginBottom: "6px" }}>From each product's Vendor field in Shopify.</div>
+        {vendorsAll.length > 8 && (
+          <input type="search" placeholder="Find a vendor" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...input, width: "100%", boxSizing: "border-box", marginBottom: "6px" }} />
+        )}
+        <div style={box2}>
+          {vendorsAll.length === 0 && <div style={{ ...item, ...muted }}>Preview first to list the vendors.</div>}
+          {shownVendors.map((v) => (
+            <label key={v.name || "(none)"} style={item}>
+              <input type="checkbox" disabled={!canManage} checked={vendors.has(lower(v.name))} onChange={(e) => toggleVendor(v.name, e.target.checked)} />
+              <span style={{ flex: 1 }}>{v.name || <span style={muted}>No vendor</span>}</span>
+              {v.count != null && <span style={muted}>{v.count}</span>}
+            </label>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div style={{ fontWeight: 650, fontSize: "13px", marginBottom: "4px" }}>Suppliers to leave out</div>
+        <div style={{ ...small, marginBottom: "6px" }}>Products on any purchase order to that supplier.</div>
+        <div style={box2}>
+          {suppliersAll.length === 0 && <div style={{ ...item, ...muted }}>No suppliers set up in Purchase orders.</div>}
+          {suppliersAll.map((s) => (
+            <label key={s.id} style={item}>
+              <input type="checkbox" disabled={!canManage} checked={suppliers.has(s.id)} onChange={(e) => toggleSupplier(s.id, e.target.checked)} />
+              <span style={{ flex: 1 }}>{s.name}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AutoJob({ job }) {
+  if (!job) return null;
+  const pctDone = job.total ? Math.round((job.done / job.total) * 100) : 100;
+  return (
+    <div style={{ border: "1px solid #e3e3e3", borderRadius: "10px", padding: "12px 14px", marginBottom: "14px", background: job.state === "running" ? "#f7f9ff" : "#fff" }}>
+      <div style={{ fontWeight: 650, fontSize: "13px" }}>
+        {job.state === "running" ? `Adding countdowns… ${job.done} of ${job.total}` : `Added ${job.added.length} countdown${job.added.length === 1 ? "" : "s"}`}
+      </div>
+      {job.state === "running" && (
+        <div style={{ height: "6px", background: "#e8e8e8", borderRadius: "99px", marginTop: "8px", overflow: "hidden" }}>
+          <div style={{ width: `${pctDone}%`, height: "100%", background: PINK, transition: "width .3s" }} />
+        </div>
+      )}
+      {job.errors.length > 0 && (
+        <details style={{ marginTop: "8px", fontSize: "13px" }}>
+          <summary style={{ color: "#b42318", cursor: "pointer" }}>{job.errors.length} couldn't be added</summary>
+          <ul style={{ margin: "6px 0 0", paddingLeft: "18px" }}>
+            {job.errors.slice(0, 50).map((e, i) => (
+              <li key={i}>{e}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function AutoTab({ auto, job: initialJob, suppliers: suppliersAll, skips, canManage }) {
+  const preview = useFetcher();
+  const approve = useFetcher();
+  const off = useFetcher();
+  const saveEx = useFetcher();
+  const allow = useFetcher();
+  const poll = useFetcher();
+  const revalidator = useRevalidator();
+  const lower = (x) => (x || "").trim().toLowerCase();
+  const savedVendors = new Set(auto.vendors.map(lower));
+  const savedSuppliers = new Set(auto.suppliers);
+  const [vendors, setVendors] = useState(savedVendors);
+  const [suppliers, setSuppliers] = useState(savedSuppliers);
+  const [untick, setUntick] = useState(() => new Set());
+  const [showLeftOut, setShowLeftOut] = useState(false);
+  const [confirmOff, setConfirmOff] = useState(false);
+
+  const p = preview.data?.intent === "autoPreview" ? preview.data.preview : null;
+  const job = (poll.data?.intent === "autoJob" ? poll.data.job : null) ?? (approve.data?.intent === "autoApprove" ? approve.data.job : null) ?? initialJob;
+  const running = job?.state === "running";
+
+  // Follow a running job, then show the new countdowns
+  useEffect(() => {
+    if (!running) return;
+    const t = setTimeout(() => poll.submit({ intent: "autoJob" }, { method: "post" }), 2000);
+    return () => clearTimeout(t);
+  }, [running, job?.done, poll.data]);
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    if (wasRunning.current && !running) revalidator.revalidate();
+    wasRunning.current = running;
+  }, [running]);
+
+  const rows = (p?.rows ?? []).map((r) => ({ ...r, why: reasonFor(r, vendors, suppliers) }));
+  const adding = rows.filter((r) => !r.why);
+  const ticked = adding.filter((r) => !untick.has(r.productId));
+  const leftOut = rows.filter((r) => r.why);
+  const vendorsAll = p?.vendors ?? [...savedVendors].map((name) => ({ name, count: null }));
+  const exclusionsChanged = !sameSet(vendors, savedVendors) || !sameSet(suppliers, savedSuppliers);
+  const vendorNames = () => {
+    // Saved with the vendor's own spelling where the preview has it
+    const byLower = new Map(vendorsAll.map((v) => [lower(v.name), v.name]));
+    return [...vendors].map((v) => byLower.get(v) ?? v);
+  };
+
+  const [hidePreview, setHidePreview] = useState(false);
+  const runPreview = () =>
+    setHidePreview(false) ||
+    preview.submit({ intent: "autoPreview", vendors: JSON.stringify(vendorNames()), suppliers: JSON.stringify([...suppliers]) }, { method: "post" });
+  const runApprove = () =>
+    approve.submit(
+      {
+        intent: "autoApprove",
+        vendors: JSON.stringify(vendorNames()),
+        suppliers: JSON.stringify([...suppliers]),
+        untick: JSON.stringify(adding.filter((r) => untick.has(r.productId)).map((r) => r.productId)),
+      },
+      { method: "post" },
+    );
+  useEffect(() => {
+    if (approve.data?.intent === "autoApprove" && approve.data.ok) {
+      setHidePreview(true);
+      setUntick(new Set());
+    }
+  }, [approve.data]);
+
+  const toggle = (id, on) =>
+    setUntick((cur) => {
+      const next = new Set(cur);
+      on ? next.delete(id) : next.add(id);
+      return next;
+    });
+  const error = preview.data?.error ?? approve.data?.error ?? off.data?.error ?? saveEx.data?.error ?? allow.data?.error;
+  const previewShown = p && !hidePreview;
+
+  return (
+    <>
+      <s-section heading="Automatic countdowns">
+        {auto.on ? (
+          <div style={{ display: "flex", gap: "12px", alignItems: "flex-start", flexWrap: "wrap", justifyContent: "space-between" }}>
+            <div style={{ fontSize: "13px", lineHeight: 1.5 }}>
+              <span style={pill("#e3f5e8", "#0c5132")}>On</span>{" "}
+              Every product with a release date still to come gets a countdown, checked every hour.
+              <div style={muted}>
+                Approved {auto.approvedAt ? fmtStore(auto.approvedAt) : ""}
+                {auto.approvedBy ? ` by ${auto.approvedBy}` : ""}
+                {auto.lastRunAt ? ` · Last check ${fmtStore(auto.lastRunAt)}: ${auto.lastSummary ?? ""}` : ""}
+              </div>
+            </div>
+            {canManage &&
+              (confirmOff ? (
+                <span style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "13px" }}>
+                  Existing countdowns stay as they are.
+                  <s-button tone="critical" onClick={() => off.submit({ intent: "autoOff" }, { method: "post" })} {...(off.state !== "idle" ? { loading: true } : {})}>
+                    Turn off
+                  </s-button>
+                  <s-button variant="tertiary" onClick={() => setConfirmOff(false)}>
+                    Keep on
+                  </s-button>
+                </span>
+              ) : (
+                <s-button onClick={() => setConfirmOff(true)}>Turn off</s-button>
+              ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: "13px", lineHeight: 1.55 }}>
+            <p style={{ margin: "0 0 8px" }}>
+              <span style={pill("#f1f1f1", "#616161")}>Off</span> When turned on, every active product with a release date still to come gets a countdown:
+            </p>
+            <ul style={{ margin: "0 0 8px", paddingLeft: "20px" }}>
+              <li>Pre-orders open straight away. No “pre-orders are open” email goes out, since these are already on pre-order.</li>
+              <li>They close at the end of the release date, and follow it if the date moves.</li>
+              <li>After that the countdown comes off the page and the normal Add to cart shows. Each product's flyout can change this.</li>
+              <li>“Continue selling when out of stock” is never changed. It stays however it's set on each product.</li>
+              <li>New products with an upcoming release date are added every hour.</li>
+            </ul>
+            <p style={{ margin: 0, ...muted }}>Choose any vendors or suppliers to leave out, preview what will be added, then approve it.</p>
+          </div>
+        )}
+      </s-section>
+
+      <AutoJob job={job} />
+
+      <s-section heading="Leave out">
+        <Exclusions
+          vendorsAll={vendorsAll}
+          vendors={vendors}
+          setVendors={setVendors}
+          suppliersAll={suppliersAll}
+          suppliers={suppliers}
+          setSuppliers={setSuppliers}
+          canManage={canManage}
+        />
+        <div style={{ display: "flex", gap: "8px", marginTop: "12px", flexWrap: "wrap", alignItems: "center" }}>
+          <s-button variant={p ? "secondary" : "primary"} onClick={runPreview} {...(preview.state !== "idle" ? { loading: true } : {})}>
+            {p ? "Refresh preview" : auto.on ? "Preview what's next" : "Preview what will be added"}
+          </s-button>
+          {auto.on && canManage && exclusionsChanged && (
+            <s-button
+              onClick={() =>
+                saveEx.submit({ intent: "autoExclusions", vendors: JSON.stringify(vendorNames()), suppliers: JSON.stringify([...suppliers]) }, { method: "post" })
+              }
+              {...(saveEx.state !== "idle" ? { loading: true } : {})}
+            >
+              Save what's left out
+            </s-button>
+          )}
+          {preview.state !== "idle" && <span style={small}>Reading the catalog. This can take a little while.</span>}
+          {saveEx.data?.ok && !exclusionsChanged && <span style={{ ...small, color: "#0c5132" }}>Saved.</span>}
+        </div>
+        <div style={{ ...small, marginTop: "6px" }}>Leaving something out only stops new countdowns. Ones already added stay until removed.</div>
+      </s-section>
+
+      {error && (
+        <s-banner tone="critical">
+          <s-paragraph>{error}</s-paragraph>
+        </s-banner>
+      )}
+
+      {previewShown && (
+        <s-section heading={`Preview: ${ticked.length} product${ticked.length === 1 ? "" : "s"} will get a countdown`}>
+          {adding.length === 0 ? (
+            <s-paragraph>Nothing to add: every product with an upcoming release date already has a countdown or is left out.</s-paragraph>
+          ) : (
+            <>
+              <div style={{ ...small, marginBottom: "8px" }}>Untick anything that shouldn't get one. Unticked products are remembered and left out from now on.</div>
+              <div style={{ ...box, maxHeight: "520px" }}>
+                <table style={{ borderCollapse: "separate", borderSpacing: 0, width: "100%", fontSize: "13px" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ ...head, ...checkCol }}>
+                        <input
+                          type="checkbox"
+                          aria-label="Tick all"
+                          checked={untick.size === 0}
+                          onChange={(e) => setUntick(e.target.checked ? new Set() : new Set(adding.map((r) => r.productId)))}
+                        />
+                      </th>
+                      <th style={head}>Product</th>
+                      <th style={head}>Vendor</th>
+                      <th style={head}>Supplier</th>
+                      <th style={head}>Release date</th>
+                      <th style={head}>Countdown</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {adding.map((r) => (
+                      <tr key={r.productId} style={{ opacity: untick.has(r.productId) ? 0.5 : 1 }}>
+                        <td style={{ ...cell, ...checkCol }}>
+                          <input type="checkbox" aria-label={`Add ${r.title}`} checked={!untick.has(r.productId)} onChange={(e) => toggle(r.productId, e.target.checked)} />
+                        </td>
+                        <td style={cell}>
+                          <ProductCell {...r} />
+                        </td>
+                        <td style={cell}>{r.vendor || <span style={muted}>—</span>}</td>
+                        <td style={cell}>{r.suppliers.length ? r.suppliers.join(", ") : <span style={muted}>—</span>}</td>
+                        <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDay(r.release)}</td>
+                        <td style={{ ...cell, ...small, whiteSpace: "nowrap" }}>Open now → closes end of {fmtDay(r.release)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+          {leftOut.length > 0 && (
+            <div style={{ marginTop: "10px" }}>
+              <button
+                type="button"
+                onClick={() => setShowLeftOut(!showLeftOut)}
+                style={{ appearance: "none", border: 0, background: "none", padding: 0, color: "#005bd3", cursor: "pointer", font: "inherit", fontSize: "13px" }}
+              >
+                {showLeftOut ? "Hide" : "Show"} {leftOut.length} left out
+              </button>
+              {showLeftOut && (
+                <ul style={{ margin: "8px 0 0", paddingLeft: "18px", fontSize: "13px", columns: "2 320px" }}>
+                  {leftOut.map((r) => (
+                    <li key={r.productId} style={{ breakInside: "avoid", marginBottom: "2px" }}>
+                      {r.title} <span style={muted}>· {REASON[r.why]}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {canManage && ticked.length > 0 && (
+            <div style={{ display: "flex", gap: "10px", alignItems: "center", marginTop: "14px", flexWrap: "wrap" }}>
+              <s-button variant="primary" onClick={runApprove} {...(approve.state !== "idle" ? { loading: true } : {})} {...(running ? { disabled: true } : {})}>
+                {auto.on ? `Add these ${ticked.length} now` : `Approve and turn on (${ticked.length})`}
+              </s-button>
+              {!auto.on && <span style={small}>After this, new products with an upcoming release date get a countdown automatically.</span>}
+            </div>
+          )}
+          {canManage && !auto.on && ticked.length === 0 && adding.length === 0 && (
+            <div style={{ marginTop: "12px" }}>
+              <s-button variant="primary" onClick={runApprove} {...(approve.state !== "idle" ? { loading: true } : {})}>
+                Turn on for new products
+              </s-button>
+            </div>
+          )}
+        </s-section>
+      )}
+
+      {skips.length > 0 && (
+        <s-section heading={`Left out of automatic countdowns (${skips.length})`}>
+          <div style={{ ...small, marginBottom: "8px" }}>Products unticked in a preview or taken out of the countdowns. They won't get one automatically.</div>
+          <ul style={{ margin: 0, padding: 0, listStyle: "none", fontSize: "13px" }}>
+            {skips.map((s) => (
+              <li key={s.productId} style={{ display: "flex", gap: "10px", alignItems: "center", padding: "6px 0", borderBottom: "1px solid #f1f1f1" }}>
+                <span style={{ flex: 1 }}>
+                  {s.title ?? s.productId.split("/").pop()}
+                  <span style={muted}>
+                    {" "}
+                    · {s.reason === "removed" ? "Taken out" : "Unticked"}
+                    {s.by ? ` by ${s.by}` : ""} · {fmtStore(s.createdAt)}
+                  </span>
+                </span>
+                {canManage && (
+                  <s-button variant="tertiary" onClick={() => allow.submit({ intent: "autoAllow", productIds: JSON.stringify([s.productId]) }, { method: "post" })}>
+                    Allow again
+                  </s-button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </s-section>
+      )}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -1163,6 +1802,7 @@ export default function PreorderCountdowns() {
 const TABS = [
   { id: "open", label: "Open and upcoming" },
   { id: "history", label: "History" },
+  { id: "auto", label: "Automatic" },
   { id: "emails", label: "Emails and settings" },
 ];
 
@@ -1207,7 +1847,8 @@ function Page() {
   });
 
   return (
-    <s-page heading="Pre-order countdowns" inlineSize="large">
+    <s-page heading="Pre-orders" inlineSize="large">
+      <PreorderTabs />
       <style>{MOTION_CSS}</style>
       <div role="tablist" style={{ display: "flex", gap: "4px", borderBottom: "1px solid #e3e3e3", marginBottom: "14px", flexWrap: "wrap" }}>
         {TABS.map((t) => (
@@ -1221,12 +1862,14 @@ function Page() {
             {t.label}
             {t.id === "open" && current.length > 0 && <span style={{ ...muted, fontWeight: 500 }}> ({current.length})</span>}
             {t.id === "history" && closed.length > 0 && <span style={{ ...muted, fontWeight: 500 }}> ({closed.length})</span>}
+            {t.id === "auto" && <span style={{ ...pill(data.auto.on ? "#e3f5e8" : "#f1f1f1", data.auto.on ? "#0c5132" : "#616161"), marginLeft: "6px" }}>{data.auto.on ? "On" : "Off"}</span>}
           </button>
         ))}
       </div>
 
       {tab === "open" && <OpenTab windows={current} now={now} canManage={canManage} settings={data.settings} releaseProblems={data.releaseProblems} />}
       {tab === "history" && <HistoryTab windows={closed} canManage={canManage} />}
+      {tab === "auto" && <AutoTab auto={data.auto} job={data.autoJob} suppliers={data.suppliers} skips={data.skips} canManage={canManage} />}
       {tab === "emails" && <EmailsTab {...data} />}
     </s-page>
   );
