@@ -2031,7 +2031,7 @@ function Page() {
       )}
       {tab === "batches" && batch && <BatchDetail batch={batch} list={list} filter={filter} allowed={allowed} staff={staff} me={me} lock={lock} />}
       {tab === "batches" && pick && <PickList key={pick.batch.id} data={pick} canPick={allowed.pick} lock={lock?.pick ?? null} />}
-      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick, bulkLabels: allowed.bulkLabels }} sandbox={Boolean(sandbox)} lock={lock?.pack ?? null} />}
+      {tab === "batches" && pack && <PackStation key={pack.batch.id} data={pack} boxData={packBox} can={{ pack: allowed.pack, ship: allowed.ship, override: allowed.override, pick: allowed.pick, bulkLabels: allowed.bulkLabels, batches: allowed.batches }} sandbox={Boolean(sandbox)} lock={lock?.pack ?? null} />}
       {tab === "batches" && slips && <Slips data={slips} />}
       {tab === "batches" && !batches && !batch && !pick && !pack && !slips && (
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>

@@ -416,6 +416,21 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
   }, [buyF.state, buyF.data]);
   const ackF = useFetcher();
   const unpackF = useFetcher();
+  // Flow mode: take the current package out of the batch (asks first)
+  const removeF = useFetcher();
+  const [confirmRemove, setConfirmRemove] = useState(null); // box id
+  useEffect(() => {
+    if (removeF.data?.intent !== "removeFromBatch" || !removeF.data.ok) return;
+    setConfirmRemove(null);
+    if (removeF.data.removed) {
+      setLast({ ok: true, text: `Taken out of ${batch.tag}. It's back in Ready.` });
+      const next = boxes.find((x) => x.state === "batched" && x.id !== current?.id);
+      if (next) openBox(next.id);
+      else go({ box: null }, { replace: false });
+      revalidator.revalidate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [removeF.data]);
   const inputRef = useRef(null);
 
   useEffect(() => {
@@ -989,7 +1004,41 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                         Unpack (start this box again)
                       </s-button>
                     )}
+                    {flow && can.batches && (b.state === "batched" || b.state === "packed") && confirmRemove !== b.id && (
+                      <s-button tone="critical" onClick={() => setConfirmRemove(b.id)}>
+                        Remove from batch
+                      </s-button>
+                    )}
                   </div>
+                  {flow && confirmRemove === b.id && (
+                    <div
+                      role="alertdialog"
+                      aria-label={`Remove ${b.orderName} from ${batch.tag}`}
+                      style={{ marginTop: "12px", padding: "12px 14px", borderRadius: "8px", border: "1px solid #f3b5ae", background: "#fff4f2", fontSize: "13px" }}
+                    >
+                      <div style={{ fontWeight: 650, color: "#8e1f0b" }}>Remove {b.orderName} from {batch.tag}?</div>
+                      <div style={{ marginTop: "4px" }}>
+                        It goes back to Ready and can be batched again.{" "}
+                        {b.state === "packed" ? "It's packed: take the items back out of the box." : "Put back anything already picked for it."}
+                      </div>
+                      {removeF.data?.intent === "removeFromBatch" && removeF.data.error && (
+                        <div style={{ marginTop: "6px", color: "#b42318" }}>{removeF.data.error}</div>
+                      )}
+                      <div style={{ display: "flex", gap: "8px", marginTop: "10px" }}>
+                        <s-button
+                          tone="critical"
+                          variant="primary"
+                          onClick={() => removeF.submit({ intent: "removeFromBatch", id: String(batch.id), ids: JSON.stringify([b.id]) }, { method: "post" })}
+                          {...(removeF.state !== "idle" ? { loading: true } : {})}
+                        >
+                          Yes, remove it
+                        </s-button>
+                        <s-button variant="tertiary" onClick={() => setConfirmRemove(null)}>
+                          Keep it
+                        </s-button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

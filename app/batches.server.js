@@ -148,7 +148,7 @@ export async function removeFromBatch(shop, batchId, shipmentIds, user) {
   await db.shipment.updateMany({
     where: { id: { in: rows.map((r) => r.id) } },
     data: {
-      state: "ready", batchId: null, flag: null,
+      state: "ready", batchId: null, flag: null, flowPicked: null, flowPickedAt: null,
       packed: null, packedAt: null, packedBy: null, packOverride: null, packAckKey: null,
       pkgWeight: null, pkgWeightUnit: null, pkgBox: null, pkgLength: null, pkgWidth: null, pkgHeight: null, pkgDimUnit: null, pkgAt: null, pkgBy: null,
     },
