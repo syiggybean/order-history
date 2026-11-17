@@ -285,17 +285,59 @@ export async function login(fetcher = fetch) {
   return jar;
 }
 
-async function getPage(fetcher, jar, url, binary = false) {
-  const res = await fetcher(url, { headers: { Cookie: cookieHeader(jar), "User-Agent": UA }, redirect: "manual" });
-  cookiesFrom(res, jar);
-  if (res.status >= 300 && res.status < 400) {
-    const to = res.headers.get("location") ?? "";
-    if (/login/.test(to)) throw new MilestoneError("Milestone signed the app out. Try again.");
-    return getPage(fetcher, jar, new URL(to, url).toString(), binary);
+export class SignedOut extends MilestoneError {}
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// One page, politely: Milestone answers 429 when it's read too fast, so wait
+// (as long as it asks, or longer each time) and try again; same for a dropped
+// connection
+async function getPage(fetcher, jar, url, binary = false, { sleep = wait, tries = 5 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    try {
+      res = await fetcher(url, { headers: { Cookie: cookieHeader(jar), "User-Agent": UA }, redirect: "manual" });
+    } catch (e) {
+      if (attempt >= tries) throw new MilestoneError(`Couldn't reach Milestone's site (${errorMessage(e)}).`);
+      await sleep(1000 * attempt);
+      continue;
+    }
+    cookiesFrom(res, jar);
+    if (res.status >= 300 && res.status < 400) {
+      const to = res.headers.get("location") ?? "";
+      if (/login/.test(to)) throw new SignedOut("Milestone signed the app out. Try again.");
+      return getPage(fetcher, jar, new URL(to, url).toString(), binary, { sleep, tries });
+    }
+    if ((res.status === 429 || res.status === 503) && attempt < tries) {
+      const asked = Number(res.headers.get("retry-after"));
+      await sleep(asked > 0 ? Math.min(asked, 30) * 1000 : 2000 * 2 ** (attempt - 1));
+      continue;
+    }
+    if (res.status === 429) throw new MilestoneError("Milestone is limiting how fast it can be read. Try again in a minute.");
+    if (!res.ok) throw new MilestoneError(`Milestone's site answered ${res.status} for ${new URL(url).pathname}.`);
+    return binary ? Buffer.from(await res.arrayBuffer()) : res.text();
   }
-  if (!res.ok) throw new MilestoneError(`Milestone's site answered ${res.status} for ${new URL(url).pathname}.`);
-  return binary ? Buffer.from(await res.arrayBuffer()) : res.text();
 }
+
+// A signed-in session per shop, reused for a while so loading details in
+// batches doesn't sign in each time
+const SESSIONS = new Map();
+async function sessionFor(shop, fetcher, fresh = false) {
+  const had = SESSIONS.get(shop);
+  if (!fresh && had && Date.now() - had.at < 15 * 60 * 1000) return had.jar;
+  const jar = await login(fetcher);
+  SESSIONS.set(shop, { jar, at: Date.now() });
+  return jar;
+}
+// Run with the shop's session; sign in again once if Milestone dropped it
+async function withSession(shop, fetcher, fn) {
+  try {
+    return await fn(await sessionFor(shop, fetcher));
+  } catch (e) {
+    if (!(e instanceof SignedOut)) throw e;
+    return fn(await sessionFor(shop, fetcher, true));
+  }
+}
+export const _forgetSessions = () => SESSIONS.clear();
 
 // ---------------------------------------------------------------------------
 // Matching against the shop
@@ -375,12 +417,12 @@ const sinceDay = (range, now = new Date()) => {
 };
 
 // The Excel invoices in the period, newest first
-async function invoicesSince(fetcher, jar, since) {
-  const first = parseInvoiceList(await getPage(fetcher, jar, INVOICES));
+async function invoicesSince(fetcher, jar, since, opts) {
+  const first = parseInvoiceList(await getPage(fetcher, jar, INVOICES, false, opts));
   const all = [...first.invoices];
   const fromYear = since ? Number(since.slice(0, 4)) : 0;
   for (const y of first.years.filter((y) => y >= fromYear)) {
-    all.push(...parseInvoiceList(await getPage(fetcher, jar, `${INVOICES}?year=${y}`)).invoices);
+    all.push(...parseInvoiceList(await getPage(fetcher, jar, `${INVOICES}?year=${y}`, false, opts)).invoices);
   }
   const seen = new Set();
   return all
@@ -391,97 +433,148 @@ async function invoicesSince(fetcher, jar, since) {
 
 // Each item invoiced in the period, grouped by product code, with what the
 // shop has, what was created or dismissed before, and the details of the new ones
-export async function suggestions(shop, admin, { fetcher = fetch, range = "3", now = new Date() } = {}) {
+export async function suggestions(shop, admin, { fetcher = fetch, range = "3", now = new Date(), sleep = wait } = {}) {
   const settings = await getSettings(shop);
-  const jar = await login(fetcher);
+  const opts = { sleep };
   const since = sinceDay(range, now);
-  const invoices = await invoicesSince(fetcher, jar, since);
-  const unread = [];
-  const byCode = new Map();
-  for (let i = 0; i < invoices.length; i += 4) {
-    const part = invoices.slice(i, i + 4);
-    const read = await Promise.all(
-      part.map(async (inv) => {
-        try {
-          return { inv, data: parseInvoice(await getPage(fetcher, jar, `${INVOICES}view?invoice_id=${inv.id}`, true)) };
-        } catch (e) {
-          unread.push({ number: inv.number, error: e instanceof MilestoneError ? e.message : errorMessage(e) });
-          return null;
-        }
-      }),
-    );
-    for (const r of read.filter(Boolean)) {
-      const number = r.data.number ?? r.inv.number;
-      const day = r.inv.day ?? r.data.day;
-      for (const line of r.data.lines) {
-        const had = byCode.get(line.msCode);
-        if (had) {
-          had.quantity += line.quantity;
-          if (!had.invoices.some((v) => v.number === number)) had.invoices.push({ number, day });
-          if ((day ?? "") > (had.invoiceDay ?? "")) {
-            had.invoiceDay = day;
-            if (line.wholesaleYen != null) had.wholesaleYen = line.wholesaleYen;
+  return withSession(shop, fetcher, async (jar) => {
+    const invoices = await invoicesSince(fetcher, jar, since, opts);
+    const unread = [];
+    const byCode = new Map();
+    // Two at a time: Milestone limits how fast it can be read
+    for (let i = 0; i < invoices.length; i += 2) {
+      const part = invoices.slice(i, i + 2);
+      const read = await Promise.all(
+        part.map(async (inv) => {
+          try {
+            return { inv, data: parseInvoice(await getPage(fetcher, jar, `${INVOICES}view?invoice_id=${inv.id}`, true, opts)) };
+          } catch (e) {
+            if (e instanceof SignedOut) throw e;
+            unread.push({ number: inv.number, error: e instanceof MilestoneError ? e.message : errorMessage(e) });
+            return null;
           }
-        } else byCode.set(line.msCode, { ...line, maker: null, invoiceDay: day, invoices: [{ number, day }] });
+        }),
+      );
+      for (const r of read.filter(Boolean)) {
+        const number = r.data.number ?? r.inv.number;
+        const day = r.inv.day ?? r.data.day;
+        for (const line of r.data.lines) {
+          const had = byCode.get(line.msCode);
+          if (had) {
+            had.quantity += line.quantity;
+            if (!had.invoices.some((v) => v.number === number)) had.invoices.push({ number, day });
+            if ((day ?? "") > (had.invoiceDay ?? "")) {
+              had.invoiceDay = day;
+              if (line.wholesaleYen != null) had.wholesaleYen = line.wholesaleYen;
+            }
+          } else byCode.set(line.msCode, { ...line, maker: null, invoiceDay: day, invoices: [{ number, day }] });
+        }
       }
     }
-  }
-  const items = [...byCode.values()];
-  const [shopHas, marked] = await Promise.all([
-    items.length ? inShop(admin, items.flatMap((x) => [x.jan, x.msCode])) : new Map(),
-    db.milestoneItem.findMany({ where: { shop, msCode: { in: items.map((x) => x.msCode) } } }),
-  ]);
-  const markOf = new Map(marked.map((m) => [m.msCode, m]));
-  for (const x of items) {
-    const has = shopHas.get(x.jan) ?? shopHas.get(x.msCode) ?? null;
-    const m = markOf.get(x.msCode);
-    x.inShop = has;
-    x.status = has ? "inShop" : m?.status === "created" && m.productId ? "created" : m?.status === "dismissed" ? "dismissed" : "new";
-    x.productId = has?.productId ?? m?.productId ?? null;
-    x.markedBy = m?.by ?? null;
-  }
-  // Details (maker, prices, photos) for the ones to suggest, a few at a time
-  const todo = items.filter((x) => x.status === "new");
-  for (let i = 0; i < todo.length; i += 4) {
-    await Promise.all(
-      todo.slice(i, i + 4).map(async (x) => {
-        try {
-          x.details = parseProduct(await getPage(fetcher, jar, `${BASE}/en/products/${encodeURIComponent(x.msCode)}`));
-          x.maker = x.details.maker;
-        } catch (e) {
-          x.details = null;
-          x.detailsError = errorMessage(e);
-        }
-      }),
+    const items = [...byCode.values()];
+    const [shopHas, marked] = await Promise.all([
+      items.length
+        ? inShop(
+            admin,
+            items.flatMap((x) => [x.jan, x.msCode]),
+          )
+        : new Map(),
+      db.milestoneItem.findMany({ where: { shop, msCode: { in: items.map((x) => x.msCode) } } }),
+    ]);
+    const markOf = new Map(marked.map((m) => [m.msCode, m]));
+    for (const x of items) {
+      const has = shopHas.get(x.jan) ?? shopHas.get(x.msCode) ?? null;
+      const m = markOf.get(x.msCode);
+      x.inShop = has;
+      x.status = has ? "inShop" : m?.status === "created" && m.productId ? "created" : m?.status === "dismissed" ? "dismissed" : "new";
+      x.productId = has?.productId ?? m?.productId ?? null;
+      x.markedBy = m?.by ?? null;
+    }
+    // Details (maker, prices, photos) of the ones to suggest: what's been read
+    // this week now; the page loads the rest in small batches (loadDetails)
+    const todo = items.filter((x) => x.status === "new");
+    const cached = await cachedDetails(
+      shop,
+      todo.map((x) => x.msCode),
+      now,
     );
-  }
-  // Today's rate; the last one fetched if the rate services don't answer
-  const live = await liveYenRate(fetcher);
-  if (live) await db.milestoneSettings.update({ where: { shop }, data: { yenRate: live.rate } });
-  const rate = live?.rate ?? settings.yenRate ?? null;
-  const markup = settings.markupPercent;
-  for (const x of items) {
-    const retail = x.details?.retailYen ?? null;
-    // The invoice price is what was actually paid
-    const wholesale = x.wholesaleYen ?? x.details?.wholesaleYen ?? null;
-    x.suggestedCost = rate && wholesale ? money(wholesale * rate) : null;
-    x.suggestedPrice = markup != null ? priceFromCost(x.suggestedCost, markup) : rate && retail ? money(retail * rate) : null;
-  }
-  const order = { new: 0, dismissed: 1, created: 2, inShop: 3 };
-  items.sort((a, b) => order[a.status] - order[b.status] || (b.invoiceDay ?? "").localeCompare(a.invoiceDay ?? "") || a.title.localeCompare(b.title));
-  await db.milestoneSettings.update({ where: { shop }, data: { lastRunAt: new Date() } });
-  return {
-    items,
-    range: RANGES[range] ? range : "3",
-    since,
-    invoiceCount: invoices.length - unread.length,
-    unread,
-    yenRate: rate,
-    markupPercent: markup ?? null,
-    rateSource: live ? live.source : rate ? "last rate fetched (the rate services didn't answer)" : null,
-    rateDate: live?.date ?? null,
-    checkedAt: new Date().toISOString(),
-  };
+    const pending = [];
+    for (const x of todo) {
+      const d = cached.get(x.msCode);
+      if (d) {
+        x.details = d;
+        x.maker = d.maker ?? null;
+      } else pending.push(x.msCode);
+    }
+    // Today's rate; the last one fetched if the rate services don't answer
+    const live = await liveYenRate(fetcher);
+    if (live) await db.milestoneSettings.update({ where: { shop }, data: { yenRate: live.rate } });
+    const rate = live?.rate ?? settings.yenRate ?? null;
+    const markup = settings.markupPercent;
+    for (const x of items) {
+      const retail = x.details?.retailYen ?? null;
+      // The invoice price is what was actually paid
+      const wholesale = x.wholesaleYen ?? x.details?.wholesaleYen ?? null;
+      x.suggestedCost = rate && wholesale ? money(wholesale * rate) : null;
+      x.suggestedPrice = markup != null ? priceFromCost(x.suggestedCost, markup) : rate && retail ? money(retail * rate) : null;
+    }
+    const order = { new: 0, dismissed: 1, created: 2, inShop: 3 };
+    items.sort((a, b) => order[a.status] - order[b.status] || (b.invoiceDay ?? "").localeCompare(a.invoiceDay ?? "") || a.title.localeCompare(b.title));
+    await db.milestoneSettings.update({ where: { shop }, data: { lastRunAt: new Date() } });
+    return {
+      items,
+      range: RANGES[range] ? range : "3",
+      since,
+      invoiceCount: invoices.length - unread.length,
+      unread,
+      yenRate: rate,
+      markupPercent: markup ?? null,
+      rateSource: live ? live.source : rate ? "last rate fetched (the rate services didn't answer)" : null,
+      rateDate: live?.date ?? null,
+      pending,
+      checkedAt: new Date().toISOString(),
+    };
+  });
+}
+
+const WEEK = 7 * 24 * 3600 * 1000;
+async function cachedDetails(shop, codes, now = new Date()) {
+  if (!codes.length) return new Map();
+  const rows = await db.milestoneDetail.findMany({ where: { shop, msCode: { in: codes } } });
+  return new Map(rows.filter((r) => now - new Date(r.fetchedAt) < WEEK).map((r) => [r.msCode, r.data]));
+}
+
+// Product pages for some items, one at a time with a pause between, kept for
+// a week. Stops after about 20 seconds; what's left comes back in `later`.
+export async function loadDetails(shop, codes, { fetcher = fetch, sleep = wait, budgetMs = 20000, gapMs = 400 } = {}) {
+  const list = [...new Set(codes.map(String).filter((c) => /^\d{6,14}$/.test(c)))].slice(0, 50);
+  const details = {};
+  const errors = {};
+  const later = [];
+  const started = Date.now();
+  await withSession(shop, fetcher, async (jar) => {
+    for (const code of list) {
+      if (details[code] || errors[code]) continue;
+      if (Date.now() - started > budgetMs) {
+        later.push(code);
+        continue;
+      }
+      try {
+        const d = parseProduct(await getPage(fetcher, jar, `${BASE}/en/products/${encodeURIComponent(code)}`, false, { sleep }));
+        details[code] = d;
+        await db.milestoneDetail.upsert({
+          where: { shop_msCode: { shop, msCode: code } },
+          create: { shop, msCode: code, data: d, fetchedAt: new Date() },
+          update: { data: d, fetchedAt: new Date() },
+        });
+      } catch (e) {
+        if (e instanceof SignedOut) throw e;
+        errors[code] = e instanceof MilestoneError ? e.message : errorMessage(e);
+      }
+      await sleep(gapMs);
+    }
+  });
+  return { details, errors, later };
 }
 
 // Price = cost plus the markup

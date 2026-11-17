@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useFetcher, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { NoAccess } from "../components/NoAccess";
 import { ProductThumb, preloadImages } from "../components/shipping/ui";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { errorMessage } from "../preorders.server";
-import { MilestoneError, RANGES, createDrafts, dismiss, getSettings, saveMarkup, suggestions } from "../milestone.server";
+import { MilestoneError, RANGES, createDrafts, dismiss, getSettings, loadDetails, saveMarkup, suggestions } from "../milestone.server";
 
 // Milestone: what's been invoiced on Milestone's B2B site that the shop
 // doesn't sell yet, with a draft product made in one go.
@@ -31,6 +31,7 @@ export const action = async ({ request }) => {
   const intent = String(form.get("intent") ?? "");
   const shop = session.shop;
   try {
+    if (intent === "details") return { intent, ok: true, ...(await loadDetails(shop, JSON.parse(String(form.get("codes") ?? "[]")))) };
     if (intent === "check") return { intent, ok: true, ...(await suggestions(shop, admin, { range: String(form.get("range") ?? "3") })) };
     if (!can(user, "purchaseOrders", "generate")) return denied("purchaseOrders", "generate");
     if (intent === "markup") return { intent, ok: true, markupPercent: await saveMarkup(shop, form.get("markup")) };
@@ -77,7 +78,52 @@ export default function Milestone() {
   const [hidden, setHidden] = useState({}); // msCode → dismissed here
 
   const result = check.data?.intent === "check" && check.data.ok ? check.data : null;
-  const items = useMemo(() => result?.items ?? [], [result]);
+  // Milestone product pages (maker, prices, photos) not read this week load a
+  // batch at a time after the list, so Milestone isn't read too fast
+  const more = useFetcher();
+  const [queue, setQueue] = useState([]);
+  const [extra, setExtra] = useState({}); // msCode → details
+  const [failed, setFailed] = useState({}); // msCode → why
+  const inflight = useRef(null);
+  useEffect(() => {
+    setQueue(result?.pending ?? []);
+    setExtra({});
+    setFailed({});
+  }, [result]);
+  useEffect(() => {
+    if (more.state !== "idle" || inflight.current || !queue.length) return;
+    const batch = queue.slice(0, 10);
+    inflight.current = batch;
+    setQueue(queue.slice(10));
+    more.submit({ intent: "details", codes: JSON.stringify(batch) }, { method: "post" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [more.state, queue]);
+  useEffect(() => {
+    const d = more.data;
+    const batch = inflight.current;
+    if (d?.intent !== "details" || !batch) return;
+    inflight.current = null;
+    if (d.ok) {
+      setExtra((e) => ({ ...e, ...d.details }));
+      setFailed((f) => ({ ...f, ...d.errors }));
+      setQueue((q) => [...(d.later ?? []), ...q]);
+    } else {
+      // Couldn't sign in or similar: the rest would fail the same way
+      setQueue((q) => {
+        setFailed((f) => ({ ...f, ...Object.fromEntries([...batch, ...q].map((c) => [c, d.error])) }));
+        return [];
+      });
+    }
+  }, [more.data]);
+  const totalPending = result?.pending?.length ?? 0;
+  const loadedCount = Object.keys(extra).length + Object.keys(failed).length;
+  const items = useMemo(
+    () =>
+      (result?.items ?? []).map((x) =>
+        extra[x.msCode] ? { ...x, details: extra[x.msCode], maker: extra[x.msCode].maker ?? x.maker } : failed[x.msCode] ? { ...x, details: null, detailsError: failed[x.msCode] } : x,
+      ),
+    [result, extra, failed],
+  );
   useEffect(() => {
     if (result?.yenRate) setRate(String(Math.round(result.yenRate * 1e6) / 1e6));
   }, [result]);
@@ -216,6 +262,30 @@ export default function Milestone() {
                   : ""}
           </span>
         </div>
+        {result && totalPending > 0 && (
+          <div style={{ ...small, marginTop: "6px", display: "flex", gap: "8px", alignItems: "center" }}>
+            {loadedCount < totalPending || queue.length || inflight.current ? (
+              <span>
+                Reading Milestone's product pages (photos, maker, retail price): {Math.min(loadedCount, totalPending)} of {totalPending}. Milestone limits
+                how fast it can be read, so this takes a moment; pages read are kept for a week.
+              </span>
+            ) : Object.keys(failed).length ? (
+              <>
+                <span>{Object.keys(failed).length} product page{Object.keys(failed).length === 1 ? "" : "s"} couldn't be read.</span>
+                <s-button
+                  variant="tertiary"
+                  onClick={() => {
+                    const again = Object.keys(failed);
+                    setFailed({});
+                    setQueue(again);
+                  }}
+                >
+                  Try those again
+                </s-button>
+              </>
+            ) : null}
+          </div>
+        )}
         <div style={{ ...small, marginTop: "6px" }}>
           {result?.yenRate
             ? `Today's rate from the ${result.rateSource}${result.rateDate ? ` (${result.rateDate})` : ""}: ¥1 = $${(Math.round(result.yenRate * 1e6) / 1e6).toString()}, so ¥1,000 = $${(result.yenRate * 1000).toFixed(2)}. `

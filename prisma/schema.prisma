@@ -1697,3 +1697,15 @@ model MilestoneItem {
 
   @@unique([shop, msCode])
 }
+
+// What a Milestone product page said (maker, prices, photos), kept for a week
+// so checks don't read every page again: Milestone limits how fast it can be read
+model MilestoneDetail {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  msCode    String
+  data      Json
+  fetchedAt DateTime @default(now())
+
+  @@unique([shop, msCode])
+}
