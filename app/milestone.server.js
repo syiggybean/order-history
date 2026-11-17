@@ -18,7 +18,13 @@ const BASE = "https://b2b.mile-stone.jp";
 const ARRIVED = `${BASE}/my/order/?stock_status=view`;
 // Milestone's own login page sends this fixed header with its API calls (it's in their public JavaScript)
 const SITE_API_AUTH = "Basic dGVzdDp0ZXN0";
-const UA = "Mozilla/5.0 (MonkeyBean order import)";
+// Like a normal browser visit: some sites only start a session for one
+const BROWSER = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+const UA = BROWSER["User-Agent"];
 
 // ---------------------------------------------------------------------------
 // Reading the site
@@ -108,7 +114,13 @@ export function parseProduct(html) {
 // ---------------------------------------------------------------------------
 
 const cookiesFrom = (res, jar = {}) => {
-  const list = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [res.headers.get("set-cookie")].filter(Boolean);
+  // One header per cookie; older runtimes join them with commas
+  const list =
+    typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : String(res.headers.get("set-cookie") ?? "")
+          .split(/,(?=\s*[A-Za-z0-9_.-]+=)/)
+          .filter(Boolean);
   for (const c of list) {
     const [pair] = c.split(";");
     const i = pair.indexOf("=");
@@ -125,18 +137,48 @@ export async function login(fetcher = fetch) {
   const account = process.env.MILESTONE_EMAIL;
   const password = process.env.MILESTONE_PASSWORD;
   if (!account || !password) throw new MilestoneError("The Milestone login isn't set up. Add MILESTONE_EMAIL and MILESTONE_PASSWORD in Railway.");
-  // A session first: the login is tied to it
-  const first = await fetcher(`${BASE}/en/v1/login/`, { headers: { "User-Agent": UA }, redirect: "manual" });
-  const jar = cookiesFrom(first);
-  if (!jar.plack_session) throw new MilestoneError("Milestone's site didn't start a session. Try again in a moment.");
-  const res = await fetcher(`${BASE}/p/api`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: SITE_API_AUTH, Cookie: cookieHeader(jar), "User-Agent": UA },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "User.login", params: { account, password, sid: jar.plack_session } }),
-  });
-  cookiesFrom(res, jar);
-  const body = await res.json().catch(() => null);
-  if (!body?.result?.login) throw new MilestoneError("Milestone didn't accept the login. Check MILESTONE_EMAIL and MILESTONE_PASSWORD in Railway.");
+  // A session first: the login is tied to it. Visit like a browser would,
+  // following redirects and keeping every cookie along the way.
+  const jar = {};
+  const seen = [];
+  for (const start of [`${BASE}/en/v1/login/`, `${BASE}/en/`, `${BASE}/`]) {
+    let url = start;
+    for (let hop = 0; hop < 5 && url; hop++) {
+      const res = await fetcher(url, { headers: { ...BROWSER, ...(Object.keys(jar).length ? { Cookie: cookieHeader(jar) } : {}) }, redirect: "manual" });
+      cookiesFrom(res, jar);
+      seen.push(`${new URL(url).pathname} ${res.status}`);
+      const to = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+      url = to ? new URL(to, url).toString() : null;
+    }
+    if (jar.plack_session) break;
+  }
+  const call = async () => {
+    const res = await fetcher(`${BASE}/p/api`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: SITE_API_AUTH,
+        Origin: BASE,
+        Referer: `${BASE}/en/v1/login/`,
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": UA,
+        ...(Object.keys(jar).length ? { Cookie: cookieHeader(jar) } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "User.login", params: { account, password, ...(jar.plack_session ? { sid: jar.plack_session } : {}) } }),
+    });
+    cookiesFrom(res, jar);
+    seen.push(`login ${res.status}`);
+    return res.json().catch(() => null);
+  };
+  // No session cookie yet: the login call may start one, then try again with it
+  let body = await call();
+  if (!body?.result?.login && jar.plack_session && !body?.result) body = await call();
+  if (!jar.plack_session) throw new MilestoneError(`Milestone's site didn't start a session (${seen.join(", ")}). Try again in a moment.`);
+  if (!body?.result?.login) {
+    if (body?.error) throw new MilestoneError(`Milestone refused the login: ${body.error.message ?? JSON.stringify(body.error)}`);
+    throw new MilestoneError("Milestone didn't accept the login. Check MILESTONE_EMAIL and MILESTONE_PASSWORD in Railway.");
+  }
   return jar;
 }
 
