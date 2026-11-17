@@ -3,6 +3,7 @@ import db from "./db.server";
 import { methodRulesOf } from "./components/shipping/methods";
 import { unauthenticated } from "./shopify.server";
 import { dayInStore, errorMessage, gql, toDay } from "./preorders.server";
+import { refreshFreebieLines, returnFreebies } from "./freebies.server";
 
 // ---------------------------------------------------------------------------
 // Shipping hub: shipments, readiness and holds
@@ -75,8 +76,11 @@ export const linesOf = (s) => json(s.lines, []);
 // What goes in this box: its own items plus, for a merged box (Order Merge), the
 // items chosen from the other orders (from: their order names). Same item: one line.
 const boxKey = (l) => l.variantId ?? `title:${l.title}|${l.variantTitle ?? ""}`;
+// Free gifts (Freebies) packed with this box
+export const freebieLinesOf = (s) => json(s.freebieLines, []);
+
 export function boxLinesOf(s) {
-  const own = linesOf(s);
+  const own = [...linesOf(s), ...freebieLinesOf(s)];
   const extra = json(s.mergedLines, []);
   if (!extra.length) return own;
   const out = own.map((l) => ({ ...l }));
@@ -235,10 +239,13 @@ async function upsertShipment(shop, data) {
     if (existing && ACTIVE_STATES.includes(existing.state)) {
       await db.shipment.update({ where: { id: existing.id }, data: { state: "closed", closedAt: new Date(), waitingReason: "Order cancelled" } });
     }
+    // Its free gifts go back to their stock
+    await returnFreebies(shop, null, fields.orderId).catch((e) => console.error(`[freebies] return ${fields.orderName}:`, errorMessage(e)));
     return;
   }
   if (!existing) {
     await db.shipment.create({ data: { shop, ...fields, syncedAt: new Date() } });
+    await placeFreebies(shop, fields.orderId);
     return;
   }
   // A shipment that left us (closed/shipped) and came back open: start over
@@ -247,6 +254,17 @@ async function upsertShipment(shop, data) {
     where: { id: existing.id },
     data: { ...fields, state, ...(state === "waiting" && existing.state !== "waiting" ? { batchId: null, readyAt: null } : {}), syncedAt: new Date() },
   });
+  // Items moved between parts: the gifts follow their product
+  if (fields.lines !== existing.lines) await placeFreebies(shop, fields.orderId);
+}
+
+// Free gifts given to the order go in the box with their product
+async function placeFreebies(shop, orderId) {
+  try {
+    if (await db.freebieGrant.count({ where: { shop, orderId } })) await refreshFreebieLines(shop, orderId);
+  } catch (e) {
+    console.error(`[freebies] boxes ${orderId}:`, errorMessage(e));
+  }
 }
 
 // A shipment Shopify no longer lists as open: shipped elsewhere or cancelled

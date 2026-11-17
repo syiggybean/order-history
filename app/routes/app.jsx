@@ -25,6 +25,7 @@ export default function App() {
         {allows(user, "packingVideos") && <s-link href="/app/packing-videos">Packing videos</s-link>}
         {allows(user, "blocklist") && <s-link href="/app/blocked">Blocked customers</s-link>}
         {allows(user, "debug") && <s-link href="/app/debug">Debug</s-link>}
+        {allows(user, "freebies") && <s-link href="/app/freebies">Freebies</s-link>}
         {allows(user, "inventory") && <s-link href="/app/inventory">Inventory history</s-link>}
         {allows(user, "debug") && <s-link href="/app/rate-test">Label rate test</s-link>}
         {allows(user, "loyalty") && <s-link href="/app/loyalty">Loyalty</s-link>}

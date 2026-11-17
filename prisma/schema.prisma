@@ -503,6 +503,8 @@ model Shipment {
   // (the main order's name) and stay out of batches until the box ships
   mergeGroupId       Int?
   mergedLines        String?
+  // Free gifts packed with this box (Freebies): JSON lines like the order's own
+  freebieLines       String?
   mergedInto         String?
   // The shipping method chosen for a merged box
   mergeMethod        String?
@@ -1601,4 +1603,68 @@ model MergeGroup {
   shippedAt      DateTime?
 
   @@index([shop, status])
+}
+
+// ---------------------------------------------------------------------------
+// Freebies: free gifts attached to products, packed with the order
+// ---------------------------------------------------------------------------
+
+model Freebie {
+  id          Int      @id @default(autoincrement())
+  shop        String
+  title       String
+  description String?
+  imageId     Int?
+  // Optional, so it can be scanned at packing (otherwise packers tap "In the box")
+  sku         String?
+  barcode     String?
+  // Left to give away; goes down as orders come in, back up if one is cancelled
+  stock       Int      @default(0)
+  given       Int      @default(0)
+  active      Boolean  @default(true)
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@index([shop])
+}
+
+model FreebieProduct {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  freebieId Int
+  productId String
+  title     String?
+  handle    String?
+  imageUrl  String?
+  createdAt DateTime @default(now())
+
+  @@unique([freebieId, productId])
+  @@index([shop, productId])
+}
+
+// One per order, freebie and product bought: how many were given
+model FreebieGrant {
+  id         Int       @id @default(autoincrement())
+  shop       String
+  freebieId  Int
+  orderId    String
+  orderName  String?
+  productId  String
+  quantity   Int
+  returnedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@unique([shop, orderId, freebieId, productId])
+  @@index([shop, orderId])
+  @@index([shop, freebieId])
+}
+
+// The freebie's photo, served by the app for the product page
+model FreebieImage {
+  id          Int      @id @default(autoincrement())
+  shop        String
+  contentType String
+  data        Bytes
+  createdAt   DateTime @default(now())
 }

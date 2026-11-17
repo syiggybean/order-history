@@ -1,6 +1,6 @@
 import db from "./db.server";
 import { gql } from "./preorders.server";
-import { ShippingError, isSandboxShop, kick, linesOf, logEvent, onAfterRun, onOrdersSynced, releaseHold, syncOrder } from "./shipping.server";
+import { ShippingError, freebieLinesOf, isSandboxShop, kick, linesOf, logEvent, onAfterRun, onOrdersSynced, releaseHold, syncOrder } from "./shipping.server";
 
 // ---------------------------------------------------------------------------
 // Order Merge: open orders for the same customer and address shipped in one box.
@@ -171,7 +171,8 @@ export async function createMerge(shop, { mainShipmentId, riders, method = null 
     if (lines.length !== want.size) throw new ShippingError(`Some items of ${s.orderName} changed. Refresh the page.`);
     riderRows.push({ s, lines });
   }
-  const mergedLines = riderRows.flatMap(({ s, lines }) => lines.map((l) => ({ ...l, fromOrderName: s.orderName, fromShipmentId: s.id })));
+  // Riders' free gifts go in the shared box too
+  const mergedLines = riderRows.flatMap(({ s, lines }) => [...lines, ...freebieLinesOf(s)].map((l) => ({ ...l, fromOrderName: s.orderName, fromShipmentId: s.id })));
   const ridersJson = riderRows.map(({ s, lines }) => ({ shipmentId: s.id, orderId: s.orderId, orderName: s.orderName, fulfillmentOrderId: s.fulfillmentOrderId, lines, done: false }));
   const group = await db.mergeGroup.create({
     data: { shop, mainShipmentId: main.id, mainOrderName: main.orderName, method: method ? String(method).slice(0, 120) : null, riders: JSON.stringify(ridersJson), createdBy: user?.name ?? null },
@@ -482,7 +483,7 @@ export async function saveBoxes(shop, admin, { customerId, boxes }, user) {
     const labelFo = b.labelShipmentId ? foOf.get(`${bi}:${Number(b.labelShipmentId)}`) : null;
     const main = rows.find((r) => r.fulfillmentOrderId === labelFo) ?? rows.find((r) => r.state === "ready") ?? rows[0];
     const riders = rows.filter((r) => r.id !== main.id);
-    const mergedLines = riders.flatMap((r) => linesOf(r).map((l) => ({ ...l, fromOrderName: r.orderName, fromShipmentId: r.id })));
+    const mergedLines = riders.flatMap((r) => [...linesOf(r), ...freebieLinesOf(r)].map((l) => ({ ...l, fromOrderName: r.orderName, fromShipmentId: r.id })));
     const g = await db.mergeGroup.create({
       data: {
         shop,

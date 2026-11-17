@@ -4,6 +4,7 @@ import { orderChanged } from "../shipping.server";
 import { recordWishlistOrder } from "../wishlist.server";
 import { syncLoyaltyOrder } from "../loyalty.server";
 import { checkOrder } from "../blocklist.server";
+import { grantFreebies } from "../freebies.server";
 
 // Shopify calls this for every new order. Used for pre-order countdowns:
 // units sold per product, and orders that came from a notification email.
@@ -19,6 +20,8 @@ export const action = async ({ request }) => {
     await recordWishlistOrder(shop, payload);
     // Loyalty: points for members
     await syncLoyaltyOrder(shop, payload);
+    // Freebies: a free gift per unit of an attached product, while stock lasts
+    await grantFreebies(shop, admin ?? (await unauthenticated.admin(shop)).admin, payload);
   } catch (e) {
     console.error("[preorder-notify] order:", e?.message ?? e);
     return new Response(null, { status: 500 }); // Shopify will retry

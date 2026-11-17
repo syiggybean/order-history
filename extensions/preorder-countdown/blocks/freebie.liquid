@@ -1,0 +1,46 @@
+{%- comment -%}
+  Freebie (from the MonkeyBean app)
+
+  Shows the free gift that comes with this product while it's on and in stock.
+  The app keeps product.metafields.oh_freebie.offers up to date (photo, name,
+  description); with nothing to give, the block shows nothing.
+  Place it in the product section, near the buy buttons.
+{%- endcomment -%}
+{%- assign offers = product.metafields.oh_freebie.offers.value -%}
+{%- if offers != blank and offers.size > 0 -%}
+  <div class="ohfb" {{ block.shopify_attributes }} style="--ohfb-bg: {{ block.settings.background }}; --ohfb-accent: {{ block.settings.accent }};">
+    {%- for offer in offers -%}
+      <div class="ohfb__item">
+        {%- if offer.image != blank -%}
+          <button type="button" class="ohfb__thumb" aria-label="See the free gift bigger: {{ offer.title | escape }}" onclick="this.nextElementSibling.showModal()">
+            <img src="{{ offer.image }}" alt="{{ offer.title | escape }}" width="72" height="72" loading="lazy">
+          </button>
+          <dialog class="ohfb__dialog" onclick="if (event.target === this) this.close()">
+            <img src="{{ offer.image }}" alt="{{ offer.title | escape }}">
+            <p class="ohfb__dialog-title">{{ offer.title | escape }}</p>
+            <form method="dialog"><button class="ohfb__close" aria-label="Close">×</button></form>
+          </dialog>
+        {%- endif -%}
+        <div class="ohfb__text">
+          {%- if block.settings.heading != blank -%}<p class="ohfb__label">{{ block.settings.heading | escape }}</p>{%- endif -%}
+          <p class="ohfb__title">{{ offer.title | escape }}</p>
+          {%- if offer.description != blank -%}<p class="ohfb__desc">{{ offer.description | escape | newline_to_br }}</p>{%- endif -%}
+        </div>
+      </div>
+    {%- endfor -%}
+  </div>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Freebie",
+  "target": "section",
+  "enabled_on": { "templates": ["product"] },
+  "stylesheet": "freebie.css",
+  "settings": [
+    { "type": "text", "id": "heading", "label": "Label", "default": "Free gift with every copy, while stocks last" },
+    { "type": "color", "id": "background", "label": "Background", "default": "#FFF1F4" },
+    { "type": "color", "id": "accent", "label": "Accent", "default": "#E0537A" }
+  ]
+}
+{% endschema %}

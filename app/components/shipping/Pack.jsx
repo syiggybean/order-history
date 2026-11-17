@@ -962,6 +962,25 @@ export function PackStation({ data, boxData, can: canIn, sandbox = false, lock =
                                     </div>
                                     <div style={small}>{[l.sku && `SKU ${l.sku}`, l.barcode && l.barcode !== l.sku && l.barcode].filter(Boolean).join(" · ")}</div>
                                     {l.from?.length > 0 && <div style={{ ...small, color: "#1c4a9c", fontWeight: 600 }}>From order {l.from.join(", ")}</div>}
+                                    {l.freebie && (
+                                      <div style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "4px", flexWrap: "wrap" }}>
+                                        <span style={{ background: "#fde7ef", color: "#a0144f", borderRadius: "999px", padding: "1px 8px", fontSize: "12px", fontWeight: 700 }}>
+                                          🎁 Free gift
+                                        </span>
+                                        {/* No barcode to scan: tap once per gift as it goes in (or picked) */}
+                                        {!done && !l.barcode && !l.sku && b.state === "batched" && (can.pack || can.pick) && (
+                                          <s-button
+                                            variant="secondary"
+                                            onClick={() => {
+                                              queue.current.push({ code: `line:${l.key}`, via: "tap" });
+                                              pump();
+                                            }}
+                                          >
+                                            {picking ? "Picked one" : "Put one in the box"}
+                                          </s-button>
+                                        )}
+                                      </div>
+                                    )}
                                   </div>
                                 </div>
                               </td>

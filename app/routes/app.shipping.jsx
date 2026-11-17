@@ -440,7 +440,7 @@ export const action = async ({ request }) => {
       return {
         intent,
         ...(await packScan(shop, id, Number(form.get("shipmentId")), String(form.get("code") ?? ""), user, {
-          via: form.get("via") === "visual" ? "visual" : "barcode",
+          via: ["visual", "tap"].includes(String(form.get("via"))) ? String(form.get("via")) : "barcode",
           holdForSeal: form.get("holdForSeal") === "1",
         })),
       };

@@ -126,6 +126,7 @@ export function SlipSheet({ s, batch }) {
                 {l.title}
                 {l.variantTitle ? ` – ${l.variantTitle}` : ""}
                 {l.from?.length ? <span style={{ fontSize: "11px", color: "#555" }}> (order {l.from.join(", ")})</span> : null}
+                {l.freebie ? <strong style={{ fontSize: "11px" }}> (FREE GIFT)</strong> : null}
               </td>
               <td>{l.sku ?? ""}</td>
               <td className="bin">{l.bin ?? ""}</td>

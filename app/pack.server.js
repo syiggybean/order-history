@@ -56,6 +56,7 @@ function viewBox(s, flags, bins) {
       scanned: Math.min(packed[key] ?? 0, l.quantity),
       bin: bins?.get(l.variantId) ?? null,
       from: l.from ?? null,
+      freebie: Boolean(l.freebie),
     };
   });
   const units = lines.reduce((n, l) => n + l.qty, 0);
@@ -467,6 +468,8 @@ export async function packScan(shop, batchId, shipmentId, code, user, { via = "b
   const byKey = c.startsWith("line:") ? String(code).trim().slice(5) : null;
   const matches = byKey ? lines.filter((l) => itemKey(l) === byKey) : lines.filter((l) => norm(l.barcode) === c || norm(l.sku) === c);
   if (byKey && !matches.length) return { ok: false, code, error: `That item isn't in ${s.orderName}.` };
+  // Tapping instead of scanning is only for free gifts with nothing to scan
+  if (via === "tap" && !matches.every((l) => l.freebie && !l.barcode && !l.sku)) return { ok: false, code, error: "Scan that item." };
   if (!matches.length) return { ok: false, code, error: `${code} isn't in ${s.orderName}. Don't pack it.` };
   // Flow mode, step 1: until every item is off the shelf, a scan is a pick
   if (b.flow && !s.flowPickedAt) return flowPick(shop, b, s, lines, matches, code, user);
@@ -763,7 +766,7 @@ export async function packingSlips(shop, admin, batchId, ids = []) {
             : [s.customerName, [s.province, s.country].filter(Boolean).join(", ")].filter(Boolean),
         note: n?.note ?? s.orderNote ?? null,
         addressWarning: ["WARNING", "ERROR"].includes(a?.validationResultSummary) ? a.validationResultSummary : (n?.address?.level ?? null),
-        lines: boxLinesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, qty: l.quantity, sku: l.sku, bin: bins.get(l.variantId) ?? null, from: l.from ?? null })),
+        lines: boxLinesOf(s).map((l) => ({ title: l.title, variantTitle: l.variantTitle, qty: l.quantity, sku: l.sku, bin: bins.get(l.variantId) ?? null, from: l.from ?? null, freebie: Boolean(l.freebie) })),
         mergedWith: [...new Set(json(s.mergedLines, []).map((l) => l.fromOrderName))],
       };
     }),
