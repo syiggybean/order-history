@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useFetcher, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { NoAccess } from "../components/NoAccess";
-import { ProductThumb } from "../components/shipping/ui";
+import { ProductThumb, preloadImages } from "../components/shipping/ui";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { errorMessage } from "../preorders.server";
 import { MilestoneError, createDrafts, dismiss, getSettings, saveRate, suggestions } from "../milestone.server";
@@ -72,6 +72,11 @@ export default function Milestone() {
 
   const result = check.data?.intent === "check" && check.data.ok ? check.data : null;
   const items = useMemo(() => result?.items ?? [], [result]);
+  // Full-size photos load in the background as soon as the list arrives, so
+  // hovering shows them sharp straight away
+  useEffect(() => {
+    preloadImages(items.map((x) => x.details?.images?.[0]));
+  }, [items]);
   useEffect(() => {
     if (create.data?.intent !== "create") return;
     const next = { ...done };

@@ -44,11 +44,39 @@ const GAP = 18; // distance from the cursor
 // Only one preview on screen at a time: showing one hides whichever was showing
 let hideShown = null;
 
+// Big pictures already in the browser, so the preview shows them sharp at once
+const LOADED = new Set();
+const WARMING = new Map();
+
+// Fetch big pictures ahead of time (a few at once), e.g. while a table fills in
+export function preloadImages(urls) {
+  if (typeof window === "undefined") return;
+  const queue = [...new Set(urls.filter(Boolean))].filter((u) => !LOADED.has(u) && !WARMING.has(u));
+  let active = 0;
+  const next = () => {
+    while (active < 4 && queue.length) {
+      const u = queue.shift();
+      const img = new Image();
+      active++;
+      WARMING.set(u, img);
+      img.onload = img.onerror = (e) => {
+        if (e.type === "load") LOADED.add(u);
+        WARMING.delete(u);
+        active--;
+        next();
+      };
+      img.src = u;
+    }
+  };
+  next();
+}
+
 // A product thumbnail that shows a large view under the cursor on hover.
 // large: the big picture's address, when it isn't a Shopify image
 export function ProductThumb({ src, size, style, large }) {
   const [at, setAt] = useState(null); // { x, y } while hovering
-  const [loaded, setLoaded] = useState(false);
+  const bigSrc = large ?? (src ? largeImage(src) : null);
+  const [loaded, setLoaded] = useState(() => LOADED.has(bigSrc));
   const [failed, setFailed] = useState(false);
   const ref = useRef(null);
   const box = { ...thumb, ...(size ? { width: `${size}px`, height: `${size}px` } : {}), ...style };
@@ -117,9 +145,9 @@ export function ProductThumb({ src, size, style, large }) {
         {/* The small picture fills in until the big one arrives */}
         <img src={src} alt="" style={{ position: "absolute", inset: 8, width: PREVIEW - 16, height: PREVIEW - 16, objectFit: "contain", opacity: loaded ? 0 : 1, filter: failed ? "none" : "blur(2px)" }} />
         <img
-          src={large ?? largeImage(src)}
+          src={bigSrc}
           alt=""
-          onLoad={() => setLoaded(true)}
+          onLoad={() => (LOADED.add(bigSrc), setLoaded(true))}
           onError={() => setFailed(true)}
           style={{ position: "relative", width: "100%", height: "100%", objectFit: "contain", opacity: loaded ? 1 : 0, transition: "opacity .15s" }}
         />
