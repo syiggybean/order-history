@@ -1,3 +1,4 @@
+import { recordLimitSales } from "../preorder-windows.server";
 import { authenticate, unauthenticated } from "../shopify.server";
 import { recordOrder } from "../preorder-notify.server";
 import { orderChanged } from "../shipping.server";
@@ -20,6 +21,8 @@ export const action = async ({ request }) => {
     await recordWishlistOrder(shop, payload);
     // Loyalty: points for members
     await syncLoyaltyOrder(shop, payload);
+    // Pre-order sales limits: units ordered count against the limit
+    await recordLimitSales(shop, payload);
     // Freebies: a free gift per unit of an attached product, while stock lasts
     await grantFreebies(shop, admin ?? (await unauthenticated.admin(shop)).admin, payload);
   } catch (e) {

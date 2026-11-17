@@ -19,6 +19,7 @@ import {
   syncReleaseCloses,
   windowVariants,
   setContinueSelling,
+  limitStockReport,
 } from "../preorder-windows.server";
 import { NotifyError, getSettings, recentSends, saveSettings, sendTestEmail } from "../preorder-notify.server";
 import { setReleaseDate } from "../preorders.server";
@@ -41,7 +42,7 @@ export const loader = async ({ request }) => {
   const shop = session.shop;
   // Closing times that follow release dates catch up with Shopify first
   const releaseSync = await syncReleaseCloses(shop, admin).catch((e) => ({ changed: [], problems: [`Couldn't read release dates: ${e?.message ?? e}`] }));
-  const [windows, settings, mail, sends, locations, suppliers, skips] = await Promise.all([
+  const [windows, settings, mail, sends, locations, suppliers, skips, stockReport] = await Promise.all([
     listWindows(shop),
     getSettings(shop),
     mailStatus(),
@@ -49,8 +50,29 @@ export const loader = async ({ request }) => {
     listLocations(admin).catch(() => []),
     listSuppliers(shop),
     listSkips(shop),
+    limitStockReport(shop).catch(() => []),
   ]);
+  // Variant names for the report of stock earlier sales limits changed
+  if (stockReport.length) {
+    const ids = [...new Set(stockReport.map((r) => r.variantId))];
+    for (let i = 0; i < ids.length; i += 100) {
+      const res = await admin
+        .graphql(`#graphql
+          query ($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id title sku product { id title } } } }`, { variables: { ids: ids.slice(i, i + 100) } })
+        .then((r) => r.json())
+        .catch(() => null);
+      const byId = new Map((res?.data?.nodes ?? []).filter(Boolean).map((n) => [n.id, n]));
+      for (const r of stockReport) {
+        const n = byId.get(r.variantId);
+        if (!n) continue;
+        r.variantTitle = n.title === "Default Title" ? null : n.title;
+        r.sku = r.sku ?? n.sku ?? null;
+        r.title = r.title ?? n.product?.title ?? null;
+      }
+    }
+  }
   return {
+    stockReport,
     canManage: can(user, "preorders", "manage"),
     windows,
     settings: {
@@ -130,7 +152,6 @@ export const action = async ({ request }) => {
       }
       // "Continue selling when out of stock", only when someone changed it
       const selling = form.has("continueSelling") ? form.get("continueSelling") === "true" : null;
-      if (selling && limits) throw new WindowError("A product with a sales limit can't continue selling when out of stock. Untick one of them.");
       await saveWindow(
         shop,
         admin,
@@ -345,15 +366,10 @@ function Stock({ w }) {
     return (
       <span style={num}>
         <strong>{w.available}</strong> <span style={muted}>left of {w.limitTotal}</span>
-        {w.soldOut && w.restockedUnits > 0 && <div style={small}>{w.restockedUnits} added since selling out</div>}
+        <div style={small}>{Math.max(0, w.limitTotal - w.available)} pre-ordered</div>
       </span>
     );
-  return (
-    <span style={num}>
-      Limit {w.limitTotal}
-      {w.held > 0 && <div style={small}>{w.held} held for re-opening</div>}
-    </span>
-  );
+  return <span style={num}>Limit {w.limitTotal}</span>;
 }
 
 function EmailStats({ m }) {
@@ -611,20 +627,20 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
             {sellingShown == null ? (
               <span style={muted}>{canManage ? "Loading…" : "Shown to people who can manage countdowns."}</span>
             ) : (
-              <label style={{ ...radioRow, opacity: limited ? 0.55 : 1 }}>
+              <label style={radioRow}>
                 <input
                   type="checkbox"
                   ref={(el) => el && (el.indeterminate = sellingShown === "mixed")}
                   checked={sellingShown === "on"}
-                  disabled={limited || !canManage}
+                  disabled={!canManage}
                   onChange={(e) => setSelling(e.target.checked ? "on" : "off")}
                 />
                 <span>
                   {sellingShown === "on" ? "On for every variant" : sellingShown === "off" ? "Off" : "On for some variants (tick to turn on for all)"}
                   <div style={small}>
-                    The same setting as on the product in Shopify. Countdowns never change it on their own, only here or in bulk edit.
-                    {limited && " Off while there's a sales limit."}
-                    {!limited && sellingShown !== "on" && w.appliedPhase === "open" && " While it's off, pre-orders stop when stock runs out."}
+                    The same setting as on the product in Shopify. Countdowns only change it on their own when pre-orders end: it's turned off then,
+                    so they can't still be bought in the Shop app.
+                    {sellingShown !== "on" && w.appliedPhase === "open" && " While it's off, pre-orders stop when stock runs out."}
                   </div>
                 </span>
               </label>
@@ -639,7 +655,7 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
                 Take the countdown off and show the normal Add to cart
                 <div style={small}>
                   {keepSelling
-                    ? "The product page goes back to normal. Whether it can be bought with no stock follows the setting above."
+                    ? "The product page goes back to normal, selling only what's in stock (Continue selling is turned off when pre-orders end)."
                     : "The product page shows “Pre-Orders Closed”."}
                 </div>
               </span>
@@ -652,7 +668,7 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
                 type="checkbox"
                 checked={limited}
                 disabled={!canManage}
-                onChange={(e) => (setLimited(e.target.checked), e.target.checked && sellingShown !== "off" && setSelling("off"), setLocalError(null))}
+                onChange={(e) => (setLimited(e.target.checked), setLocalError(null))}
               />
               <span style={sectionTitle}>Limit pre-orders</span>
             </label>
@@ -663,7 +679,7 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
                 ) : (
                   <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
                     {list.map((v) => (
-                      <Field key={v.id} label={`${v.title}${w.appliedPhase === "open" ? ` (${v.available} on sale now)` : ""}`}>
+                      <Field key={v.id} label={`${v.title}${w.appliedPhase === "open" && v.left != null ? ` (${v.left} left)` : ""}`}>
                         <input
                           type="number"
                           min="0"
@@ -671,18 +687,20 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
                           value={limits[v.id] ?? ""}
                           onChange={(e) => (setLimits({ ...limits, [v.id]: e.target.value }), setLocalError(null))}
                           style={{ ...input, width: "110px" }}
-                          disabled={!v.tracked}
                         />
-                        {!v.tracked && <span style={{ ...small, color: "#b42318" }}>Turn on “Track quantity” first</span>}
                       </Field>
                     ))}
                   </div>
                 )}
                 <div style={small}>
-                  At opening each variant gets this many units to sell. When they run out the button shows “Pre-Orders Closed” and customers can sign up
-                  to hear if more are added.
-                  {w.appliedPhase === "open" && " Changing it now adds or removes the difference straight away."}
+                  Counts the units ordered since pre-orders opened; stock isn't changed. When the limit is reached the button shows “Pre-Orders Closed”,
+                  customers can sign up to hear if more are added, and the “Pre-order limits” checkout rule stops more being bought (cart links and the
+                  Shop app too). Turn on Continue selling above so pre-orders can be bought with no stock.
+                  {w.appliedPhase === "open" && " Changing it now takes effect straight away."}
                 </div>
+                {sellingShown && sellingShown !== "on" && selling !== "on" && (
+                  <div style={{ ...small, color: "#8a4b00" }}>Continue selling is off, so only what's in stock can be pre-ordered.</div>
+                )}
               </>
             )}
           </div>
@@ -692,7 +710,7 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
               {confirmRemove ? (
                 <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                   <span style={{ fontSize: "13px" }}>
-                    Take this product out of the countdowns? Its selling setting goes back to how it was
+                    Take this product out of the countdowns? Its stock and selling setting stay as they are
                     {w.auto ? ", and automatic countdowns won't add it again." : "."}
                   </span>
                   <span style={{ display: "flex", gap: "6px" }}>
@@ -736,7 +754,7 @@ function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
   );
 }
 
-const OPEN_COLUMNS = ["Product", "Opens", "Closes", "Release date", "Status", "After closing", "Stock", "Sign-ups", "Emails", "From emails", "Sold"];
+const OPEN_COLUMNS = ["Product", "Opens", "Closes", "Release date", "Status", "After closing", "Limit", "Sign-ups", "Emails", "From emails", "Sold"];
 
 function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect, onOpen }) {
   const m = w.metrics;
@@ -928,7 +946,7 @@ function HistoryRow({ w, canManage, onNewWave }) {
   const [confirmRemove, setConfirmRemove] = useState(false);
   const busy = fetcher.state !== "idle";
   const m = w.metrics;
-  const willSell = w.held + (Number(addUnits) || 0) * (w.variantCount ?? 1);
+  const more = (Number(addUnits) || 0) * (w.variantCount ?? 1);
 
   return (
     <>
@@ -950,10 +968,7 @@ function HistoryRow({ w, canManage, onNewWave }) {
         </td>
         <td style={cell}>
           {w.limited ? (
-            <span style={num}>
-              Limit {w.limitTotal}
-              {w.held > 0 && <div style={small}>{w.held} held</div>}
-            </span>
+            <span style={num}>Limit {w.limitTotal}</span>
           ) : (
             <span style={muted}>No limit</span>
           )}
@@ -997,7 +1012,7 @@ function HistoryRow({ w, canManage, onNewWave }) {
                 <input type="datetime-local" value={closes} onChange={(e) => setCloses(e.target.value)} style={input} />
               </Field>
               {w.limited && (
-                <Field label="Add units to each variant">
+                <Field label="Raise the limit, per variant">
                   <input
                     type="number"
                     min="0"
@@ -1023,7 +1038,7 @@ function HistoryRow({ w, canManage, onNewWave }) {
             <div style={{ ...small, marginTop: "8px" }}>
               Pre-orders open straight away.
               {w.limited
-                ? ` ${willSell} unit${willSell === 1 ? "" : "s"} go on sale (${w.held} held at closing${Number(addUnits) > 0 ? ` plus ${addUnits} per variant` : ""}). Sign-ups are emailed if that's more than the restock threshold.`
+                ? ` ${more ? `The limit goes up by ${addUnits} per variant (${w.limitTotal + more} in all); stock isn't changed.` : `The limit stays at ${w.limitTotal}.`} Sign-ups are emailed if more than the restock threshold can be pre-ordered. Turn Continue selling back on in the product's flyout if it should sell with no stock.`
                 : " Everyone signed up is emailed."}
             </div>
             {fetcher.data?.error && <div style={{ color: "#b42318", marginTop: "8px" }}>{fetcher.data.error}</div>}
@@ -1178,7 +1193,7 @@ function EmailsTab({ windows, settings, locations, mail, sends, canManage, staff
 
       <s-section heading="Settings">
         <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", alignItems: "flex-end" }}>
-          <Field label="Email sign-ups after a restock of more than">
+          <Field label="Email sign-ups when a sold-out limit is raised by more than">
             <span style={{ display: "flex", gap: "6px", alignItems: "center" }}>
               <input
                 type="number"
@@ -1212,22 +1227,6 @@ function EmailsTab({ windows, settings, locations, mail, sends, canManage, staff
               style={{ ...input, width: "180px" }}
               disabled={!canManage}
             />
-          </Field>
-          <Field label="Limited stock is kept at">
-            <select
-              value={s.locationId}
-              onChange={(e) => setS({ ...s, locationId: e.target.value })}
-              style={{ ...input, minWidth: "180px" }}
-              disabled={!canManage}
-            >
-              <option value="">Automatic (online orders location)</option>
-              {locations.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.name}
-                  {l.online ? "" : " (doesn't fulfil online orders)"}
-                </option>
-              ))}
-            </select>
           </Field>
           {canManage && (
             <s-button
@@ -1720,7 +1719,7 @@ function AutoTab({ auto, job: initialJob, suppliers: suppliersAll, skips, canMan
               <li>Pre-orders open straight away. No “pre-orders are open” email goes out, since these are already on pre-order.</li>
               <li>They close at the end of the release date, and follow it if the date moves.</li>
               <li>After that the countdown comes off the page and the normal Add to cart shows. Each product's flyout can change this.</li>
-              <li>“Continue selling when out of stock” is never changed. It stays however it's set on each product.</li>
+              <li>“Continue selling when out of stock” is turned off when pre-orders end, so they can't still be bought in the Shop app. Otherwise it's left as it is.</li>
               <li>New products with an upcoming release date are added every hour.</li>
             </ul>
             <p style={{ margin: 0, ...muted }}>Choose any vendors or suppliers to leave out, preview what will be added, then approve it.</p>
@@ -1955,11 +1954,68 @@ function Page() {
         ))}
       </div>
 
+      {data.stockReport?.length > 0 && <StockReport rows={data.stockReport} />}
       {tab === "open" && <OpenTab windows={current} now={now} canManage={canManage} settings={data.settings} releaseProblems={data.releaseProblems} />}
       {tab === "history" && <HistoryTab windows={closed} canManage={canManage} />}
       {tab === "auto" && <AutoTab auto={data.auto} job={data.autoJob} suppliers={data.suppliers} skips={data.skips} canManage={canManage} />}
       {tab === "emails" && <EmailsTab {...data} />}
     </s-page>
+  );
+}
+
+// Stock earlier versions of sales limits changed, to put right by hand
+function StockReport({ rows }) {
+  const [open, setOpen] = useState(false);
+  const fmt = (n) => (n > 0 ? `+${n}` : String(n));
+  return (
+    <div style={{ border: "1px solid #f5c26b", background: "#fff8eb", borderRadius: "10px", padding: "10px 14px", marginBottom: "14px", fontSize: "13px" }}>
+      <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+        <span style={{ flex: 1, minWidth: "260px" }}>
+          <strong>Stock changed by earlier sales limits.</strong> Sales limits used to change stock (set to the limit at opening, held back at closing).
+          They don't anymore. Here's what was changed on {rows.length} variant{rows.length === 1 ? "" : "s"}, so you can put stock right in Shopify.
+        </span>
+        <s-button variant="tertiary" onClick={() => setOpen(!open)}>
+          {open ? "Hide list" : "Show list"}
+        </s-button>
+      </div>
+      {open && (
+        <div style={{ overflowX: "auto", marginTop: "10px" }}>
+          <table style={{ borderCollapse: "collapse", width: "100%", background: "#fff" }}>
+            <thead>
+              <tr>
+                {["Product", "SKU", "Added by the app", "Taken off by the app", "Net change", "Still held back", "Last change"].map((h) => (
+                  <th key={h} style={{ ...cell, textAlign: "left", fontWeight: 600, whiteSpace: "nowrap" }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={`${r.productId}|${r.variantId}`}>
+                  <td style={cell}>
+                    <a href={`shopify://admin/products/${r.productId.split("/").pop()}`} target="_top" style={{ color: "inherit" }}>
+                      {r.title ?? "Unknown product"}
+                    </a>
+                    {r.variantTitle && <div style={small}>{r.variantTitle}</div>}
+                  </td>
+                  <td style={cell}>{r.sku ?? "—"}</td>
+                  <td style={{ ...cell, ...num }}>{r.added ? `+${r.added}` : "—"}</td>
+                  <td style={{ ...cell, ...num }}>{r.removed ? `−${r.removed}` : "—"}</td>
+                  <td style={{ ...cell, ...num, fontWeight: 600 }}>{r.net ? fmt(r.net) : "0"}</td>
+                  <td style={{ ...cell, ...num }}>{r.held || "—"}</td>
+                  <td style={{ ...cell, whiteSpace: "nowrap" }}>{r.last ? fmtStore(r.last) : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ ...small, marginTop: "6px" }}>
+            From the inventory history MonkeyBean keeps (changes it made with a countdown as the reference). “Still held back” is stock taken off sale at
+            closing that was never put back.
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

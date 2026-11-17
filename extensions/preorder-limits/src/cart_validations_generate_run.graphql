@@ -1,0 +1,23 @@
+query CartValidationsGenerateRunInput {
+  cart {
+    lines {
+      quantity
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          id
+          title
+          limitLeft: metafield(namespace: "oh_preorder", key: "limit_left") {
+            value
+          }
+          product {
+            title
+            onSale: metafield(namespace: "oh_preorder", key: "on_sale") {
+              value
+            }
+          }
+        }
+      }
+    }
+  }
+}

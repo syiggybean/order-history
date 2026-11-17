@@ -29,6 +29,7 @@
     data-opens="{% if opens != blank %}{{ opens | date: '%s' }}{% endif %}"
     data-closes="{% if closes != blank %}{{ closes | date: '%s' }}{% endif %}"
     data-limited="{% if limited %}true{% else %}false{% endif %}"
+    data-left="{% if limited %}{% for v in product.variants %}{% if v.metafields.oh_preorder.limit_left != blank %}{{ v.id }}:{{ v.metafields.oh_preorder.limit_left.value }},{% endif %}{% endfor %}{% endif %}"
     data-closing-inline="{% if block.settings.show_closing %}true{% else %}false{% endif %}"
     data-hide-other-notify="{% if block.settings.hide_other_notify %}true{% else %}false{% endif %}"
     data-other-notify-selector="{{ block.settings.other_notify_selector | escape }}"

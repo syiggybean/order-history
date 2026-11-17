@@ -285,6 +285,8 @@ model PreorderWindow {
   closedAt         DateTime?
   soldOutAt        DateTime?
   restockedUnits   Int       @default(0)
+  // Sales limit: orders from before counting started have been counted
+  limitCountedAt   DateTime?
   // Closing time: "release" = end of the release date, "manual" = its own time,
   // null = the shop's setting (closeOnRelease)
   closesRule       String?
@@ -460,6 +462,23 @@ model PreorderSale {
 
   @@unique([shop, orderId, productId])
   @@index([shop, productId])
+}
+
+// Units of a limited variant in an order, counted against its sales limit
+// (units drop to 0 when the order is cancelled or the item removed)
+model PreorderLimitSale {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  windowId  Int
+  productId String
+  variantId String
+  orderId   String
+  units     Int      @default(0)
+  orderedAt DateTime
+  createdAt DateTime @default(now())
+
+  @@unique([shop, orderId, variantId])
+  @@index([shop, windowId])
 }
 
 // ---------------------------------------------------------------------------

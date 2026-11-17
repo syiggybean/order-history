@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import db from "./db.server";
 import { unauthenticated } from "./shopify.server";
 import { KEY, NAMESPACE, TIERS, errorMessage, gql, setReleaseDate, syncTemplate, toDay } from "./preorders.server";
@@ -11,16 +10,17 @@ import { createCampaign, getSettings, kickMail, metricsFor, storeUrl } from "./p
 // time. The theme block shows a countdown before opening, a "Pre-Order"
 // button while open, and "Pre-Orders Closed" afterwards.
 //
-// The buttons on the page are only half of it: to stop sales everywhere
-// (quick-add, cart links, checkout) the app turns "Continue selling when out
-// of stock" off before opening and after closing, and on while open. Pre-order
-// items have 0 stock, so with it off they can't be bought at all.
+// The app never changes stock. "Continue selling when out of stock" is only
+// changed when a person changes it, with one exception: when pre-orders end
+// it's turned off, so they can't still be bought elsewhere (the Shop app,
+// cart links).
 //
-// With a sales limit, "Continue selling" stays off and the app gives each
-// variant its limit as stock at opening, so Shopify stops at exactly 0.
-// Stock is taken off sale (held) at closing and put back on re-opening.
-// Adding stock after selling out re-opens sales; once enough is added, the
-// people who signed up are emailed.
+// A sales limit counts the units ordered since opening. What's left of it is
+// kept on each variant (metafield oh_preorder.limit_left) with whether
+// pre-orders are open (product metafield oh_preorder.on_sale), and the
+// "Pre-order limits" checkout rule (a validation function) stops carts and
+// checkouts from going past it. Raising the limit after selling out re-opens
+// sales; once enough is added, the people who signed up are emailed.
 //
 // Times are entered and shown in store time (Pacific).
 // ---------------------------------------------------------------------------
@@ -212,63 +212,6 @@ export async function sellingLocation(shop, admin) {
   return pick.id;
 }
 
-const ACTIVATE = `#graphql
-  mutation ($item: ID!, $location: ID!) {
-    inventoryActivate(inventoryItemId: $item, locationId: $location) { userErrors { field message } }
-  }`;
-
-const ADJUST = `#graphql
-  mutation Adjust($input: InventoryAdjustQuantitiesInput!, $key: String!) {
-    inventoryAdjustQuantities(input: $input) @idempotent(key: $key) {
-      userErrors { field message code }
-    }
-  }`;
-
-const LEVEL_QUERY = `#graphql
-  query ($item: ID!, $location: ID!) {
-    inventoryItem(id: $item) {
-      inventoryLevel(locationId: $location) { quantities(names: ["available"]) { name quantity } }
-    }
-  }`;
-
-async function readAvailable(admin, inventoryItemId, locationId) {
-  const data = await gql(admin, LEVEL_QUERY, { item: inventoryItemId, location: locationId });
-  const level = data?.inventoryItem?.inventoryLevel;
-  return level ? level.quantities.find((q) => q.name === "available")?.quantity ?? 0 : null;
-}
-
-// Sets a variant's available stock at the location. Returns the new amount.
-async function setAvailable(admin, w, variant, locationId, target) {
-  if (!variant.tracked) throw new Error(`"${variant.title}" doesn't track stock, so it can't have a sales limit.`);
-  let current = variant.stocked ? variant.available : await readAvailable(admin, variant.inventoryItemId, locationId);
-  if (current === null && target === 0) return 0; // not stocked there: already nothing on sale
-  if (current === null) {
-    const data = await gql(admin, ACTIVATE, { item: variant.inventoryItemId, location: locationId });
-    const errs = data?.inventoryActivate?.userErrors ?? [];
-    if (errs.length) throw new Error(errs.map((e) => e.message).join("; "));
-    current = 0;
-  }
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const delta = target - current;
-    if (delta === 0) return target;
-    const data = await gql(admin, ADJUST, {
-      key: randomUUID(),
-      input: {
-        name: "available",
-        reason: "correction",
-        referenceDocumentUri: `gid://order-history/PreorderWindow/${w.id}`,
-        changes: [{ delta, inventoryItemId: variant.inventoryItemId, locationId, changeFromQuantity: current }],
-      },
-    });
-    const err = data?.inventoryAdjustQuantities?.userErrors?.[0];
-    if (!err) return target;
-    const stale = err.code === "CHANGE_FROM_QUANTITY_STALE" || /stale|changed/i.test(err.message);
-    if (!stale || attempt === 1) throw new Error(err.message);
-    current = (await readAvailable(admin, variant.inventoryItemId, locationId)) ?? 0;
-  }
-  return target;
-}
-
 const METAFIELDS_SET = `#graphql
   mutation ($metafields: [MetafieldsSetInput!]!) {
     metafieldsSet(metafields: $metafields) { userErrors { field message } }
@@ -308,6 +251,180 @@ async function writeMetafields(admin, productId, { opensAt, closesAt, limited = 
 }
 
 // ---------------------------------------------------------------------------
+// Sales limits: counted from orders, enforced at checkout
+// ---------------------------------------------------------------------------
+
+// Units of each limited variant ordered in this run (since it first opened)
+async function soldOf(w, since = w.firstOpenedAt) {
+  if (!since) return {};
+  const rows = await db.preorderLimitSale.findMany({ where: { shop: w.shop, windowId: w.id } });
+  const out = {};
+  for (const r of rows) if (new Date(r.orderedAt) >= new Date(since)) out[r.variantId] = (out[r.variantId] ?? 0) + Math.max(0, r.units);
+  return out;
+}
+
+const leftOf = (limits, sold) => Object.fromEntries(Object.entries(limits).map(([vid, n]) => [vid, Math.max(0, Number(n) - Number(sold[vid] ?? 0))]));
+
+async function setMetafields(admin, list) {
+  for (let i = 0; i < list.length; i += 25) {
+    const data = await gql(admin, METAFIELDS_SET, { metafields: list.slice(i, i + 25) });
+    const errs = data?.metafieldsSet?.userErrors ?? [];
+    if (errs.length) throw new Error(errs.map((e) => e.message).join("; "));
+  }
+}
+async function deleteMetafields(admin, list) {
+  for (let i = 0; i < list.length; i += 25) {
+    const data = await gql(admin, METAFIELDS_DELETE, { metafields: list.slice(i, i + 25) });
+    const errs = data?.metafieldsDelete?.userErrors ?? [];
+    if (errs.length) throw new Error(errs.map((e) => e.message).join("; "));
+  }
+}
+
+// What the checkout rule reads: units left per variant, and whether
+// pre-orders are open. Taken off when there's no limit (or it's finished).
+async function writeLimit(admin, w, { left, onSale, variantIds = [] }) {
+  if (!left) {
+    const ids = [...new Set([...variantIds, ...Object.keys(json(w.stock))])];
+    await deleteMetafields(admin, [
+      { ownerId: w.productId, namespace: MF_NAMESPACE, key: "on_sale" },
+      ...ids.map((id) => ({ ownerId: id, namespace: MF_NAMESPACE, key: "limit_left" })),
+    ]);
+    return;
+  }
+  await setMetafields(admin, [
+    { ownerId: w.productId, namespace: MF_NAMESPACE, key: "on_sale", type: "boolean", value: onSale ? "true" : "false" },
+    ...Object.entries(left).map(([id, n]) => ({ ownerId: id, namespace: MF_NAMESPACE, key: "limit_left", type: "number_integer", value: String(n) })),
+  ]);
+}
+
+// Units ordered of limited variants, from an order (new or changed). Cancelled
+// orders and removed items free their units again.
+export async function recordLimitSales(shop, order) {
+  const orderId = order?.admin_graphql_api_id ?? (order?.id ? `gid://shopify/Order/${order.id}` : null);
+  if (!orderId) return;
+  const byVariant = new Map();
+  for (const li of order.line_items ?? []) {
+    if (!li?.variant_id || !li?.product_id) continue;
+    const vid = `gid://shopify/ProductVariant/${li.variant_id}`;
+    const qty = order.cancelled_at ? 0 : Number(li.current_quantity ?? li.quantity) || 0;
+    const cur = byVariant.get(vid) ?? { productId: `gid://shopify/Product/${li.product_id}`, units: 0 };
+    cur.units += qty;
+    byVariant.set(vid, cur);
+  }
+  if (!byVariant.size) return;
+  const productIds = [...new Set([...byVariant.values()].map((x) => x.productId))];
+  const windows = (await db.preorderWindow.findMany({ where: { shop, productId: { in: productIds } } })).filter((w) => limitsOf(w));
+  const touched = [];
+  for (const w of windows) {
+    const limits = limitsOf(w);
+    let changed = false;
+    for (const [vid, x] of byVariant) {
+      if (x.productId !== w.productId || !(vid in limits)) continue;
+      const where = { shop_orderId_variantId: { shop, orderId, variantId: vid } };
+      const had = await db.preorderLimitSale.findUnique({ where });
+      if (had && had.units === x.units) continue;
+      if (!had && x.units === 0) continue;
+      const orderedAt = new Date(order.created_at ?? Date.now());
+      if (had) await db.preorderLimitSale.update({ where, data: { units: x.units } });
+      else await db.preorderLimitSale.create({ data: { shop, windowId: w.id, productId: w.productId, variantId: vid, orderId, units: x.units, orderedAt } });
+      changed = true;
+    }
+    if (changed) touched.push(w.id);
+  }
+  if (!touched.length) return;
+  const { admin } = await unauthenticated.admin(shop);
+  for (const id of touched) {
+    const w = await db.preorderWindow.findUnique({ where: { id } });
+    if (w) await refreshLimit(admin, w).catch((e) => console.error(`[preorder-windows] limit ${w.productId}:`, errorMessage(e)));
+  }
+}
+
+const ORDERS_QUERY = `#graphql
+  query ($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Order { id createdAt cancelledAt lineItems(first: 100) { nodes { currentQuantity variant { id } } } }
+    }
+  }`;
+
+// Orders placed before the app counted limits by order: found through the
+// pre-order sales it already kept for the product, read from Shopify
+async function backfillLimit(admin, w) {
+  const limits = limitsOf(w);
+  if (limits && w.firstOpenedAt) {
+    const since = new Date(new Date(w.firstOpenedAt).getTime() - 24 * 3600 * 1000);
+    const sales = await db.preorderSale.findMany({ where: { shop: w.shop, productId: w.productId } });
+    const ids = [...new Set(sales.filter((x) => new Date(x.createdAt) >= since).map((x) => x.orderId))];
+    for (let i = 0; i < ids.length; i += 50) {
+      const data = await gql(admin, ORDERS_QUERY, { ids: ids.slice(i, i + 50) });
+      for (const o of data?.nodes ?? []) {
+        if (!o?.id || new Date(o.createdAt) < new Date(w.firstOpenedAt)) continue;
+        const units = {};
+        for (const li of o.lineItems?.nodes ?? []) {
+          const vid = li.variant?.id;
+          if (vid && vid in limits) units[vid] = (units[vid] ?? 0) + (o.cancelledAt ? 0 : Number(li.currentQuantity) || 0);
+        }
+        for (const [vid, n] of Object.entries(units)) {
+          const where = { shop_orderId_variantId: { shop: w.shop, orderId: o.id, variantId: vid } };
+          if (await db.preorderLimitSale.findUnique({ where })) continue; // the order notification got there first
+          await db.preorderLimitSale.create({ data: { shop: w.shop, windowId: w.id, productId: w.productId, variantId: vid, orderId: o.id, units: n, orderedAt: new Date(o.createdAt) } });
+        }
+      }
+    }
+  }
+  return db.preorderWindow.update({ where: { id: w.id }, data: { limitCountedAt: new Date() } });
+}
+
+// Every limited product: count earlier orders once, then put what's left
+// (and whether it's on sale) where the checkout rule reads it
+export async function syncLimits(now = Date.now()) {
+  const rows = await db.preorderWindow.findMany({ where: { limits: { not: null } } });
+  for (let w of rows) {
+    if (!limitsOf(w) || finished(w, phaseOf(w, now)) || busy.has(w.id)) continue;
+    busy.add(w.id);
+    try {
+      const { admin } = await unauthenticated.admin(w.shop);
+      if (!w.limitCountedAt) w = await backfillLimit(admin, w);
+      await refreshLimit(admin, w, now);
+    } catch (e) {
+      console.error(`[preorder-windows] limit ${w.productId}:`, errorMessage(e));
+    } finally {
+      busy.delete(w.id);
+    }
+  }
+}
+
+// After sales or a new limit: what's left goes to Shopify; selling out and
+// coming back (with the "re-opened" email) are noted
+async function refreshLimit(admin, w, now = Date.now()) {
+  const limits = limitsOf(w);
+  const phase = phaseOf(w, now);
+  if (!limits || finished(w, phase)) return;
+  const left = leftOf(limits, await soldOf(w));
+  const total = sum(left);
+  const onSale = phase === "open" && w.appliedPhase === "open";
+  await writeLimit(admin, w, { left, onSale });
+  const data = { stock: JSON.stringify(left) };
+  let reopened = false;
+  if (onSale && total === 0 && !w.soldOutAt) {
+    data.soldOutAt = new Date();
+    data.restockedUnits = 0;
+  } else if (onSale && total > 0 && w.soldOutAt) {
+    const settings = await getSettings(w.shop);
+    if (total > settings.restockThreshold) {
+      data.soldOutAt = null;
+      data.restockedUnits = 0;
+      reopened = true;
+    } else data.restockedUnits = total;
+  }
+  const saved = await db.preorderWindow.update({ where: { id: w.id }, data });
+  if (reopened) {
+    const product = await loadProduct(admin, w.productId);
+    await sendCampaign(w.shop, admin, saved, product, "reopened", `reopened:${w.id}:${Date.now()}`);
+  }
+  return left;
+}
+
+// ---------------------------------------------------------------------------
 // Applying a window to Shopify
 // ---------------------------------------------------------------------------
 
@@ -328,45 +445,30 @@ async function sendCampaign(shop, admin, w, product, kind, dedupeKey) {
 }
 
 // Makes Shopify match the window's phase:
-//   - "Continue selling when out of stock": on only while open and unlimited
-//   - with a limit: stock goes on sale at opening and is held at closing
+//   - when pre-orders end, "Continue selling" is turned off (never on)
+//   - with a limit: what's left and whether it's open, for the checkout rule
 // Sends the "pre-orders are open" / "re-opened" emails on the way into open.
 export async function enforce(admin, w, now = Date.now()) {
   const phase = phaseOf(w, now);
   const prev = w.appliedPhase;
   const limits = limitsOf(w);
   try {
-    const locationId = limits ? w.locationId ?? (await sellingLocation(w.shop, admin)) : null;
-    const product = await loadProduct(admin, w.productId, locationId);
-
-    const held = json(w.held);
-    const stock = json(w.stock);
+    const product = await loadProduct(admin, w.productId);
     const data = {};
     let firstOpen = false;
     let reopened = false;
 
-    if (limits && prev !== phase) {
-      for (const v of product.variants) {
-        let target;
-        if (phase === "open") {
-          // First opening: exactly the limit. Re-opening: what was held back.
-          target = !w.firstOpenedAt ? Number(limits[v.id] ?? 0) : v.available + Number(held[v.id] ?? 0);
-          held[v.id] = 0;
-        } else {
-          // Not on sale: hold whatever is there for later
-          held[v.id] = Number(held[v.id] ?? 0) + Math.max(0, v.available);
-          target = 0;
-        }
-        stock[v.id] = await setAvailable(admin, w, v, locationId, target);
-        v.available = stock[v.id];
+    // Pre-orders ended: stop "Continue selling when out of stock", so they
+    // can't still be bought elsewhere (the Shop app, cart links). Only ever
+    // turned off here, never on.
+    if (phase === "closed" && prev !== "closed") {
+      const changes = product.variants.filter((v) => v.inventoryPolicy === "CONTINUE").map((v) => ({ id: v.id, inventoryPolicy: "DENY" }));
+      if (changes.length) {
+        await setPolicies(admin, w.productId, changes);
+        await db.preorderLog
+          .create({ data: { shop: w.shop, productId: w.productId, title: product.title, action: "countdown", detail: "Pre-orders ended: Continue selling when out of stock turned off" } })
+          .catch(() => null);
       }
-      data.held = JSON.stringify(held);
-      data.stock = JSON.stringify(stock);
-      data.locationId = locationId;
-    } else if (limits) {
-      for (const v of product.variants) stock[v.id] = v.available;
-      data.stock = JSON.stringify(stock);
-      data.locationId = locationId;
     }
 
     if (phase === "open" && prev !== "open") {
@@ -382,6 +484,17 @@ export async function enforce(admin, w, now = Date.now()) {
     // Set to show "Add to cart" after closing: the countdown comes off the page
     // instead of showing "Pre-Orders Closed"
     if (finished(w, phase)) await writeMetafields(admin, w.productId, { opensAt: null, closesAt: null, limited: false });
+
+    // The limit for the checkout rule: what's left, and whether it's on sale
+    if (limits && !finished(w, phase)) {
+      const left = leftOf(limits, await soldOf(w, data.firstOpenedAt ?? w.firstOpenedAt));
+      await writeLimit(admin, w, { left, onSale: phase === "open" });
+      data.stock = JSON.stringify(left);
+      if (phase === "open" && sum(left) === 0 && !w.soldOutAt && !firstOpen && !reopened) data.soldOutAt = new Date();
+    } else if (json(w.stock) && Object.keys(json(w.stock)).length) {
+      await writeLimit(admin, w, { left: null, variantIds: product.variants.map((v) => v.id) });
+      data.stock = null;
+    }
 
     const saved = await db.preorderWindow.update({
       where: { id: w.id },
@@ -409,7 +522,7 @@ export async function enforce(admin, w, now = Date.now()) {
       await sendCampaign(w.shop, admin, saved, product, "opened", `opened:${w.id}:${saved.firstOpenedAt.toISOString()}`);
     } else if (reopened) {
       const settings = await getSettings(w.shop);
-      const onSale = limits ? product.variants.reduce((n, v) => n + Math.max(0, v.available), 0) : Infinity;
+      const onSale = limits ? sum(json(data.stock)) : Infinity;
       if (onSale > settings.restockThreshold) {
         await sendCampaign(w.shop, admin, saved, product, "reopened", `reopened:${w.id}:${Date.now()}`);
       }
@@ -455,9 +568,10 @@ const view = (w, now = Date.now(), metrics = null) => {
     limited: Boolean(limits),
     limitTotal: limits ? sum(limits) : null,
     variantCount: limits ? Object.keys(limits).length : 0,
-    available: limits ? sum(stock) : null,
-    held: limits ? sum(json(w.held)) : 0,
-    soldOut: Boolean(limits && phase === "open" && w.appliedPhase === "open" && sum(stock) === 0),
+    // Units left in the limit (sold = limit − left)
+    available: limits ? (Object.keys(stock).length ? sum(stock) : sum(limits)) : null,
+    held: 0,
+    soldOut: Boolean(limits && phase === "open" && w.appliedPhase === "open" && Object.keys(stock).length && sum(stock) === 0),
     restockedUnits: w.restockedUnits,
     firstOpenedAt: w.firstOpenedAt?.toISOString() ?? null,
     closedAt: w.closedAt?.toISOString() ?? null,
@@ -501,15 +615,16 @@ export async function addProduct(shop, admin, productId, user) {
 export async function windowVariants(shop, admin, id) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) throw new WindowError("That product isn't in the group anymore.");
-  const locationId = w.locationId ?? (await sellingLocation(shop, admin));
-  const product = await loadProduct(admin, w.productId, locationId);
+  const product = await loadProduct(admin, w.productId);
   const limits = limitsOf(w) ?? {};
+  const left = json(w.stock);
   return product.variants.map((v) => ({
     id: v.id,
     title: v.title === "Default Title" ? product.title : v.title,
     tracked: v.tracked,
     available: v.available,
     limit: limits[v.id] ?? null,
+    left: limits[v.id] != null ? left[v.id] ?? limits[v.id] : null,
     continueSelling: v.inventoryPolicy === "CONTINUE",
   }));
 }
@@ -519,7 +634,6 @@ export async function windowVariants(shop, admin, id) {
 export async function setContinueSelling(shop, admin, id, on, user) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) throw new WindowError("That product isn't in the group anymore.");
-  if (on && limitsOf(w)) throw new WindowError("A product with a sales limit can't continue selling when out of stock. Untick “Limit pre-orders” first.");
   const product = await loadProduct(admin, w.productId);
   const want = on ? "CONTINUE" : "DENY";
   const changes = product.variants.filter((v) => v.inventoryPolicy !== want).map((v) => ({ id: v.id, inventoryPolicy: want }));
@@ -587,20 +701,6 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
   busy.add(w.id);
   try {
     const waveData = await placeWave(shop, w, asWave, { opensAt, closesAt }, user);
-    // Limit changed while on sale: add or take away the difference now
-    const oldLimits = limitsOf(w);
-    if (newLimits && w.appliedPhase === "open" && phaseOf({ opensAt, closesAt }) === "open") {
-      const locationId = w.locationId ?? (await sellingLocation(shop, admin));
-      const product = await loadProduct(admin, w.productId, locationId);
-      const stock = json(w.stock);
-      for (const v of product.variants) {
-        const before = oldLimits ? Number(oldLimits[v.id] ?? 0) : 0;
-        const diff = Number(newLimits[v.id] ?? 0) - before;
-        if (diff !== 0) stock[v.id] = await setAvailable(admin, w, v, locationId, Math.max(0, v.available + diff));
-      }
-      await db.preorderWindow.update({ where: { id: w.id }, data: { stock: JSON.stringify(stock), locationId } });
-    }
-
     await writeMetafields(admin, w.productId, { opensAt, closesAt, limited: Boolean(newLimits), shipsOn: asWave?.shipDay ?? null });
     const saved = await db.preorderWindow.update({
       where: { id: w.id },
@@ -609,6 +709,8 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
         opensAt,
         closesAt,
         limits: newLimits ? JSON.stringify(newLimits) : null,
+        // Orders are counted from here on; ones from before are counted once at start-up
+        ...(newLimits && !w.limitCountedAt && !w.firstOpenedAt ? { limitCountedAt: new Date() } : {}),
         updatedBy: user?.name ?? null,
         ...(closesRule === "release" || closesRule === "manual" ? { closesRule } : {}),
         releaseDay,
@@ -616,6 +718,13 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
       },
     });
     await enforce(admin, saved);
+    // A new limit: count orders already placed in this run, then what's left
+    // changes now (and may re-open)
+    if (newLimits) {
+      let cur = await db.preorderWindow.findUnique({ where: { id: w.id } });
+      if (!cur.limitCountedAt) cur = await backfillLimit(admin, cur);
+      await refreshLimit(admin, cur);
+    }
   } finally {
     busy.delete(w.id);
   }
@@ -788,8 +897,7 @@ export const saveTimes = (shop, admin, id, times, user) =>
     .then((w) => saveWindow(shop, admin, id, { ...times, limits: w ? limitsOf(w) : null }, user));
 
 // History tab: open a closed product again, with a new closing time (or none).
-// addUnits: with a sales limit, extra units for each variant on top of what
-// was held back at closing.
+// addUnits: with a sales limit, raises each variant's limit by this many.
 export async function reopenWindow(shop, admin, id, { closes, addUnits = 0 }, user) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) throw new WindowError("That product isn't in the group anymore.");
@@ -800,14 +908,10 @@ export async function reopenWindow(shop, admin, id, { closes, addUnits = 0 }, us
   if (extra < 0) throw new WindowError("Units to add can't be negative.");
   const limits = limitsOf(w);
   if (extra && limits) {
-    // Goes on sale with the held stock when enforce() opens it
-    const held = json(w.held);
+    // A bigger limit: that many more can be pre-ordered (stock isn't touched)
     const bigger = {};
-    for (const vid of Object.keys(limits)) {
-      held[vid] = Number(held[vid] ?? 0) + extra;
-      bigger[vid] = Number(limits[vid] ?? 0) + extra;
-    }
-    await db.preorderWindow.update({ where: { id: w.id }, data: { held: JSON.stringify(held), limits: JSON.stringify(bigger) } });
+    for (const vid of Object.keys(limits)) bigger[vid] = Number(limits[vid] ?? 0) + extra;
+    await db.preorderWindow.update({ where: { id: w.id }, data: { limits: JSON.stringify(bigger) } });
     w.limits = JSON.stringify(bigger);
   }
   return saveWindow(
@@ -833,17 +937,11 @@ export async function removeProduct(shop, admin, id, user = null) {
     })
     .catch((e) => console.error(`[preorder-windows] skip ${w.productId}:`, errorMessage(e)));
   await writeMetafields(admin, w.productId, { opensAt: null, closesAt: null, limited: false });
-  const held = json(w.held);
-  const locationId = w.locationId;
-  const product = await loadProduct(admin, w.productId, sum(held) && locationId ? locationId : null).catch(() => null);
-  if (product && sum(held) && locationId) {
-    // Stock the app held back goes back on the shelf
-    for (const v of product.variants) {
-      const extra = Number(held[v.id] ?? 0);
-      if (extra > 0) await setAvailable(admin, w, v, locationId, v.available + extra).catch(() => null);
-    }
-  }
-  // "Continue selling when out of stock" is left as it is
+  // The checkout rule lets it go; stock and "Continue selling" are left as they are
+  const product = await loadProduct(admin, w.productId).catch(() => null);
+  await writeLimit(admin, w, { left: null, variantIds: [...(product?.variants ?? []).map((v) => v.id), ...Object.keys(limitsOf(w) ?? {})] }).catch((e) =>
+    console.error(`[preorder-windows] limit ${w.productId}:`, errorMessage(e)),
+  );
   await db.preorderWindow.delete({ where: { id: w.id } });
   // Back to the default template, unless its release date is still to come
   await syncTemplate(shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
@@ -867,76 +965,46 @@ async function variantFor(shop, inventoryItemId) {
   return v ? { productId: v.product.id, variantId: v.id } : null;
 }
 
-// Watches limited products: notices selling out, and re-opens (with an email)
-// once more than the threshold has been added back. Stock that appears while
-// pre-orders aren't open is held until they are.
-export async function stockChanged(shop, payload, now = Date.now()) {
-  const inventoryItemId = `gid://shopify/InventoryItem/${payload?.inventory_item_id}`;
-  const locationId = `gid://shopify/Location/${payload?.location_id}`;
-  const available = Number(payload?.available);
-  if (!payload?.inventory_item_id || !Number.isFinite(available)) return;
-
-  const groupIds = await db.preorderWindow.findMany({ where: { shop, limits: { not: null } }, select: { productId: true } });
-  if (!groupIds.length) return;
-  const found = await variantFor(shop, inventoryItemId);
-  if (!found) return;
-  const w = await db.preorderWindow.findUnique({ where: { shop_productId: { shop, productId: found.productId } } });
-  if (!w || !limitsOf(w) || (w.locationId && w.locationId !== locationId)) return;
-  if (busy.has(w.id)) return; // the app is changing it itself
-  const phase = phaseOf(w, now);
-  if (phase !== w.appliedPhase) return; // about to open or close; that run sets the stock
-
-  busy.add(w.id);
-  try {
-    const stock = json(w.stock);
-    const before = Number(stock[found.variantId] ?? 0);
-    stock[found.variantId] = available;
-    const data = { stock: JSON.stringify(stock) };
-    const { admin } = await unauthenticated.admin(shop);
-
-    if (phase !== "open") {
-      // Not on sale: hold it back so it can't be bought early or late
-      if (available > 0) {
-        const product = await loadProduct(admin, w.productId, locationId);
-        const v = product.variants.find((x) => x.id === found.variantId);
-        if (v && v.available > 0) {
-          const held = json(w.held);
-          held[found.variantId] = Number(held[found.variantId] ?? 0) + v.available;
-          stock[found.variantId] = await setAvailable(admin, w, v, locationId, 0);
-          data.held = JSON.stringify(held);
-          data.stock = JSON.stringify(stock);
-        }
-      }
-      await db.preorderWindow.update({ where: { id: w.id }, data });
-      return;
+// Stock earlier versions changed for sales limits (they set stock to the
+// limit at opening and held it back at closing), from the inventory history
+// the app keeps, plus anything still held back. For fixing stock by hand.
+export async function limitStockReport(shop) {
+  const [rows, windows] = await Promise.all([
+    db.inventoryAdjustment.findMany({ where: { shop, referenceUri: { startsWith: "gid://order-history/PreorderWindow/" } } }),
+    db.preorderWindow.findMany({ where: { shop } }),
+  ]);
+  const byWindow = new Map(windows.map((w) => [w.id, w]));
+  const byProduct = new Map(windows.map((w) => [w.productId, w]));
+  const out = new Map();
+  const entry = (productId, variantId, sku) => {
+    const k = `${productId}|${variantId}`;
+    if (!out.has(k)) {
+      const w = byProduct.get(productId);
+      out.set(k, { productId, variantId, sku: sku ?? null, title: w?.title ?? null, handle: w?.handle ?? null, added: 0, removed: 0, held: 0, last: null });
     }
-
-    const total = sum(stock);
-    const added = available - before;
-    let restocked = false;
-    if (total === 0 && !w.soldOutAt) {
-      data.soldOutAt = new Date();
-      data.restockedUnits = 0;
-    } else if (added > 0 && w.soldOutAt) {
-      const units = w.restockedUnits + added;
-      const settings = await getSettings(shop);
-      if (units > settings.restockThreshold) {
-        data.soldOutAt = null;
-        data.restockedUnits = 0;
-        restocked = true;
-      } else {
-        data.restockedUnits = units;
-      }
-    }
-    const saved = await db.preorderWindow.update({ where: { id: w.id }, data });
-    if (restocked) {
-      const product = await loadProduct(admin, w.productId);
-      await sendCampaign(shop, admin, saved, product, "reopened", `reopened:${w.id}:${Date.now()}`);
-    }
-  } finally {
-    busy.delete(w.id);
+    return out.get(k);
+  };
+  for (const r of rows) {
+    if (r.state && r.state !== "available") continue;
+    const w = byWindow.get(Number(String(r.referenceUri).split("/").pop()));
+    const productId = r.productId ?? w?.productId ?? null;
+    if (!productId || !r.variantId) continue;
+    const e = entry(productId, r.variantId, r.sku);
+    if (r.change > 0) e.added += r.change;
+    else e.removed += -r.change;
+    if (!e.last || r.occurredAt > e.last) e.last = r.occurredAt;
   }
+  for (const w of windows) {
+    for (const [vid, n] of Object.entries(json(w.held))) if (Number(n) > 0) entry(w.productId, vid, null).held += Number(n);
+  }
+  return [...out.values()]
+    .map((e) => ({ ...e, net: e.added - e.removed, last: e.last ? new Date(e.last).toISOString() : null }))
+    .sort((a, b) => (a.title ?? "").localeCompare(b.title ?? "") || a.variantId.localeCompare(b.variantId));
 }
+
+// Stock changes don't affect countdowns any more: a sales limit counts orders
+// (recordLimitSales). Kept so the inventory webhook can still call it.
+export async function stockChanged() {}
 
 // ---------------------------------------------------------------------------
 // Finding products to add
@@ -1036,7 +1104,7 @@ async function maybeRemind(w, now) {
   const closes = new Date(w.closesAt).getTime();
   if (now < closes - settings.reminderHours * 3600 * 1000 || now >= closes) return;
   // No point reminding people about something that's sold out
-  if (limitsOf(w) && sum(json(w.stock)) === 0) return;
+  if (limitsOf(w) && w.soldOutAt) return;
   const key = `closing:${w.id}:${new Date(w.closesAt).toISOString()}`;
   if (await db.emailCampaign.findUnique({ where: { dedupeKey: key } })) return;
   try {
@@ -1057,5 +1125,7 @@ if (!globalThis.__preorderWindowTimer && process.env.NODE_ENV !== "test") {
   const tick = () => checkWindows().catch((e) => console.error("[preorder-windows] check:", errorMessage(e)));
   globalThis.__preorderWindowTimer = setInterval(tick, TICK_MS);
   setTimeout(tick, 20 * 1000);
+  // Sales limits are checked at checkout from what's written here
+  setTimeout(() => syncLimits().catch((e) => console.error("[preorder-windows] limits:", errorMessage(e))), 40 * 1000);
   kickMail();
 }

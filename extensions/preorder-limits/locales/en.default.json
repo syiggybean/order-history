@@ -1,0 +1,4 @@
+{
+  "name": "Pre-order limits",
+  "description": "Stops carts and checkouts going past a MonkeyBean pre-order sales limit"
+}
