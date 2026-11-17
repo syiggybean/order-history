@@ -1,21 +1,22 @@
+import { inflateRawSync } from "node:zlib";
 import db from "./db.server";
 import { errorMessage, gql } from "./preorders.server";
 
 // ---------------------------------------------------------------------------
-// Milestone (b2b.mile-stone.jp): suggestions from "View What's Arrived"
+// Milestone (b2b.mile-stone.jp): suggestions from invoiced items
 //
 // Signs in with MILESTONE_EMAIL / MILESTONE_PASSWORD (Railway variables; the
-// login is Milestone's B2B account), reads the arrived list, and suggests the
-// items the shop doesn't sell yet (no variant with that JAN code as its
-// barcode or SKU). Each suggestion can be created in Shopify as a draft
-// product: title, maker as vendor, JAN as barcode, price and cost from the
-// yen prices, and Milestone's photos.
+// login is Milestone's B2B account), reads the Excel copy of each invoice in
+// the chosen period, and suggests the items the shop doesn't sell yet (no
+// variant with that JAN code as its barcode or SKU). Each suggestion can be
+// created in Shopify as a draft product: title, maker as vendor, JAN as
+// barcode, price and cost from the yen prices, and Milestone's photos.
 // ---------------------------------------------------------------------------
 
 export class MilestoneError extends Error {}
 
 const BASE = "https://b2b.mile-stone.jp";
-const ARRIVED = `${BASE}/my/order/?stock_status=view`;
+const INVOICES = `${BASE}/my/invoice/`;
 // Milestone's own login page sends this fixed header with its API calls (it's in their public JavaScript)
 const SITE_API_AUTH = "Basic dGVzdDp0ZXN0";
 // Like a normal browser visit: some sites only start a session for one
@@ -51,35 +52,131 @@ export const dayOf = (s) => {
   const m = String(s ?? "").match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/);
   return m ? `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}` : null;
 };
-const cell = (row, cls) => {
-  const m = row.match(new RegExp(`<td[^>]*class="[^"]*-${cls}[^"]*"[^>]*>([\\s\\S]*?)<\\/td>`));
-  return m ? m[1] : "";
+// Product codes are 11 digits; the spreadsheet stores them as numbers, so
+// leading zeros are lost ("81933777" is 00081933777)
+export const padCode = (c) => {
+  const s = String(c ?? "").trim();
+  return /^\d{1,11}$/.test(s) ? s.padStart(11, "0") : s;
+};
+// Excel day number → "2026-11-13"
+const excelDay = (v) => {
+  const n = Number(v);
+  if (!(n > 20000)) return dayOf(v);
+  return new Date(Math.round((Math.floor(n) - 25569) * 86400000)).toISOString().slice(0, 10);
 };
 
-// The arrived list: one row per item ordered
-export function parseArrived(html) {
-  const tables = [...String(html).matchAll(/<table[^>]*stock-arrived-list__table[^>]*>([\s\S]*?)<\/table>/g)];
+// The invoice list: [{ id, number, day }] for the Excel copies, plus the
+// other years the page links to
+export function parseInvoiceList(html) {
+  const h = String(html);
+  const invoices = [];
+  for (const m of h.matchAll(/<a href="view\?invoice_id=(\d+)"[^>]*>((?:(?!<\/a>)[\s\S])*)<\/a>/g)) {
+    const text = decode(m[2]);
+    if (!/\[excel\]/i.test(text)) continue;
+    const no = text.match(/Invoice No\.\s*([^\s(]+)/i);
+    const day = text.match(/\((\d{4}\/\d{1,2}\/\d{1,2})\)/);
+    invoices.push({ id: m[1], number: no ? no[1] : `#${m[1]}`, day: day ? dayOf(day[1]) : null });
+  }
+  const years = [...new Set([...h.matchAll(/href="\?year=(\d{4})"/g)].map((m) => Number(m[1])))];
+  return { invoices, years };
+}
+
+// A minimal .xlsx reader: the files we need out of the zip
+export function unzip(buf) {
+  const b = Buffer.from(buf);
+  let e = b.length - 22;
+  while (e >= 0 && b.readUInt32LE(e) !== 0x06054b50) e--;
+  if (e < 0) throw new MilestoneError("The invoice file isn't a spreadsheet.");
+  const count = b.readUInt16LE(e + 10);
+  let p = b.readUInt32LE(e + 16);
+  const files = {};
+  for (let i = 0; i < count; i++) {
+    if (b.readUInt32LE(p) !== 0x02014b50) break;
+    const method = b.readUInt16LE(p + 10);
+    const size = b.readUInt32LE(p + 20);
+    const nameLen = b.readUInt16LE(p + 28);
+    const extraLen = b.readUInt16LE(p + 30);
+    const commentLen = b.readUInt16LE(p + 32);
+    const at = b.readUInt32LE(p + 42);
+    const name = b.toString("utf8", p + 46, p + 46 + nameLen);
+    const start = at + 30 + b.readUInt16LE(at + 26) + b.readUInt16LE(at + 28);
+    const data = b.subarray(start, start + size);
+    if (method === 0 || method === 8) files[name] = (method === 8 ? inflateRawSync(data) : data).toString("utf8");
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return files;
+}
+
+const xmlText = (s) =>
+  String(s ?? "")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&amp;/g, "&");
+
+// The sheet as rows of { column letter: value }
+function sheetRows(files) {
+  const sheetName = Object.keys(files).find((n) => /^xl\/worksheets\/sheet1\.xml$/.test(n)) ?? Object.keys(files).find((n) => /^xl\/worksheets\/[^/]+\.xml$/.test(n));
+  if (!sheetName) throw new MilestoneError("The invoice spreadsheet has no sheet.");
+  const shared = [...String(files["xl/sharedStrings.xml"] ?? "").matchAll(/<si>([\s\S]*?)<\/si>/g)].map((m) =>
+    xmlText([...m[1].replace(/<rPh\b[\s\S]*?<\/rPh>/g, "").matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((t) => t[1]).join("")),
+  );
   const rows = [];
-  for (const t of tables) {
-    for (const m of t[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)) {
-      const r = m[1];
-      if (!/<td/.test(r)) continue;
-      const nameCell = cell(r, "product-name");
-      const title = decode((nameCell.match(/<a[^>]*>([\s\S]*?)<\/a>/) || [])[1] ?? "");
-      const msCode = decode(cell(r, "ms-code"));
-      if (!msCode || !title) continue;
-      rows.push({
-        orderDay: dayOf(cell(r, "order-date")),
-        msCode,
-        jan: decode(cell(r, "jan-code")) || null,
-        maker: decode(cell(r, "manufacturer")) || null,
-        title,
-        quantity: yen(cell(r, "quantity")) ?? 0,
-        wholesaleYen: yen(cell(r, "price")),
-      });
+  for (const r of files[sheetName].matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)) {
+    const row = {};
+    for (const c of r[1].matchAll(/<c r="([A-Z]+)\d+"([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+      const body = c[3] ?? "";
+      const v = body.match(/<v>([\s\S]*?)<\/v>/);
+      const inline = body.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+      let val = null;
+      if (/t="s"/.test(c[2]) && v) val = shared[Number(v[1])] ?? null;
+      else if (/t="inlineStr"/.test(c[2]) && inline) val = xmlText(inline[1]);
+      else if (v) val = xmlText(v[1]);
+      if (val != null && String(val).trim() !== "") row[c[1]] = String(val).trim();
     }
+    rows.push(row);
   }
   return rows;
+}
+
+// One invoice: its number, date and product lines (fees, bank charges and
+// refunds have no JAN code and are left out)
+export function parseInvoice(buf) {
+  const rows = sheetRows(unzip(buf));
+  const flat = (s) => String(s ?? "").replace(/\s+/g, " ").trim().toUpperCase();
+  let number = null;
+  let day = null;
+  let cols = null;
+  const lines = [];
+  for (const row of rows) {
+    const keys = Object.keys(row);
+    for (let i = 0; i < keys.length; i++) {
+      const label = flat(row[keys[i]]);
+      const next = row[keys[i + 1]];
+      if (label === "INVOICE NO.:" && next) number = next;
+      if (label === "INVOICE DATE:" && next) day = excelDay(next);
+    }
+    if (!cols) {
+      const find = (re) => keys.find((k) => re.test(flat(row[k])));
+      const jan = find(/^JAN ?CODE$/);
+      if (jan) cols = { code: find(/^PRODUCT ?CODE$/), jan, title: find(/^DESCRIPTION$/), qty: find(/^QUANTITY$/), price: find(/^UNIT ?PRICE$/) };
+      continue;
+    }
+    const jan = String(row[cols.jan] ?? "").replace(/\D/g, "");
+    if (!/^\d{8,14}$/.test(jan)) continue;
+    const code = padCode(row[cols.code]);
+    lines.push({
+      msCode: code || jan,
+      jan,
+      title: row[cols.title] ?? "",
+      quantity: Number(row[cols.qty]) || 0,
+      wholesaleYen: row[cols.price] != null ? Number(row[cols.price]) : null,
+    });
+  }
+  if (!cols) throw new MilestoneError("Couldn't find the item list in the invoice spreadsheet.");
+  return { number, day, lines };
 }
 
 const dd = (html, label) => {
@@ -96,6 +193,7 @@ export function parseProduct(html) {
   );
   const category = h.match(/<span class="p-4px border[^"]*">([^<]+)<\/span>\s*<\/div>\s*<h2/);
   const copyright = h.match(/<p class="mt-8px break-all text-center">([\s\S]*?)<\/p>/);
+  const maker = h.match(/<a href="\/en\/search\/0\/maker_id=\d+\/"[^>]*>([\s\S]*?)<\/a>/);
   return {
     // The product's own heading (the page has others, like the "Working days" calendar)
     title:
@@ -109,6 +207,7 @@ export function parseProduct(html) {
     release: decode(dd(h, "Release Date")) || null,
     category: category ? decode(category[1]) : null,
     copyright: copyright ? decode(copyright[1]) : null,
+    maker: maker ? decode(maker[1]) || null : null,
     images,
   };
 }
@@ -186,16 +285,16 @@ export async function login(fetcher = fetch) {
   return jar;
 }
 
-async function getPage(fetcher, jar, url) {
+async function getPage(fetcher, jar, url, binary = false) {
   const res = await fetcher(url, { headers: { Cookie: cookieHeader(jar), "User-Agent": UA }, redirect: "manual" });
   cookiesFrom(res, jar);
   if (res.status >= 300 && res.status < 400) {
     const to = res.headers.get("location") ?? "";
     if (/login/.test(to)) throw new MilestoneError("Milestone signed the app out. Try again.");
-    return getPage(fetcher, jar, new URL(to, BASE).toString());
+    return getPage(fetcher, jar, new URL(to, url).toString(), binary);
   }
   if (!res.ok) throw new MilestoneError(`Milestone's site answered ${res.status} for ${new URL(url).pathname}.`);
-  return res.text();
+  return binary ? Buffer.from(await res.arrayBuffer()) : res.text();
 }
 
 // ---------------------------------------------------------------------------
@@ -266,23 +365,70 @@ export async function liveYenRate(fetcher = fetch) {
   return null;
 }
 
-// Everything on "View What's Arrived", grouped by product code, with what the
+// How far back to read invoices
+export const RANGES = { "3": "Last 3 months", "12": "Last 12 months", all: "All invoices" };
+const sinceDay = (range, now = new Date()) => {
+  if (range === "all") return null;
+  const d = new Date(now);
+  d.setUTCMonth(d.getUTCMonth() - (Number(range) || 3));
+  return d.toISOString().slice(0, 10);
+};
+
+// The Excel invoices in the period, newest first
+async function invoicesSince(fetcher, jar, since) {
+  const first = parseInvoiceList(await getPage(fetcher, jar, INVOICES));
+  const all = [...first.invoices];
+  const fromYear = since ? Number(since.slice(0, 4)) : 0;
+  for (const y of first.years.filter((y) => y >= fromYear)) {
+    all.push(...parseInvoiceList(await getPage(fetcher, jar, `${INVOICES}?year=${y}`)).invoices);
+  }
+  const seen = new Set();
+  return all
+    .filter((x) => !seen.has(x.id) && seen.add(x.id))
+    .filter((x) => !since || !x.day || x.day >= since)
+    .sort((a, b) => (b.day ?? "").localeCompare(a.day ?? ""));
+}
+
+// Each item invoiced in the period, grouped by product code, with what the
 // shop has, what was created or dismissed before, and the details of the new ones
-export async function suggestions(shop, admin, { fetcher = fetch } = {}) {
+export async function suggestions(shop, admin, { fetcher = fetch, range = "3", now = new Date() } = {}) {
   const settings = await getSettings(shop);
   const jar = await login(fetcher);
-  const rows = parseArrived(await getPage(fetcher, jar, ARRIVED));
+  const since = sinceDay(range, now);
+  const invoices = await invoicesSince(fetcher, jar, since);
+  const unread = [];
   const byCode = new Map();
-  for (const r of rows) {
-    const had = byCode.get(r.msCode);
-    if (had) {
-      had.quantity += r.quantity;
-      if (r.orderDay > had.orderDay) had.orderDay = r.orderDay;
-    } else byCode.set(r.msCode, { ...r });
+  for (let i = 0; i < invoices.length; i += 4) {
+    const part = invoices.slice(i, i + 4);
+    const read = await Promise.all(
+      part.map(async (inv) => {
+        try {
+          return { inv, data: parseInvoice(await getPage(fetcher, jar, `${INVOICES}view?invoice_id=${inv.id}`, true)) };
+        } catch (e) {
+          unread.push({ number: inv.number, error: e instanceof MilestoneError ? e.message : errorMessage(e) });
+          return null;
+        }
+      }),
+    );
+    for (const r of read.filter(Boolean)) {
+      const number = r.data.number ?? r.inv.number;
+      const day = r.inv.day ?? r.data.day;
+      for (const line of r.data.lines) {
+        const had = byCode.get(line.msCode);
+        if (had) {
+          had.quantity += line.quantity;
+          if (!had.invoices.some((v) => v.number === number)) had.invoices.push({ number, day });
+          if ((day ?? "") > (had.invoiceDay ?? "")) {
+            had.invoiceDay = day;
+            if (line.wholesaleYen != null) had.wholesaleYen = line.wholesaleYen;
+          }
+        } else byCode.set(line.msCode, { ...line, maker: null, invoiceDay: day, invoices: [{ number, day }] });
+      }
+    }
   }
   const items = [...byCode.values()];
   const [shopHas, marked] = await Promise.all([
-    inShop(admin, items.flatMap((x) => [x.jan, x.msCode])),
+    items.length ? inShop(admin, items.flatMap((x) => [x.jan, x.msCode])) : new Map(),
     db.milestoneItem.findMany({ where: { shop, msCode: { in: items.map((x) => x.msCode) } } }),
   ]);
   const markOf = new Map(marked.map((m) => [m.msCode, m]));
@@ -294,13 +440,14 @@ export async function suggestions(shop, admin, { fetcher = fetch } = {}) {
     x.productId = has?.productId ?? m?.productId ?? null;
     x.markedBy = m?.by ?? null;
   }
-  // Details (prices, photos) for the ones to suggest, a few at a time
+  // Details (maker, prices, photos) for the ones to suggest, a few at a time
   const todo = items.filter((x) => x.status === "new");
   for (let i = 0; i < todo.length; i += 4) {
     await Promise.all(
       todo.slice(i, i + 4).map(async (x) => {
         try {
           x.details = parseProduct(await getPage(fetcher, jar, `${BASE}/en/products/${encodeURIComponent(x.msCode)}`));
+          x.maker = x.details.maker;
         } catch (e) {
           x.details = null;
           x.detailsError = errorMessage(e);
@@ -312,22 +459,41 @@ export async function suggestions(shop, admin, { fetcher = fetch } = {}) {
   const live = await liveYenRate(fetcher);
   if (live) await db.milestoneSettings.update({ where: { shop }, data: { yenRate: live.rate } });
   const rate = live?.rate ?? settings.yenRate ?? null;
+  const markup = settings.markupPercent;
   for (const x of items) {
     const retail = x.details?.retailYen ?? null;
-    const wholesale = x.details?.wholesaleYen ?? x.wholesaleYen;
-    x.suggestedPrice = rate && retail ? money(retail * rate) : null;
+    // The invoice price is what was actually paid
+    const wholesale = x.wholesaleYen ?? x.details?.wholesaleYen ?? null;
     x.suggestedCost = rate && wholesale ? money(wholesale * rate) : null;
+    x.suggestedPrice = markup != null ? priceFromCost(x.suggestedCost, markup) : rate && retail ? money(retail * rate) : null;
   }
   const order = { new: 0, dismissed: 1, created: 2, inShop: 3 };
-  items.sort((a, b) => order[a.status] - order[b.status] || (b.orderDay ?? "").localeCompare(a.orderDay ?? "") || a.title.localeCompare(b.title));
+  items.sort((a, b) => order[a.status] - order[b.status] || (b.invoiceDay ?? "").localeCompare(a.invoiceDay ?? "") || a.title.localeCompare(b.title));
   await db.milestoneSettings.update({ where: { shop }, data: { lastRunAt: new Date() } });
   return {
     items,
+    range: RANGES[range] ? range : "3",
+    since,
+    invoiceCount: invoices.length - unread.length,
+    unread,
     yenRate: rate,
+    markupPercent: markup ?? null,
     rateSource: live ? live.source : rate ? "last rate fetched (the rate services didn't answer)" : null,
     rateDate: live?.date ?? null,
     checkedAt: new Date().toISOString(),
   };
+}
+
+// Price = cost plus the markup
+export const priceFromCost = (cost, markup) => (cost == null || markup == null || !(Number(cost) > 0) ? null : money(Number(cost) * (1 + Number(markup) / 100)));
+
+export async function saveMarkup(shop, value) {
+  const raw = String(value ?? "").replace(/%/g, "").trim();
+  const m = raw === "" ? null : Number(raw);
+  if (m != null && !(Number.isFinite(m) && m >= 0 && m <= 10000)) throw new MilestoneError("Enter the markup as a percentage, for example 100.");
+  await getSettings(shop);
+  await db.milestoneSettings.update({ where: { shop }, data: { markupPercent: m } });
+  return m;
 }
 
 export async function dismiss(shop, msCodes, user, undo = false) {

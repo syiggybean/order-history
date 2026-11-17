@@ -5,10 +5,10 @@ import { NoAccess } from "../components/NoAccess";
 import { ProductThumb, preloadImages } from "../components/shipping/ui";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { errorMessage } from "../preorders.server";
-import { MilestoneError, createDrafts, dismiss, getSettings, suggestions } from "../milestone.server";
+import { MilestoneError, RANGES, createDrafts, dismiss, getSettings, saveMarkup, suggestions } from "../milestone.server";
 
-// Milestone: what's arrived on Milestone's B2B site that the shop doesn't sell
-// yet, with a draft product made in one go.
+// Milestone: what's been invoiced on Milestone's B2B site that the shop
+// doesn't sell yet, with a draft product made in one go.
 
 export const loader = async ({ request }) => {
   const { session, user, noAccess } = await loadWithAccess(request, "purchaseOrders", "view");
@@ -17,6 +17,8 @@ export const loader = async ({ request }) => {
   return {
     canCreate: can(user, "purchaseOrders", "generate"),
     yenRate: settings.yenRate ?? null,
+    markupPercent: settings.markupPercent ?? null,
+    ranges: RANGES,
     lastRunAt: settings.lastRunAt?.toISOString() ?? null,
     loginSet: Boolean(process.env.MILESTONE_EMAIL && process.env.MILESTONE_PASSWORD),
   };
@@ -29,8 +31,9 @@ export const action = async ({ request }) => {
   const intent = String(form.get("intent") ?? "");
   const shop = session.shop;
   try {
-    if (intent === "check") return { intent, ok: true, ...(await suggestions(shop, admin)) };
+    if (intent === "check") return { intent, ok: true, ...(await suggestions(shop, admin, { range: String(form.get("range") ?? "3") })) };
     if (!can(user, "purchaseOrders", "generate")) return denied("purchaseOrders", "generate");
+    if (intent === "markup") return { intent, ok: true, markupPercent: await saveMarkup(shop, form.get("markup")) };
     if (intent === "dismiss" || intent === "undismiss") {
       await dismiss(shop, JSON.parse(String(form.get("codes") ?? "[]")).map(String), user, intent === "undismiss");
       return { intent, ok: true };
@@ -61,6 +64,10 @@ export default function Milestone() {
   const check = useFetcher();
   const create = useFetcher();
   const mark = useFetcher();
+  const markupSave = useFetcher();
+  const [range, setRange] = useState("3");
+  // Price = cost × (1 + markup%), saved for next time; empty uses Milestone's retail price
+  const [markup, setMarkup] = useState(data.markupPercent == null ? "" : String(data.markupPercent));
   // Fetched with each check (today's rate); can be changed for this check
   const [rate, setRate] = useState("");
   const [picked, setPicked] = useState(() => new Set());
@@ -95,8 +102,40 @@ export default function Milestone() {
   const val = (x, k, fallback) => edits[x.msCode]?.[k] ?? fallback;
   const setVal = (x, k, v) => setEdits({ ...edits, [x.msCode]: { ...(edits[x.msCode] ?? {}), [k]: v } });
   const r = Number(rate) || null;
-  const priceOf = (x) => val(x, "price", x.details?.retailYen && r ? (Math.round(x.details.retailYen * r * 100) / 100).toFixed(2) : "");
-  const costOf = (x) => val(x, "cost", (x.details?.wholesaleYen ?? x.wholesaleYen) && r ? (Math.round((x.details?.wholesaleYen ?? x.wholesaleYen) * r * 100) / 100).toFixed(2) : "");
+  const m = markup.trim() === "" || !(Number(markup) >= 0) ? null : Number(markup);
+  // The invoice price is what was paid; Milestone's page price if it's missing
+  const wholesaleOf = (x) => x.wholesaleYen ?? x.details?.wholesaleYen ?? null;
+  const costOf = (x) => val(x, "cost", wholesaleOf(x) && r ? (Math.round(wholesaleOf(x) * r * 100) / 100).toFixed(2) : "");
+  const priceOf = (x) => {
+    if (edits[x.msCode]?.price != null) return edits[x.msCode].price;
+    if (m != null) {
+      const c = Number(costOf(x));
+      return c > 0 ? (Math.round(c * (1 + m / 100) * 100) / 100).toFixed(2) : "";
+    }
+    return x.details?.retailYen && r ? (Math.round(x.details.retailYen * r * 100) / 100).toFixed(2) : "";
+  };
+  // This item's markup: what was typed, or worked out from its price and cost
+  const markupOf = (x) => {
+    if (edits[x.msCode]?.markup != null) return edits[x.msCode].markup;
+    const c = Number(costOf(x));
+    const p = Number(priceOf(x));
+    return c > 0 && p > 0 ? String(Math.round((p / c - 1) * 1000) / 10) : "";
+  };
+  // Typing a price works out the markup; typing a markup works out the price
+  const setPrice = (x, v) => setEdits({ ...edits, [x.msCode]: { ...(edits[x.msCode] ?? {}), price: v, markup: undefined } });
+  const setRowMarkup = (x, v) => {
+    const c = Number(costOf(x));
+    const mm = Number(v);
+    const price = v.trim() !== "" && mm >= 0 && c > 0 ? (Math.round(c * (1 + mm / 100) * 100) / 100).toFixed(2) : edits[x.msCode]?.price;
+    setEdits({ ...edits, [x.msCode]: { ...(edits[x.msCode] ?? {}), markup: v, price } });
+  };
+  const setCost = (x, v) => {
+    // A markup typed for this item keeps its price following the cost
+    const e = edits[x.msCode] ?? {};
+    const mm = Number(e.markup);
+    const price = e.markup != null && e.markup.trim() !== "" && mm >= 0 && Number(v) > 0 ? (Math.round(Number(v) * (1 + mm / 100) * 100) / 100).toFixed(2) : e.price;
+    setEdits({ ...edits, [x.msCode]: { ...e, cost: v, price } });
+  };
   const pickable = shown.filter((x) => statusOf(x) === "new");
 
   const createPicked = () => {
@@ -116,14 +155,14 @@ export default function Milestone() {
     create.submit({ intent: "create", items: JSON.stringify(list) }, { method: "post" });
   };
   const missingPrice = items.filter((x) => picked.has(x.msCode) && !(Number(priceOf(x)) > 0)).length;
-  const error = check.data?.error ?? create.data?.error ?? mark.data?.error;
+  const error = check.data?.error ?? create.data?.error ?? mark.data?.error ?? markupSave.data?.error;
 
   return (
     <s-page heading="Milestone" inlineSize="large">
       <s-section>
         <s-paragraph>
-          Reads “View What's Arrived” on Milestone's B2B site and suggests what the shop doesn't sell yet (no product with that JAN code as its barcode
-          or SKU). Pick the ones to add and they're made in Shopify as draft products with Milestone's photos, the maker as vendor and the JAN as
+          Reads your invoices on Milestone's B2B site and suggests the invoiced items the shop doesn't sell yet (no product with that JAN code as its
+          barcode or SKU). Pick the ones to add and they're made in Shopify as draft products with Milestone's photos, the maker as vendor and the JAN as
           barcode. Nothing is published.
         </s-paragraph>
         {!data.loginSet && (
@@ -132,7 +171,17 @@ export default function Milestone() {
           </s-banner>
         )}
         <div style={{ display: "flex", gap: "16px", alignItems: "flex-end", flexWrap: "wrap", marginTop: "10px" }}>
-          <s-button variant="primary" onClick={() => check.submit({ intent: "check" }, { method: "post" })} {...(check.state !== "idle" ? { loading: true } : {})}>
+          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+            Invoices from
+            <select value={range} onChange={(e) => setRange(e.target.value)} style={{ ...input, width: "150px" }}>
+              {Object.entries(data.ranges ?? {}).map(([id, label]) => (
+                <option key={id} value={id}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <s-button variant="primary" onClick={() => check.submit({ intent: "check", range }, { method: "post" })} {...(check.state !== "idle" ? { loading: true } : {})}>
             {result ? "Check again" : "Check Milestone"}
           </s-button>
           {data.canCreate && result && (
@@ -141,9 +190,25 @@ export default function Milestone() {
               <input value={rate} onChange={(e) => setRate(e.target.value)} placeholder="Enter a rate" inputMode="decimal" style={{ ...input, width: "110px" }} />
             </label>
           )}
+          {data.canCreate && (
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+              Markup %
+              <input
+                value={markup}
+                onChange={(e) => setMarkup(e.target.value.replace(/[^\d.]/g, ""))}
+                onBlur={() => {
+                  if (String(data.markupPercent ?? "") !== markup.trim()) markupSave.submit({ intent: "markup", markup: markup.trim() }, { method: "post" });
+                }}
+                placeholder="Retail price"
+                inputMode="decimal"
+                aria-label="Markup percentage"
+                style={{ ...input, width: "110px" }}
+              />
+            </label>
+          )}
           <span style={small}>
             {check.state !== "idle"
-              ? "Signing in to Milestone and reading the list…"
+              ? "Signing in to Milestone and reading the invoices…"
               : result
                 ? `Checked ${new Date(result.checkedAt).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
                 : data.lastRunAt
@@ -157,7 +222,11 @@ export default function Milestone() {
             : result
               ? "Couldn't get today's exchange rate: enter one above. "
               : "Each check uses today's yen to dollar exchange rate. "}
-          Suggested price is Milestone's retail price, and cost the wholesale price, at that rate. Change any of them before creating.
+          Cost is the invoiced price at that rate.{" "}
+          {m != null
+            ? `Price is cost plus ${m}% (×${(1 + m / 100).toFixed(2)}). Clear the markup to use Milestone's retail price instead.`
+            : "Price is Milestone's retail price at that rate, or enter a markup % to price from cost."}{" "}
+          Change any of them before creating: type a price and its markup is worked out, or type a markup and the price is.
         </div>
       </s-section>
 
@@ -167,8 +236,16 @@ export default function Milestone() {
         </s-banner>
       )}
 
+      {result?.unread?.length > 0 && (
+        <s-banner tone="warning">
+          <s-paragraph>
+            Couldn't read {result.unread.length} invoice{result.unread.length === 1 ? "" : "s"}: {result.unread.map((u) => `${u.number} (${u.error})`).join("; ")}
+          </s-paragraph>
+        </s-banner>
+      )}
+
       {result && (
-        <s-section heading={`Arrived items (${items.length})`}>
+        <s-section heading={`Invoiced items (${items.length}) from ${result.invoiceCount} invoice${result.invoiceCount === 1 ? "" : "s"}${result.since ? ` since ${dayFmt(result.since)}` : ""}`}>
           <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "10px" }}>
             {[
               ["new", `Not in the shop (${counts.new ?? 0})`],
@@ -236,7 +313,7 @@ export default function Milestone() {
                         />
                       </th>
                     )}
-                    {["Item", "Codes", "Ordered", "Retail / wholesale", "Price", "Cost", "SKU", ""].map((h, i) => (
+                    {["Item", "Codes", "Invoiced", "Retail / invoiced", "Cost", "Price", "Markup", "SKU", ""].map((h, i) => (
                       <th key={i} style={headS}>
                         {h}
                       </th>
@@ -321,22 +398,42 @@ export default function Milestone() {
                         </td>
                         <td style={{ ...cellS, whiteSpace: "nowrap" }}>
                           {x.quantity} pcs
-                          <div style={small}>{dayFmt(x.orderDay)}</div>
+                          <div style={small} title={(x.invoices ?? []).map((v) => `${v.number} (${dayFmt(v.day)})`).join("\n")}>
+                            {x.invoices?.[0]?.number ?? ""} · {dayFmt(x.invoiceDay)}
+                            {x.invoices?.length > 1 ? ` +${x.invoices.length - 1} more` : ""}
+                          </div>
                         </td>
                         <td style={{ ...cellS, whiteSpace: "nowrap" }}>
                           {yenFmt(x.details?.retailYen)}
-                          <div style={small}>{yenFmt(x.details?.wholesaleYen ?? x.wholesaleYen)}</div>
+                          <div style={small}>{yenFmt(wholesaleOf(x))}</div>
                         </td>
                         <td style={cellS}>
                           {editable ? (
-                            <input value={priceOf(x)} onChange={(e) => setVal(x, "price", e.target.value)} inputMode="decimal" aria-label="Price" placeholder="0.00" style={{ ...input, width: "80px" }} />
+                            <input value={costOf(x)} onChange={(e) => setCost(x, e.target.value)} inputMode="decimal" aria-label="Cost" placeholder="0.00" style={{ ...input, width: "80px" }} />
                           ) : (
                             "—"
                           )}
                         </td>
                         <td style={cellS}>
                           {editable ? (
-                            <input value={costOf(x)} onChange={(e) => setVal(x, "cost", e.target.value)} inputMode="decimal" aria-label="Cost" placeholder="0.00" style={{ ...input, width: "80px" }} />
+                            <input value={priceOf(x)} onChange={(e) => setPrice(x, e.target.value)} inputMode="decimal" aria-label="Retail price" placeholder="0.00" style={{ ...input, width: "80px" }} />
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td style={{ ...cellS, whiteSpace: "nowrap" }}>
+                          {editable ? (
+                            <span style={{ display: "inline-flex", alignItems: "center", gap: "3px" }}>
+                              <input
+                                value={markupOf(x)}
+                                onChange={(e) => setRowMarkup(x, e.target.value.replace(/[^\d.-]/g, ""))}
+                                inputMode="decimal"
+                                aria-label="Markup percentage"
+                                placeholder="—"
+                                style={{ ...input, width: "64px" }}
+                              />
+                              %
+                            </span>
                           ) : (
                             "—"
                           )}

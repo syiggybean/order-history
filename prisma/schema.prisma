@@ -1680,9 +1680,11 @@ model MilestoneSettings {
   // Dollars per yen, for suggested prices and costs
   yenRate   Float?
   lastRunAt DateTime?
+  // Suggested price = cost × (1 + markup / 100); empty uses Milestone's retail price
+  markupPercent Float?
 }
 
-// An arrived item someone created in Shopify, or chose not to sell
+// An invoiced item someone created in Shopify, or chose not to sell
 model MilestoneItem {
   id        Int      @id @default(autoincrement())
   shop      String
