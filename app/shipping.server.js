@@ -372,9 +372,30 @@ const prettyDay = (day) =>
 
 // Lines still on pre-order today, with a reason for each.
 // products: { productId: { gtTag, release } }, read fresh on every stock check
+// The later pre-order wave (countdowns) an order's line was bought in, if any:
+// ordered while that wave was open
+export function waveOf(s, l, products = {}) {
+  const waves = products[l.productId]?.waves;
+  if (!waves?.length || !s.orderCreatedAt) return null;
+  const at = new Date(s.orderCreatedAt).getTime();
+  return waves.find((w) => at >= new Date(w.opensAt).getTime() && (!w.closesAt || at < new Date(w.closesAt).getTime())) ?? null;
+}
+
+// Lines from a later wave whose ship date hasn't come
+export function waveLines(s, today, products = {}) {
+  return linesOf(s)
+    .map((l) => {
+      const w = waveOf(s, l, products);
+      return w && w.shipDay > today ? `${lineLabel(l)} (wave ${w.number}) ships ${prettyDay(w.shipDay)}` : null;
+    })
+    .filter(Boolean);
+}
+
 export function preorderLines(s, today, products = {}) {
   return linesOf(s)
     .map((l) => {
+      // A later wave goes by its own ship date (waveLines), not the release date
+      if (waveOf(s, l, products)) return null;
       const p = products[l.productId] ?? {};
       if (p.release && p.release > today) return `${lineLabel(l)} releases ${prettyDay(p.release)}`;
       if (p.gtTag) return `${lineLabel(l)} is tagged ${p.gtTag}`;
@@ -418,6 +439,17 @@ export async function loadProductInfo(admin, productIds) {
   return info;
 }
 
+// Later pre-order waves (countdowns) of these products, onto their info
+export async function addWaves(shop, products) {
+  const ids = Object.keys(products);
+  if (!ids.length) return products;
+  const rows = await db.preorderWave.findMany({ where: { shop, productId: { in: ids } }, orderBy: { opensAt: "asc" } });
+  for (const r of rows) {
+    ((products[r.productId] ??= {}).waves ??= []).push({ number: r.number, opensAt: r.opensAt, closesAt: r.closesAt, shipDay: r.shipDay });
+  }
+  return products;
+}
+
 // Works out which shipments are ready, oldest orders first, and flags batched
 // shipments whose stock has gone. Pure: takes shipments and stock, returns changes.
 // aheadBatchIds: batches made ahead of a release (auto-batching upcoming releases):
@@ -426,12 +458,15 @@ export async function loadProductInfo(admin, productIds) {
 export function allocate(shipments, stock, now = new Date(), products = {}, { aheadBatchIds = new Set(), earlyHours = 0 } = {}) {
   const free = { ...stock };
   const key = (l, s) => `${l.inventoryItemId}|${s.locationId}`;
-  const take = (s) => {
+  // Units older orders are waiting for (held for their release date): a later
+  // wave only ships early from stock left over after them
+  const promised = {};
+  const take = (s, { afterPromised = false } = {}) => {
     const short = [];
     for (const l of linesOf(s)) {
       if (!l.tracked || !l.inventoryItemId) continue;
       const k = key(l, s);
-      const have = free[k] ?? 0;
+      const have = (free[k] ?? 0) - (afterPromised ? (promised[k] ?? 0) : 0);
       if (have < l.quantity) short.push({ line: l, need: l.quantity - Math.max(0, have) });
     }
     if (short.length) return short;
@@ -473,8 +508,14 @@ export function allocate(shipments, stock, now = new Date(), products = {}, { ah
     if (!PAID.has(s.financialStatus ?? "")) reason = "Awaiting payment";
     else if (s.otherHold) reason = `On hold in Shopify: ${s.otherHold}`;
     else if (s.foStatus === "SCHEDULED") reason = "Scheduled for later";
-    else if (preorderLines(s, readyDay, products).length) reason = `Pre-order: ${preorderLines(s, readyDay, products).join(", ")}`;
-    else {
+    else if (preorderLines(s, readyDay, products).length) {
+      reason = `Pre-order: ${preorderLines(s, readyDay, products).join(", ")}`;
+      for (const l of linesOf(s)) if (l.tracked && l.inventoryItemId) promised[key(l, s)] = (promised[key(l, s)] ?? 0) + l.quantity;
+    } else if (waveLines(s, readyDay, products).length) {
+      // A later wave waits for its ship date, unless there's already stock for it
+      // after every older order has had theirs
+      if (take(s, { afterPromised: true })) reason = `Pre-order: ${waveLines(s, readyDay, products).join(", ")}`;
+    } else {
       const short = take(s);
       if (short) reason = `Needs ${short.map((x) => `${x.need} more × ${lineLabel(x.line)}`).join(", ")}`;
     }
@@ -537,6 +578,7 @@ export async function refreshReadiness(shop, admin) {
   const items = shipments.flatMap((s) => linesOf(s).filter((l) => l.tracked && l.inventoryItemId).map((l) => l.inventoryItemId));
   const stock = items.length ? await loadStock(admin, items) : {};
   const products = await loadProductInfo(admin, shipments.flatMap((s) => linesOf(s).map((l) => l.productId)));
+  await addWaves(shop, products);
   // Batched ahead of a release: auto-batched upcoming releases
   const ahead = new Set(
     (await db.batch.findMany({ where: { shop, source: { startsWith: "auto:release:" } }, select: { id: true } })).map((b) => b.id),

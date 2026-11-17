@@ -297,11 +297,35 @@ model PreorderWindow {
   keepSelling      Boolean   @default(false)
   // Skip the "pre-orders are open" email on first opening (already on pre-order)
   quietOpen        Boolean   @default(false)
+  // A later wave of pre-orders for a product already out: its own ship date,
+  // the product's release date isn't touched (PreorderWave has each wave)
+  waveId           Int?
+  waveNumber       Int?
+  waveShipDay      String?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @default(now()) @updatedAt
 
   @@unique([shop, productId])
   @@index([shop, opensAt])
+}
+
+// Each extra wave of pre-orders for a product. Orders placed while it was open
+// (opensAt to closesAt) belong to it: they wait until its ship date, or until
+// there's stock for them after older orders.
+model PreorderWave {
+  id        Int       @id @default(autoincrement())
+  shop      String
+  productId String
+  windowId  Int?
+  number    Int
+  opensAt   DateTime
+  closesAt  DateTime?
+  shipDay   String
+  createdBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @default(now()) @updatedAt
+
+  @@index([shop, productId])
 }
 
 // Shop-wide settings for pre-order countdowns and notification emails

@@ -16,6 +16,8 @@
 {%- assign opens = product.metafields.oh_preorder.opens_at.value -%}
 {%- assign closes = product.metafields.oh_preorder.closes_at.value -%}
 {%- assign limited = product.metafields.oh_preorder.limited.value -%}
+{%- comment -%} A later wave of pre-orders has its own ship date {%- endcomment -%}
+{%- assign wave_ships = product.metafields.oh_preorder.wave_ships_on.value -%}
 {%- if opens != blank or closes != blank -%}
   <script src="{{ 'preorder-countdown-lib.js' | asset_url }}" defer data-ohpc-lib></script>
   <div
@@ -66,6 +68,9 @@
       {%- if block.settings.show_close_date and closes != blank -%}
         <p class="ohpc__when" data-ohpc-when="closes" hidden>Closes {{ closes | date: '%B %-d, %Y at %-I:%M %p %Z' }}</p>
       {%- endif -%}
+      {%- if block.settings.show_wave_ships and wave_ships != blank -%}
+        <p class="ohpc__when ohpc__ships">{{ block.settings.wave_ships_label | escape }} {{ wave_ships | date: '%B %-d, %Y' }}</p>
+      {%- endif -%}
       <p class="ohpc__sr" data-ohpc-sr role="status"></p>
     </div>
 
@@ -108,6 +113,8 @@
     { "type": "checkbox", "id": "show_closing", "label": "Once pre-orders open, count down to closing in the same place", "default": true, "info": "With this on, you don't need the separate \"Pre-order closing clock\" block." },
     { "type": "text", "id": "closing_heading", "label": "Heading while open", "default": "Pre-orders close in" },
     { "type": "checkbox", "id": "show_close_date", "label": "Show the closing date under the clock", "default": true },
+    { "type": "checkbox", "id": "show_wave_ships", "label": "Show the ship date for a new pre-order wave", "default": true, "info": "Only for products with a later wave set in the app." },
+    { "type": "text", "id": "wave_ships_label", "label": "Ship date label", "default": "This wave ships" },
     { "type": "header", "content": "Buy button" },
     { "type": "text", "id": "open_text", "label": "Button text once open", "default": "Pre-Order" },
     { "type": "text", "id": "sold_out_text", "label": "Button text when the limit is reached", "default": "Pre-Orders Closed" },

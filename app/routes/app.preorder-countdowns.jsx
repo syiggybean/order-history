@@ -141,6 +141,12 @@ export const action = async ({ request }) => {
           limits,
           closesRule: ["release", "manual"].includes(String(form.get("closesRule"))) ? String(form.get("closesRule")) : undefined,
           keepSelling: form.has("keepSelling") ? form.get("keepSelling") === "true" : undefined,
+          // A later wave: its own ship date; the release date stays as it is
+          wave: !form.has("wave")
+            ? undefined
+            : form.get("wave") === "on"
+              ? { shipDay: String(form.get("waveShipDay") ?? ""), fresh: form.get("waveFresh") === "1" }
+              : false,
         },
         user,
       );
@@ -429,29 +435,36 @@ const radioRow = { display: "flex", gap: "8px", alignItems: "flex-start", fontSi
 const drawerSection = { padding: "14px 18px", borderBottom: "1px solid #ebebeb", display: "flex", flexDirection: "column", gap: "10px" };
 const sectionTitle = { fontWeight: 650, fontSize: "13px", margin: 0 };
 
-function EditDrawer({ w, onClose, closeOnRelease, canManage }) {
+// startWave: the History tab's "New wave": another run of pre-orders for a
+// product that's already out, with its own ship date
+function EditDrawer({ w, onClose, closeOnRelease, canManage, startWave = false }) {
   return (
     <Flyout
       onClose={onClose}
-      label={`Countdown for ${w.title}`}
-      title={canManage ? "Edit countdown" : "Countdown"}
+      label={`${startWave ? "New pre-order wave" : "Countdown"} for ${w.title}`}
+      title={startWave ? "New pre-order wave" : canManage ? "Edit countdown" : "Countdown"}
       width={460}
       bodyStyle={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}
     >
-      <DrawerBody w={w} closeOnRelease={closeOnRelease} canManage={canManage} />
+      <DrawerBody w={w} closeOnRelease={closeOnRelease} canManage={canManage} startWave={startWave} />
     </Flyout>
   );
 }
 
-function DrawerBody({ w, closeOnRelease, canManage }) {
+function DrawerBody({ w, closeOnRelease, canManage, startWave }) {
   const onClose = useFlyoutClose();
   const save = useFetcher();
   const remove = useFetcher();
   const variants = useFetcher();
   const [release, setRelease] = useState(w.releaseDay ?? "");
-  const [opens, setOpens] = useState(w.opensInput || "");
-  const [closeMode, setCloseMode] = useState(follows(w, closeOnRelease) && w.releaseDay ? "release" : w.closesInput ? "date" : "none");
-  const [closes, setCloses] = useState(w.closesInput || "");
+  // A later wave of pre-orders: its own ship date instead of the release date
+  const [waveOn, setWaveOn] = useState(startWave || Boolean(w.wave));
+  const [waveShip, setWaveShip] = useState(startWave ? "" : (w.wave?.shipDay ?? ""));
+  const [opens, setOpens] = useState(startWave ? "" : w.opensInput || "");
+  const [closeMode, setCloseMode] = useState(
+    startWave ? "date" : follows(w, closeOnRelease) && w.releaseDay && !w.wave ? "release" : w.closesInput ? "date" : "none",
+  );
+  const [closes, setCloses] = useState(startWave ? "" : w.closesInput || "");
   const [keepSelling, setKeepSelling] = useState(Boolean(w.keepSelling));
   // "Continue selling when out of stock" as it is in Shopify now (null until loaded)
   const [selling, setSelling] = useState(null);
@@ -479,7 +492,8 @@ function DrawerBody({ w, closeOnRelease, canManage }) {
 
   const submit = () => {
     setLocalError(null);
-    if (closeMode === "release" && !release) return setLocalError("Enter a release date, or pick another closing option.");
+    if (waveOn && !waveShip) return setLocalError("Enter the date this wave ships.");
+    if (closeMode === "release" && !release && !waveOn) return setLocalError("Enter a release date, or pick another closing option.");
     if (closeMode === "date" && !closes) return setLocalError("Enter a closing time, or pick another closing option.");
     const payload = {
       intent: "save",
@@ -489,9 +503,16 @@ function DrawerBody({ w, closeOnRelease, canManage }) {
       releaseWas: w.releaseDay ?? "",
       opens,
       closes: closeMode === "date" ? closes : "",
-      closesRule: closeMode === "release" ? "release" : "manual",
+      closesRule: closeMode === "release" && !waveOn ? "release" : "manual",
       keepSelling: String(keepSelling),
     };
+    if (waveOn || w.wave) {
+      payload.wave = waveOn ? "on" : "off";
+      payload.waveShipDay = waveShip;
+      if (startWave) payload.waveFresh = "1";
+    }
+    // The release date isn't touched for a wave
+    if (waveOn) payload.release = "";
     // Only sent when someone changed it here
     if (selling && selling !== sellingNow) payload.continueSelling = String(selling === "on");
     if (limited) {
@@ -513,17 +534,46 @@ function DrawerBody({ w, closeOnRelease, canManage }) {
               <div style={{ fontWeight: 650, fontSize: "14px" }}>{w.title}</div>
               <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap", marginTop: "3px" }}>
                 {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Added automatically</span>}
+                {w.wave && !startWave && <span style={pill("#e6f4ff", "#0b4f8a")}>Wave {w.wave.number}</span>}
                 <a href={`shopify:admin/products/${numeric}`} target="_top" style={{ color: "#005bd3", fontSize: "12px" }}>
                   Open in Shopify ↗
                 </a>
               </div>
             </div>
           </div>
-          <div style={drawerSection}>
-            <p style={sectionTitle}>Release date</p>
-            <input type="date" value={release} onChange={(e) => setRelease(e.target.value)} style={{ ...input, width: "180px" }} disabled={!canManage} />
-            <span style={small}>Saved to the product in Shopify (its publication date), so pre-order tags and shipping follow it too.</span>
-          </div>
+          {waveOn ? (
+            <div style={drawerSection}>
+              <p style={sectionTitle}>{startWave || !w.wave ? "New pre-order wave" : `Pre-order wave ${w.wave.number}`}</p>
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+                This wave ships
+                <input type="date" value={waveShip} onChange={(e) => setWaveShip(e.target.value)} style={{ ...input, width: "180px" }} disabled={!canManage} />
+              </label>
+              <span style={small}>
+                The product's release date stays {w.releaseDay ? fmtDay(w.releaseDay) : "as it is"}. Orders placed during this wave wait until this date, or
+                ship sooner if there's stock for them after every older order. The product page shows the ship date under the countdown.
+              </span>
+              {!startWave && !w.wave && (
+                <s-button variant="tertiary" onClick={() => setWaveOn(false)}>
+                  Not a new wave
+                </s-button>
+              )}
+            </div>
+          ) : (
+            <div style={drawerSection}>
+              <p style={sectionTitle}>Release date</p>
+              <input type="date" value={release} onChange={(e) => setRelease(e.target.value)} style={{ ...input, width: "180px" }} disabled={!canManage} />
+              <span style={small}>Saved to the product in Shopify (its publication date), so pre-order tags and shipping follow it too.</span>
+              {canManage && (
+                <button
+                  type="button"
+                  onClick={() => (setWaveOn(true), closeMode === "release" && setCloseMode("date"))}
+                  style={{ appearance: "none", border: 0, background: "none", padding: 0, font: "inherit", fontSize: "13px", color: "#005bd3", cursor: "pointer", textAlign: "left" }}
+                >
+                  Already released? Make this a new pre-order wave with its own ship date instead
+                </button>
+              )}
+            </div>
+          )}
 
           <div style={drawerSection}>
             <p style={sectionTitle}>Pre-orders open (Pacific)</p>
@@ -532,6 +582,7 @@ function DrawerBody({ w, closeOnRelease, canManage }) {
 
           <div style={drawerSection}>
             <p style={sectionTitle}>Pre-orders close</p>
+            {!waveOn && (
             <label style={radioRow}>
               <input type="radio" name={`close-${w.id}`} checked={closeMode === "release"} onChange={() => setCloseMode("release")} disabled={!canManage} />
               <span>
@@ -539,6 +590,7 @@ function DrawerBody({ w, closeOnRelease, canManage }) {
                 <div style={small}>Moves with the release date if it changes.</div>
               </span>
             </label>
+            )}
             <label style={radioRow}>
               <input type="radio" name={`close-${w.id}`} checked={closeMode === "date"} onChange={() => setCloseMode("date")} disabled={!canManage} />
               <span style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
@@ -705,6 +757,7 @@ function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect, onOpen
         <ProductCell {...w} onOpen={onOpen} />
         <div style={{ display: "flex", gap: "4px", marginTop: "4px", flexWrap: "wrap" }}>
           {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Auto</span>}
+          {w.wave && <span style={pill("#e6f4ff", "#0b4f8a")}>Wave {w.wave.number}</span>}
           {!w.opensAt && !w.closesAt && <span style={pill("#fff1e3", "#8a4b00")}>Not set up</span>}
         </div>
         {w.lastError && <div style={{ color: "#b42318", fontSize: "12px", marginTop: "4px" }}>Couldn't update Shopify: {w.lastError}</div>}
@@ -718,7 +771,16 @@ function OpenRow({ w, now, canManage, closeOnRelease, selected, onSelect, onOpen
           </div>
         )}
       </td>
-      <td style={{ ...cell, whiteSpace: "nowrap" }}>{fmtDay(w.releaseDay) ?? <span style={muted}>Not set</span>}</td>
+      <td style={{ ...cell, whiteSpace: "nowrap" }}>
+        {w.wave ? (
+          <>
+            Ships {fmtDay(w.wave.shipDay)}
+            <div style={small}>Released {fmtDay(w.releaseDay) ?? "—"}</div>
+          </>
+        ) : (
+          (fmtDay(w.releaseDay) ?? <span style={muted}>Not set</span>)
+        )}
+      </td>
       <td style={cell}>
         <Status w={w} now={now} />
       </td>
@@ -858,7 +920,7 @@ function OpenTab({ windows, now, canManage, settings, releaseProblems }) {
 // History
 // ---------------------------------------------------------------------------
 
-function HistoryRow({ w, canManage }) {
+function HistoryRow({ w, canManage, onNewWave }) {
   const fetcher = useFetcher();
   const [reopening, setReopening] = useState(false);
   const [closes, setCloses] = useState("");
@@ -873,9 +935,10 @@ function HistoryRow({ w, canManage }) {
       <tr className="pc-rise">
         <td style={cell}>
           <ProductCell {...w} />
-          {(w.auto || w.finished) && (
+          {(w.auto || w.finished || w.wave) && (
             <div style={{ display: "flex", gap: "4px", marginTop: "4px", flexWrap: "wrap" }}>
               {w.auto && <span style={pill("#f3ecff", "#5b2bb5")}>Auto</span>}
+              {w.wave && <span style={pill("#e6f4ff", "#0b4f8a")}>Wave {w.wave.number} · ships {fmtDay(w.wave.shipDay)}</span>}
               {w.finished && <span style={pill("#e3f5e8", "#0c5132")}>Countdown taken off</span>}
             </div>
           )}
@@ -904,8 +967,11 @@ function HistoryRow({ w, canManage }) {
         </td>
         {canManage && (
           <td style={{ ...cell, textAlign: "right", whiteSpace: "nowrap" }}>
+            {!reopening && <s-button onClick={() => setReopening(true)}>Re-open</s-button>}
             {!reopening && (
-              <s-button onClick={() => setReopening(true)}>Re-open</s-button>
+              <s-button variant="primary" onClick={onNewWave}>
+                New wave
+              </s-button>
             )}
             {confirmRemove ? (
               <s-button
@@ -969,8 +1035,18 @@ function HistoryRow({ w, canManage }) {
 }
 
 function HistoryTab({ windows, canManage }) {
+  // "New wave": the flyout, starting another run with its own ship date
+  const [waveId, setWaveId] = useState(null);
+  const waveW = windows.find((w) => w.id === waveId);
   return (
     <s-section heading="Closed pre-orders">
+      {waveW && <EditDrawer key={`wave-${waveW.id}`} w={waveW} canManage={canManage} startWave onClose={() => setWaveId(null)} />}
+      {canManage && windows.length > 0 && (
+        <div style={{ ...small, marginBottom: "10px" }}>
+          Re-open carries on the same pre-orders. New wave opens another run for a product that's already out, with its own ship date; the release date
+          isn't changed.
+        </div>
+      )}
       {windows.length === 0 ? (
         <s-paragraph>No closed pre-orders yet.</s-paragraph>
       ) : (
@@ -989,7 +1065,7 @@ function HistoryTab({ windows, canManage }) {
             </thead>
             <tbody>
               {windows.map((w) => (
-                <HistoryRow key={w.id} w={w} canManage={canManage} />
+                <HistoryRow key={w.id} w={w} canManage={canManage} onNewWave={() => setWaveId(w.id)} />
               ))}
             </tbody>
           </table>

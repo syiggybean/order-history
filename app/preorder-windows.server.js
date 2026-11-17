@@ -280,9 +280,12 @@ const METAFIELDS_DELETE = `#graphql
   }`;
 
 // The theme block reads these: product.metafields.oh_preorder.opens_at / closes_at / limited
-async function writeMetafields(admin, productId, { opensAt, closesAt, limited = false }) {
+async function writeMetafields(admin, productId, { opensAt, closesAt, limited = false, shipsOn = null }) {
   const set = [];
   const remove = [];
+  // A later wave's own ship date, for the countdown block ("This wave ships …")
+  if (shipsOn) set.push({ ownerId: productId, namespace: MF_NAMESPACE, key: "wave_ships_on", type: "date", value: shipsOn });
+  else remove.push({ ownerId: productId, namespace: MF_NAMESPACE, key: "wave_ships_on" });
   for (const [key, at] of [
     ["opens_at", opensAt],
     ["closes_at", closesAt],
@@ -444,6 +447,7 @@ const view = (w, now = Date.now(), metrics = null) => {
     releaseDay: w.releaseDay ?? null,
     auto: Boolean(w.auto),
     keepSelling: Boolean(w.keepSelling),
+    wave: w.waveId ? { id: w.waveId, number: w.waveNumber, shipDay: w.waveShipDay } : null,
     finished: finished(w, phase),
     addedBy: w.addedBy ?? null,
     phase,
@@ -552,10 +556,19 @@ const parseLimits = (input) => {
 // closesRule: "release" closes at the end of the product's release date (read
 // from Shopify now), "manual" uses `closes`, undefined leaves the rule as it is
 // keepSelling: true/false to change it, undefined leaves it as it is
-export async function saveWindow(shop, admin, id, { opens, closes, limits, closesRule, keepSelling }, user) {
+// wave: undefined leaves it as it is; { shipDay: "YYYY-MM-DD", fresh } makes this a
+// later wave of pre-orders with its own ship date (the release date isn't
+// touched), fresh starting another one; false ends being a wave
+export async function saveWindow(shop, admin, id, { opens, closes, limits, closesRule, keepSelling, wave }, user) {
   const w = await db.preorderWindow.findFirst({ where: { shop, id } });
   if (!w) throw new WindowError("That product isn't in the group anymore.");
   const keep = keepSelling === undefined ? Boolean(w.keepSelling) : Boolean(keepSelling);
+  const asWave = wave === undefined ? (w.waveId ? { shipDay: w.waveShipDay } : null) : wave || null;
+  if (asWave) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(asWave.shipDay ?? "")) throw new WindowError("Enter the date this wave ships.");
+    // A wave closes at its own time; the release date belongs to the first run
+    if (closesRule === "release" || (!closesRule && followsRelease(w, await getSettings(shop)))) closesRule = "manual";
+  }
   let releaseDay = w.releaseDay;
   if (closesRule === "release") {
     releaseDay = (await releaseDays(admin, [w.productId]))[w.productId] ?? null;
@@ -573,6 +586,7 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
   if (busy.has(w.id)) throw new WindowError("This product is being updated. Try again in a moment.");
   busy.add(w.id);
   try {
+    const waveData = await placeWave(shop, w, asWave, { opensAt, closesAt }, user);
     // Limit changed while on sale: add or take away the difference now
     const oldLimits = limitsOf(w);
     if (newLimits && w.appliedPhase === "open" && phaseOf({ opensAt, closesAt }) === "open") {
@@ -587,10 +601,11 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
       await db.preorderWindow.update({ where: { id: w.id }, data: { stock: JSON.stringify(stock), locationId } });
     }
 
-    await writeMetafields(admin, w.productId, { opensAt, closesAt, limited: Boolean(newLimits) });
+    await writeMetafields(admin, w.productId, { opensAt, closesAt, limited: Boolean(newLimits), shipsOn: asWave?.shipDay ?? null });
     const saved = await db.preorderWindow.update({
       where: { id: w.id },
       data: {
+        ...waveData,
         opensAt,
         closesAt,
         limits: newLimits ? JSON.stringify(newLimits) : null,
@@ -607,6 +622,53 @@ export async function saveWindow(shop, admin, id, { opens, closes, limits, close
   // The countdown blocks live on the "preorder" product template
   await syncTemplate(shop, admin, w.productId).catch((e) => console.error(`[preorder-windows] template ${w.productId}:`, errorMessage(e)));
   return view(await db.preorderWindow.findUnique({ where: { id: w.id } }));
+}
+
+// ---------------------------------------------------------------------------
+// Waves: more pre-orders for a product that's already out
+// ---------------------------------------------------------------------------
+
+// Window fields for the wave (and the wave's own row). A new wave starts when
+// the product isn't in a wave yet or one is asked for (fresh, the History
+// tab's "New wave"); otherwise the current wave's times and ship date change
+// (re-opening a wave keeps it the same wave).
+async function placeWave(shop, w, asWave, { opensAt, closesAt }, user) {
+  const now = new Date();
+  const current = w.waveId ? await db.preorderWave.findFirst({ where: { shop, id: w.waveId } }) : null;
+  if (!asWave) {
+    if (!current) return {};
+    // Not a wave after all: forget it if it never opened
+    if (new Date(current.opensAt) > now) await db.preorderWave.delete({ where: { id: current.id } });
+    return { waveId: null, waveNumber: null, waveShipDay: null };
+  }
+  const opened = opensAt ?? now;
+  const startNew = !current || Boolean(asWave.fresh);
+  if (!startNew) {
+    await db.preorderWave.update({ where: { id: current.id }, data: { opensAt: opened, closesAt, shipDay: asWave.shipDay } });
+    return { waveShipDay: asWave.shipDay };
+  }
+  // The run before it ends now at the latest, so orders after this belong to the new wave
+  if (current && (!current.closesAt || new Date(current.closesAt) > now)) {
+    await db.preorderWave.update({ where: { id: current.id }, data: { closesAt: now } });
+  }
+  const last = await db.preorderWave.findFirst({ where: { shop, productId: w.productId }, orderBy: { number: "desc" } });
+  // The first run (on the release date) is wave 1
+  const number = Math.max(2, (last?.number ?? 1) + 1);
+  const row = await db.preorderWave.create({
+    data: { shop, productId: w.productId, windowId: w.id, number, opensAt: opened, closesAt, shipDay: asWave.shipDay, createdBy: user?.name ?? null },
+  });
+  // A fresh run: opening emails "pre-orders are open" again, and a limit starts from scratch
+  return { waveId: row.id, waveNumber: number, waveShipDay: asWave.shipDay, firstOpenedAt: null, closedAt: null, soldOutAt: null, restockedUnits: 0, quietOpen: false };
+}
+
+// Every wave of these products: productId → [{ number, opensAt, closesAt, shipDay }]
+export async function wavesFor(shop, productIds) {
+  const ids = [...new Set(productIds.filter(Boolean))];
+  if (!ids.length) return {};
+  const rows = await db.preorderWave.findMany({ where: { shop, productId: { in: ids } }, orderBy: { opensAt: "asc" } });
+  const out = {};
+  for (const r of rows) (out[r.productId] ??= []).push({ number: r.number, opensAt: r.opensAt.toISOString(), closesAt: r.closesAt?.toISOString() ?? null, shipDay: r.shipDay });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +712,7 @@ export async function syncReleaseCloses(shop, admin, { ids = null, user = null }
   for (const w of rows) {
     const day = days[w.productId] ?? null;
     if (day !== (w.releaseDay ?? null)) await db.preorderWindow.update({ where: { id: w.id }, data: { releaseDay: day } });
+    if (w.waveId) continue; // a later wave closes at its own time
     if (!followsRelease(w, settings) || !day) continue;
     if (!w.opensAt && !w.closesAt) continue; // not set up: saving it would open pre-orders now
     if (phaseOf(w) === "closed") continue;
