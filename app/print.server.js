@@ -133,6 +133,16 @@ export function stationView(st) {
     barcodePrinter: st.barcodePrinter ?? null,
     barcodeZebra: Boolean(printers.find((p) => p.name === st.barcodePrinter)?.zebra),
     labelZebra: Boolean(printers.find((p) => p.name === st.labelPrinter)?.zebra),
+    // Pack Cam (the Mac camera app) on this computer
+    packCam: {
+      paired: Boolean(st.packCamKeyHash),
+      running: Boolean(st.packCamKeyHash && st.packCamSeenAt && Date.now() - st.packCamSeenAt.getTime() < 15_000),
+      version: st.packCamVersion ?? null,
+      host: st.packCamHost ?? null,
+      camera: st.packCamInfo ?? null,
+      seenAt: st.packCamSeenAt?.toISOString() ?? null,
+      pairPending: Boolean(st.packCamPairHash && st.packCamPairExpiresAt && st.packCamPairExpiresAt > new Date()),
+    },
   };
 }
 

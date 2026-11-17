@@ -408,7 +408,7 @@ export async function getBox(shop, batchId, shipmentId) {
 }
 
 async function startPackingBatch(b) {
-  if (b.status === "picked") await db.batch.update({ where: { id: b.id }, data: { status: "packing", packStartedAt: new Date() } });
+  if (b.status === "picked") await db.batch.update({ where: { id: b.id }, data: { status: "packing", packStartedAt: b.packStartedAt ?? new Date() } });
 }
 
 // When every shipment in the batch is packed, the batch is Packed (and back again if one is unpacked)

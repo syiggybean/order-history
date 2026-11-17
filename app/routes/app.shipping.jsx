@@ -27,6 +27,7 @@ import { slipsPdf } from "../slips-pdf.server";
 import { checkShipped, createMerge, customerPlan, listMerges, mergeCandidates, saveBoxes, searchCustomers, undoMerge } from "../merge.server";
 import { MergeTab } from "../components/shipping/Merge";
 import { benchContext, benchLink, benchTakeScans, benchUnlink, pickPhoneLink, videosFor } from "../camera.server";
+import { PackCamError, currentRelease, listReleases, packCamForget, packCamPairCode, packCamStatus, releaseDownloadUrl, saveRelease } from "../packcam.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
 import { IN_APP_LABELS } from "../components/shipping/features";
 import { redirect, useFetcher, useLoaderData, useNavigation, useRevalidator, useSearchParams } from "react-router";
@@ -238,6 +239,8 @@ export const loader = async ({ request }) => {
       jobs: tab === "settings" ? await recentJobs(session.shop) : null,
       uninstall: uninstallCommand(appUrl(request)),
       agentVersion: AGENT_VERSION,
+      // Pack Cam: the installer offered to packing Macs (and, in settings, the last few)
+      packCam: { latest: await currentRelease(session.shop), releases: tab === "settings" ? await listReleases(session.shop) : null },
     },
     can: {
       settings: can(user, "shipping", "settings"),
@@ -336,6 +339,12 @@ const NEEDS = {
   removeStation: "settings",
   installCode: "settings",
   refreshPrinters: "settings",
+  // Pack Cam (the Mac camera app): is it on this bench's computer, and getting it there
+  packCamStatus: "view",
+  packCamDownload: "view",
+  packCamPairCode: ["settings", "pack"],
+  packCamForget: "settings",
+  packCamRelease: "settings",
 };
 
 export const action = async ({ request }) => {
@@ -456,6 +465,16 @@ export const action = async ({ request }) => {
       await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null, stationId: form.get("stationId") || null });
       return { intent, ok: true };
     }
+    if (intent === "packCamStatus") return { intent, ok: true, ...(await packCamStatus(session.shop, Number(form.get("stationId")) || null)) };
+    if (intent === "packCamDownload") return { intent, ok: true, ...(await releaseDownloadUrl(session.shop, appUrl(request))) };
+    if (intent === "packCamPairCode") return { intent, ok: true, stationId: Number(form.get("stationId")), ...(await packCamPairCode(session.shop, form.get("stationId"), appUrl(request))) };
+    if (intent === "packCamForget") return { intent, ok: true, ...(await packCamForget(session.shop, form.get("stationId"))) };
+    if (intent === "packCamRelease") {
+      const file = form.get("file");
+      if (!file || typeof file === "string") return { intent, error: "Choose the installer (.pkg)." };
+      const r = await saveRelease(session.shop, user, { version: form.get("version"), fileName: file.name, bytes: Buffer.from(await file.arrayBuffer()) });
+      return { intent, ok: true, release: r, releases: await listReleases(session.shop) };
+    }
     if (intent === "cameraScans") return { intent, ok: true, ...(await benchTakeScans(session.shop, shop, user)) };
     if (intent === "cameraUnlink") return { intent, ok: true, ...(await benchUnlink(session.shop, shop, user)) };
     if (intent === "boxVideos") return { intent, ok: true, shipmentId: Number(form.get("shipmentId")), videos: await videosFor(session.shop, form.get("shipmentId")) };
@@ -554,7 +573,7 @@ export const action = async ({ request }) => {
       const ids = form.get("ids") ? JSON.parse(String(form.get("ids"))) : null;
       const filter = form.get("filter") ? JSON.parse(String(form.get("filter"))) : null;
       const limit = form.get("limit") ? Number(form.get("limit")) : null;
-      const r = await addToBatch(shop, { ids, filter, limit, target: String(form.get("target") || "new"), name: String(form.get("name") ?? "") }, user);
+      const r = await addToBatch(shop, { ids, filter, limit, target: String(form.get("target") || "new"), name: String(form.get("name") ?? ""), flow: form.get("flow") !== "off" }, user);
       return { intent, ok: true, ...r };
     }
     if (intent === "removeFromBatch") {
@@ -602,7 +621,7 @@ export const action = async ({ request }) => {
       return { intent, ok: true, ...startFullRead(shop) };
     }
   } catch (e) {
-    if (!(e instanceof ShippingError) && !(e instanceof PrintError)) console.error(`[shipping] ${intent}:`, e);
+    if (!(e instanceof ShippingError) && !(e instanceof PrintError) && !(e instanceof PackCamError)) console.error(`[shipping] ${intent}:`, e);
     return { intent, id, error: e?.message ?? String(e) };
   }
   return { intent, error: "Unknown action" };

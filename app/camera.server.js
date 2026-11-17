@@ -86,7 +86,8 @@ async function claimStationCamera(shop, workShop, user, stationId) {
 }
 
 export async function benchUnlink(shop, workShop, user) {
-  const r = await db.cameraLink.updateMany({ where: { shop, workShop, staffKey: staffKeyOf(user), kind: "pack", revokedAt: null }, data: { revokedAt: new Date() } });
+  // Camera windows only: Pack Cam stays this bench's camera while it's on this computer
+  const r = await db.cameraLink.updateMany({ where: { shop, workShop, staffKey: staffKeyOf(user), kind: "pack", revokedAt: null, stationId: null }, data: { revokedAt: new Date() } });
   return { unlinked: r.count };
 }
 

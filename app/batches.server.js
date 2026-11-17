@@ -29,6 +29,11 @@ const EDITABLE = ["open", "picking", "picked"]; // shipments can still be added/
 const LIVE = ["open", "picking", "picked", "packing", "packed", "shipping"];
 // Unpacked shipments can still be taken out while the batch is being packed
 const REMOVABLE = [...EDITABLE, "packing", "packed"];
+// Shipments can be added while packing too (by people who can manage batches).
+// The usual way, the batch goes back to picking until the new items are picked;
+// Flow mode picks each package on its own, so it just carries on.
+const ADDABLE = [...EDITABLE, "packing", "packed"];
+const needsRepick = (b) => !b.flow && ["picked", "packing", "packed"].includes(b.status);
 const TAG_CHANGES_PER_RUN = 250;
 
 // Staff live under the real shop name, also when working in sandbox
@@ -51,11 +56,12 @@ const itemKey = (l) => l.variantId ?? `title:${l.title}|${l.variantTitle ?? ""}`
 // Creating and changing batches
 // ---------------------------------------------------------------------------
 
-async function newBatch(shop, { name = null, source = "manual", user = null }) {
+// New batches use Flow mode unless someone chooses the usual pick list
+async function newBatch(shop, { name = null, source = "manual", user = null, flow = true }) {
   await getShippingSettings(shop);
   const { batchCounter } = await db.shippingSettings.update({ where: { shop }, data: { batchCounter: { increment: 1 } } });
   return db.batch.create({
-    data: { shop, number: batchCounter, tag: tagFor(batchCounter), name: name?.trim() || null, source, createdBy: user?.name ?? null },
+    data: { shop, number: batchCounter, tag: tagFor(batchCounter), name: name?.trim() || null, source, createdBy: user?.name ?? null, flow: Boolean(flow) },
   });
 }
 
@@ -80,7 +86,7 @@ const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, 
 // target: "new" or a batch id. ids: shipment ids, or filter: everything on the
 // Ready list matching the filter, in the list's order (oldest first unless
 // sorted newest first); limit: just the first N of those. New batches over 250 are split.
-export async function addToBatch(shop, { ids = null, filter = null, limit = null, target = "new", name = null }, user) {
+export async function addToBatch(shop, { ids = null, filter = null, limit = null, target = "new", name = null, flow = true }, user) {
   let wanted;
   if (filter) {
     const rows = await db.shipment.findMany({
@@ -106,22 +112,34 @@ export async function addToBatch(shop, { ids = null, filter = null, limit = null
     const parts = chunk(wanted, MAX_BATCH);
     for (const [i, part] of parts.entries()) {
       const label = name?.trim() ? (parts.length > 1 ? `${name.trim()} (${i + 1} of ${parts.length})` : name.trim()) : null;
-      const batch = await newBatch(shop, { name: label, user });
+      const batch = await newBatch(shop, { name: label, user, flow });
       const added = await assign(shop, batch, part);
       results.push({ id: batch.id, number: batch.number, tag: batch.tag, name: batch.name, added });
       await logEvent(shop, { batchId: batch.id, type: "batch_created", detail: `${batch.tag}${batch.name ? ` "${batch.name}"` : ""}: ${added} shipment${added === 1 ? "" : "s"}`, user });
     }
   } else {
     const batch = await db.batch.findFirst({ where: { shop, id: Number(target) } });
-    if (!batch || !EDITABLE.includes(batch.status)) throw new ShippingError("That batch can't take more shipments.");
+    if (!batch || !ADDABLE.includes(batch.status)) throw new ShippingError("That batch can't take more shipments.");
     const room = MAX_BATCH - (await batchCount(batch.id));
     if (wanted.length > room)
       throw new ShippingError(
         `${batch.tag} has room for ${room} more (batches hold up to ${MAX_BATCH}). You picked ${wanted.length}. Make a new batch instead, or pick fewer.`,
       );
     const added = await assign(shop, batch, wanted);
-    results.push({ id: batch.id, number: batch.number, tag: batch.tag, name: batch.name, added });
-    await logEvent(shop, { batchId: batch.id, type: "batch_added", detail: `${added} added to ${batch.tag}`, user });
+    const repick = added > 0 && needsRepick(batch);
+    if (repick) {
+      // Packing waits until the new items are picked
+      await db.batch.update({ where: { id: batch.id }, data: { status: "picking", pickedAt: null, pickedBy: null, packDoneAt: null } });
+    } else if (added > 0 && batch.flow && batch.status === "packed") {
+      await db.batch.update({ where: { id: batch.id }, data: { status: "packing", packDoneAt: null } });
+    }
+    results.push({ id: batch.id, number: batch.number, tag: batch.tag, name: batch.name, added, repick });
+    await logEvent(shop, {
+      batchId: batch.id,
+      type: "batch_added",
+      detail: `${added} added to ${batch.tag}${repick ? ` while ${batch.status}: back to picking until the new items are picked` : ""}`,
+      user,
+    });
   }
   kick(shop);
   const added = results.reduce((n, b) => n + b.added, 0);
@@ -315,6 +333,8 @@ const viewBatch = (b, stats) => ({
   createdAt: b.createdAt.toISOString(),
   pickedAt: b.pickedAt?.toISOString() ?? null,
   pickedBy: b.pickedBy,
+  // Shipments were added after packing started: pick those first
+  repicking: !b.flow && ["open", "picking"].includes(b.status) && Boolean(b.packStartedAt),
   shipments: stats?.shipments ?? 0,
   shipped: stats?.shipped ?? 0,
   units: stats?.units ?? 0,
@@ -363,7 +383,7 @@ export async function listBatches(shop, { show = "live", onlyFor = null } = {}) 
 
 // Open batches with room, for the "Add to batch" picker
 export async function openBatches(shop) {
-  return (await listBatches(shop)).filter((b) => EDITABLE.includes(b.status) && b.room > 0);
+  return (await listBatches(shop)).filter((b) => ADDABLE.includes(b.status) && b.room > 0).map((b) => ({ ...b, repick: needsRepick(b) }));
 }
 
 export async function getBatch(shop, batchId) {

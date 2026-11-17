@@ -121,10 +121,14 @@ function NotPickedYet({ batch, canPick }) {
   const short = finish.data?.intent === "finishPicking" ? finish.data.short : null;
   return (
     <div style={{ marginTop: "12px" }}>
-      <s-banner tone="warning" heading={`${batch.tag} hasn't been picked yet`}>
+      <s-banner
+        tone="warning"
+        heading={batch.packStartedAt && !batch.flow ? `Orders were added to ${batch.tag}: pick them before packing more` : `${batch.tag} hasn't been picked yet`}
+      >
         <s-paragraph>
-          Packing starts once everything in the batch is picked. Pick it with the pick list (scan or tick each item), then choose Finish picking. If
-          it's already been picked by hand, finish it here.
+          {batch.packStartedAt && !batch.flow
+            ? "Packing is paused until the newly added orders are picked. The pick list only shows what's still to pick; finish picking and packing carries on where it left off."
+            : "Packing starts once everything in the batch is picked. Pick it with the pick list (scan or tick each item), then choose Finish picking. If it's already been picked by hand, finish it here."}
         </s-paragraph>
         <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "8px" }}>
           <s-button onClick={() => go({ view: "pick", box: null }, { replace: false })}>Open the pick list</s-button>

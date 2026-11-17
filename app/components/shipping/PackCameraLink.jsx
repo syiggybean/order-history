@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useFetcher } from "react-router";
 import { muted, small } from "./ui";
+import { usePrinting } from "./Printing";
+import { PackCamPrompt, usePackCamStatus } from "./PackCam";
 
 // The pack bench's side of the pack camera (a separate window, because Shopify's
 // admin doesn't give embedded apps the camera):
@@ -8,6 +10,11 @@ import { muted, small } from "./ui";
 //   - tells it which box is open, so it can show the items and record the box
 //   - picks up its scans and hands them to the bench like a handheld scanner's
 // onScans([{ code, via }]) is called with each batch of scans.
+//
+// Pack Cam (the Mac app) on this bench's packing computer ("Printing on") is the
+// camera when it's running there: the bench then works with it automatically,
+// exactly as with a camera window. When it isn't, the bench offers to install,
+// update or open it, next to the built-in camera.
 
 const QR_URL = "https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js";
 const WIN = "mb-pack-camera";
@@ -25,6 +32,9 @@ export function loadQr() {
 }
 
 export function usePackCamera({ batchId, box, onScans, enabled = true }) {
+  const { stationId } = usePrinting();
+  const packCam = usePackCamStatus(stationId, enabled);
+  const packCamReady = packCam?.state === "ready" || packCam?.state === "outdated"; // an older Pack Cam still records
   const scans = useFetcher();
   const ctx = useFetcher();
   const [cameras, setCameras] = useState([]);
@@ -46,6 +56,10 @@ export function usePackCamera({ batchId, box, onScans, enabled = true }) {
     if (d.cameras?.length) setPolling(true);
     if (d.scans?.length) onScansRef.current(d.scans);
   }, [scans.data]);
+  // Pack Cam running on this computer: work with it like a linked camera
+  useEffect(() => {
+    if (packCamReady && enabled) setPolling(true);
+  }, [packCamReady, enabled]);
   // About once a second while a camera is linked
   useEffect(() => {
     if (!polling || !enabled) return undefined;
@@ -61,13 +75,13 @@ export function usePackCamera({ batchId, box, onScans, enabled = true }) {
   const boxKey = box ? `${box.id}:${box.state}` : "none";
   useEffect(() => {
     if (!polling || !enabled) return;
-    ctx.submit({ intent: "cameraContext", batchId: String(batchId), shipmentId: box ? String(box.id) : "" }, { method: "post" });
+    ctx.submit({ intent: "cameraContext", batchId: String(batchId), shipmentId: box ? String(box.id) : "", stationId: stationId ? String(stationId) : "" }, { method: "post" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [boxKey, polling, enabled, batchId]);
+  }, [boxKey, polling, enabled, batchId, stationId, packCamReady]);
 
   // What's open now, for a new camera link to start from
   const context = { batchId: batchId ? String(batchId) : "", shipmentId: box ? String(box.id) : "" };
-  return { cameras, linked: polling, context, startPolling: () => setPolling(true), stopPolling: () => setPolling(false) };
+  return { cameras, linked: polling, context, packCam, packCamReady, startPolling: () => setPolling(true), stopPolling: () => setPolling(false) };
 }
 
 export function PackCameraBar({ cam }) {
@@ -113,23 +127,32 @@ export function PackCameraBar({ cam }) {
   }, [link.data, link.state]);
   useEffect(() => {
     if (unlink.data?.intent === "cameraUnlink" && unlink.data.ok) {
-      cam.stopPolling();
+      if (!cam.packCamReady) cam.stopPolling();
       setOther(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unlink.data]);
 
-  const connected = cam.cameras.filter((c) => c.connected);
+  // Camera windows (browser) and Pack Cam are shown separately
+  const windows = cam.cameras.filter((c) => !c.packCam);
+  const connected = windows.filter((c) => c.connected);
+  const packCamLive = cam.cameras.some((c) => c.packCam && c.connected);
+  const usingBuiltIn = windows.length > 0;
   const btn = { appearance: "none", border: "1px solid #c9c9c9", background: "#fff", borderRadius: "8px", padding: "5px 10px", font: "inherit", fontSize: "13px", cursor: "pointer" };
   // The QR code panel sits in the page (a full-width row under the toolbar) rather
   // than floating, so it's never cut off on a short page
   return (
     <>
       <div style={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: "8px" }}>
+        {cam.packCamReady && (
+          <span style={{ ...small, color: packCamLive ? "#1a7f37" : "#8a6116" }} title={[cam.packCam?.host, cam.packCam?.camera].filter(Boolean).join(" · ")}>
+            🎥 Pack Cam on {cam.packCam?.station?.name}: {packCamLive ? "● connected" : "○ starting…"}
+          </span>
+        )}
         <button type="button" style={btn} onClick={() => open(false)} disabled={busy}>
-          📷 {cam.linked ? "Camera window" : "Open pack camera"}
+          📷 {usingBuiltIn ? "Camera window" : cam.packCamReady ? "Built-in camera" : "Open pack camera"}
         </button>
-        {cam.linked && (
+        {usingBuiltIn && (
           <span style={{ ...small, color: connected.length ? "#1a7f37" : "#8a6116" }} title={connected.map((c) => c.info).filter(Boolean).join(", ")}>
             {connected.length ? `● Camera connected${connected.length > 1 ? ` (${connected.length})` : ""}` : "○ Waiting for the camera…"}
           </span>
@@ -137,13 +160,14 @@ export function PackCameraBar({ cam }) {
         <button type="button" style={{ ...btn, border: 0, color: "#005bd3", padding: 0 }} onClick={() => open(true)} disabled={busy}>
           Use another device
         </button>
-        {cam.linked && (
+        {usingBuiltIn && (
           <button type="button" style={{ ...btn, border: 0, color: "#005bd3", padding: 0 }} onClick={() => unlink.submit({ intent: "cameraUnlink" }, { method: "post" })}>
             Unlink
           </button>
         )}
         {link.data?.error && <span style={{ ...small, color: "#b42318" }}>{link.data.error}</span>}
       </div>
+      <PackCamPrompt status={cam.packCam} usingBuiltIn={usingBuiltIn} onBuiltIn={() => open(false)} />
       {other && (
         <div
           role="region"

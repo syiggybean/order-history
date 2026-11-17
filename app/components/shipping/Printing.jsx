@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { useFetcher } from "react-router";
 import { ago, box, cell, fmtDate, head, input, muted, small } from "./ui";
+import { PackCamInstaller, PackCamStationRow } from "./PackCam";
 
 // ---------------------------------------------------------------------------
 // Direct printing through MonkeyBean Print on the packing Macs.
@@ -213,7 +214,7 @@ function InstallSteps({ install, name }) {
   );
 }
 
-function StationCard({ st, install, canSettings, canTest, isThis }) {
+function StationCard({ st, install, canSettings, canTest, isThis, packCamLatest = null }) {
   const save = useFetcher();
   const act = useFetcher();
   const test = useAgentTest(st);
@@ -386,6 +387,7 @@ function StationCard({ st, install, canSettings, canTest, isThis }) {
         <PrintNote note={test.note} />
       </div>
       {st.installPending && (fresh ?? install) && <InstallSteps install={fresh ?? install} name={st.name} />}
+      <PackCamStationRow st={st} canSettings={canSettings} latest={packCamLatest} />
     </div>
   );
 }
@@ -532,9 +534,12 @@ export function PackingComputers({ printing, canSettings, canPrint }) {
             install={newInstall?.station?.id === st.id ? newInstall : null}
             canSettings={canSettings}
             canTest={canSettings || canPrint}
+            packCamLatest={printing?.packCam?.latest ?? null}
           />
         ))}
       </div>
+
+      <PackCamInstaller packCam={printing?.packCam} canSettings={canSettings} />
 
       {canSettings && (
         <form

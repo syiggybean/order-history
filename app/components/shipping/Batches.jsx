@@ -152,12 +152,14 @@ export function SelectionBar({ count, total, allMatching, limit, sort, onSelectA
   const tooMany = chosen && count > chosen.room;
   const parts = target === "new" ? Math.ceil(count / MAX_BATCH) : 1;
 
+  const [flowOn, setFlowOn] = useState(true);
   const submit = () =>
     fetcher.submit(
       {
         intent: "addToBatch",
         target,
         name,
+        flow: flowOn ? "on" : "off",
         ...(allMatching ? { filter: JSON.stringify(filter), ...(limit ? { limit: String(limit) } : {}) } : { ids: JSON.stringify(ids) }),
       },
       { method: "post" },
@@ -250,6 +252,17 @@ export function SelectionBar({ count, total, allMatching, limit, sort, onSelectA
                 style={{ ...input, maxWidth: "360px", marginLeft: "26px" }}
               />
             )}
+            {target === "new" && (
+              <label style={{ ...radioRow, marginLeft: "26px" }}>
+                <input type="checkbox" checked={flowOn} onChange={(e) => setFlowOn(e.target.checked)} />
+                <span>
+                  Flow mode
+                  <span style={{ ...small, display: "block" }}>
+                    {flowOn ? "Pick, pack and label one package at a time." : "Usual way: pick the whole batch first, then pack."}
+                  </span>
+                </span>
+              </label>
+            )}
             <label style={{ ...radioRow, opacity: openBatches.length ? 1 : 0.5 }}>
               <input
                 type="radio"
@@ -260,17 +273,24 @@ export function SelectionBar({ count, total, allMatching, limit, sort, onSelectA
               />
               <span>
                 <strong>Add to an open batch</strong>
-                <span style={{ ...small, display: "block" }}>{openBatches.length ? "Batches that haven't finished picking." : "No open batches with room."}</span>
+                <span style={{ ...small, display: "block" }}>
+                  {openBatches.length ? "Live batches with room. Adding to one that's packing pauses its packing until the new orders are picked (not in Flow mode)." : "No open batches with room."}
+                </span>
               </span>
             </label>
             {target !== "new" && (
               <select value={target} onChange={(e) => setTarget(e.target.value)} style={{ ...input, maxWidth: "420px", marginLeft: "26px" }} aria-label="Batch">
                 {openBatches.map((b) => (
                   <option key={b.id} value={b.id}>
-                    {batchTitle(b)} ({b.shipments}/{MAX_BATCH}, room for {b.room})
+                    {batchTitle(b)} ({b.shipments}/{MAX_BATCH}, room for {b.room}){b.repick ? ` · ${b.status}: pick again before packing` : ""}
                   </option>
                 ))}
               </select>
+            )}
+            {target !== "new" && chosen?.repick && (
+              <div style={{ ...small, color: "#8a4b00", marginLeft: "26px", maxWidth: "460px" }}>
+                {chosen.tag} is {chosen.status}. Adding these sends it back to picking: packing stops until the new orders are picked.
+              </div>
             )}
             {tooMany && (
               <div style={{ ...small, color: "#b42318", marginLeft: "26px" }}>
@@ -575,6 +595,13 @@ export function BatchHeader({ batch, canBatches, canPick, canPack = false, staff
         {batch.pickedAt ? ` · picked ${fmtDate(batch.pickedAt, true)}${batch.pickedBy ? ` by ${batch.pickedBy}` : ""}` : ""}
       </div>
       {batch.status !== "cancelled" && <AssignControl batch={batch} staff={staff} canAssign={canBatches} me={me} />}
+      {batch.repicking && (
+        <div style={{ marginTop: "10px" }}>
+          <s-banner tone="warning" heading="Orders were added after packing started">
+            <s-paragraph>Pick the new orders (the pick list only shows what's left), then finish picking. Packing carries on after that.</s-paragraph>
+          </s-banner>
+        </div>
+      )}
       <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "12px" }}>
         {batch.flow && batch.status !== "cancelled" && (
           <s-button variant={["done", "packed"].includes(batch.status) ? "secondary" : "primary"} onClick={() => go({ view: "pack" }, { replace: false })}>
