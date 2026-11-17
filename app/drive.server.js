@@ -111,3 +111,22 @@ export async function startDriveUpload({ name, mimeType, description, origin, re
 }
 
 export const driveFileUrl = (id) => (id ? `https://drive.google.com/file/d/${id}/view` : null);
+
+// A file's size and checksum as Google has it (to confirm an upload arrived whole)
+export async function driveFileInfo(id) {
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?supportsAllDrives=true&fields=id,name,size,md5Checksum,mimeType`, {
+    headers: { Authorization: `Bearer ${await token()}` },
+  });
+  if (res.status === 404) return null;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Google Drive: ${body?.error?.message ?? `HTTP ${res.status}`}`);
+  return { id: body.id, name: body.name, size: Number(body.size) || 0, md5: body.md5Checksum ?? null, mimeType: body.mimeType ?? null };
+}
+
+// Streams a file from Drive, passing a browser's Range request through so video
+// can seek. Returns Google's response (200 or 206); the video never touches disk.
+export async function driveMedia(id, range = null) {
+  return fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media&supportsAllDrives=true`, {
+    headers: { Authorization: `Bearer ${await token()}`, ...(range ? { Range: range } : {}) },
+  });
+}

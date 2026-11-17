@@ -1322,6 +1322,15 @@ model PrintStation {
   slipOptions   String?
   slipSize      String?   // letter | 4x6
   barcodePrinter String?  // Zebra for 2 × 1 product barcode labels (raw ZPL)
+  // Pack Cam (the Mac camera app) on this computer
+  packCamKeyHash      String?   @unique // the app's key (sha256); the key itself is only on the Mac
+  packCamPairHash     String?   @unique // one-time "Connect this Mac" code (sha256)
+  packCamPairExpiresAt DateTime?
+  packCamVersion      String?
+  packCamHost         String?
+  packCamInfo         String?   // the camera in use
+  packCamSeenAt       DateTime?
+  packCamPairedAt     DateTime?
   createdAt     DateTime  @default(now())
   createdBy     String?
 
@@ -1443,6 +1452,8 @@ model CameraLink {
   userName    String?
   // "pack": the pack camera; "pick": picking a batch on a phone
   kind        String    @default("pack")
+  // Pack Cam: the packing computer whose Mac app is this bench's camera (one link per computer)
+  stationId   Int?
   // sha256 of the secret in the camera window's link
   secretHash  String    @unique
   // What the bench has open: {batchId, shipmentId} (the camera reads the box from it)
@@ -1455,6 +1466,7 @@ model CameraLink {
   revokedAt   DateTime?
 
   @@index([shop, staffKey])
+  @@index([stationId])
 }
 
 // Scans made by a pack camera, waiting for the bench to apply them
@@ -1485,11 +1497,65 @@ model PackVideo {
   seconds     Int?
   userName    String?
   error       String?
+  // Recorded by Pack Cam on this packing computer (null: the browser camera)
+  stationId   Int?
+  mimeType    String?
   createdAt   DateTime  @default(now())
   doneAt      DateTime?
 
   @@index([shop, shipmentId])
   @@index([shop, createdAt])
+}
+
+// Pack Cam installers (signed .pkg) uploaded by an admin; the newest is the one offered
+model PackCamRelease {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  version    String
+  fileName   String
+  sizeBytes  Int
+  sha256     String
+  data       Bytes
+  uploadedBy String?
+  createdAt  DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+// Customer clips: part of a packing video, cut on a packing Mac (Pack Cam) and
+// shown in the customer's account until it expires or is revoked
+model PackClip {
+  id               Int       @id @default(autoincrement())
+  shop             String
+  packVideoId      Int
+  shipmentId       Int
+  orderId          String    // Shopify order GID
+  orderName        String
+  customerId       String    // Shopify customer GID
+  customerName     String?
+  customerEmail    String?
+  startSeconds     Float
+  endSeconds       Float
+  availabilityDays Int
+  notifyCustomer   Boolean   @default(false)
+  status           String    @default("queued") // queued | cutting | published | failed | revoked
+  stationId        Int?      // the Mac cutting it
+  claimedAt        DateTime?
+  attempts         Int       @default(0)
+  driveFileId      String?
+  sizeBytes        Int?
+  error            String?
+  notifiedAt       DateTime?
+  createdBy        String?
+  createdAt        DateTime  @default(now())
+  publishedAt      DateTime?
+  expiresAt        DateTime?
+  revokedAt        DateTime?
+  revokedBy        String?
+
+  @@index([shop, status])
+  @@index([shop, orderId])
+  @@index([packVideoId])
 }
 
 // Order Merge: several orders for the same customer and address shipped in one box.

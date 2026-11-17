@@ -50,7 +50,10 @@ export async function benchLink(shop, workShop, user, appOrigin, { batchId = nul
 }
 
 // The box open at the bench (null: none), for every camera linked to this person
-export async function benchContext(shop, workShop, user, { batchId = null, shipmentId = null } = {}) {
+// stationId: the packing computer this bench prints on; if Pack Cam is connected
+// there, it becomes this bench's camera (whoever's bench last used that computer)
+export async function benchContext(shop, workShop, user, { batchId = null, shipmentId = null, stationId = null } = {}) {
+  if (stationId) await claimStationCamera(shop, workShop, user, Number(stationId));
   await db.cameraLink.updateMany({
     where: { shop, workShop, staffKey: staffKeyOf(user), kind: "pack", ...activeWhere() },
     data: { batchId: batchId ? Number(batchId) : null, shipmentId: shipmentId ? Number(shipmentId) : null, contextAt: new Date() },
@@ -67,8 +70,19 @@ export async function benchTakeScans(shop, workShop, user) {
   const now = Date.now();
   return {
     scans: scans.map((x) => ({ id: x.id, code: x.code, via: x.via })),
-    cameras: links.map((l) => ({ id: l.id, connected: Boolean(l.cameraSeenAt && now - l.cameraSeenAt.getTime() < 15_000), info: l.cameraInfo })),
+    cameras: links.map((l) => ({ id: l.id, connected: Boolean(l.cameraSeenAt && now - l.cameraSeenAt.getTime() < 15_000), info: l.cameraInfo, packCam: Boolean(l.stationId) })),
   };
+}
+
+// Pack Cam's link for a packing computer: one per computer, moved to whoever's
+// bench is using it. Its secret is never handed out (Pack Cam signs in with its key).
+async function claimStationCamera(shop, workShop, user, stationId) {
+  const st = await db.printStation.findFirst({ where: { id: stationId, shop, packCamKeyHash: { not: null } }, select: { id: true } });
+  if (!st) return null;
+  const data = { shop, workShop, staffKey: staffKeyOf(user), userName: user?.name ?? null };
+  const link = await db.cameraLink.findFirst({ where: { stationId, kind: "pack", revokedAt: null }, orderBy: { id: "desc" } });
+  if (link) return link.staffKey === data.staffKey && link.workShop === workShop ? link : db.cameraLink.update({ where: { id: link.id }, data });
+  return db.cameraLink.create({ data: { ...data, stationId, secretHash: hash(randomBytes(32).toString("base64url")) } });
 }
 
 export async function benchUnlink(shop, workShop, user) {
@@ -126,9 +140,12 @@ async function batchSummary(workShop, batchId) {
   return { id: b.id, title: b.name ? `${b.tag} · ${b.name}` : b.tag, status: b.status, total: boxes.length, packed: boxes.filter((x) => x.packed).length, boxes };
 }
 
+// The camera window passes its secret; Pack Cam passes its computer's link, already checked
+const resolve = (secretOrLink) => (secretOrLink && typeof secretOrLink === "object" && secretOrLink.id ? secretOrLink : linkFor(secretOrLink));
+
 // What to show: the open box (or none). info: the camera in use, for the bench to show
 export async function cameraState(secret, { info = null } = {}) {
-  const link = await linkFor(secret);
+  const link = await resolve(secret);
   await db.cameraLink.update({ where: { id: link.id }, data: { cameraSeenAt: new Date(), ...(info ? { cameraInfo: String(info).slice(0, 120) } : {}) } });
   let box = null;
   if (link.batchId && link.shipmentId) {
@@ -154,7 +171,7 @@ export async function cameraState(secret, { info = null } = {}) {
 }
 
 export async function cameraScan(secret, { code, via = "barcode" }) {
-  const link = await linkFor(secret);
+  const link = await resolve(secret);
   const c = String(code ?? "").trim().slice(0, 200);
   if (!c) throw new CameraError("Nothing scanned.");
   await db.cameraScan.create({ data: { linkId: link.id, code: c, via: via === "visual" ? "visual" : "barcode" } });
@@ -162,7 +179,7 @@ export async function cameraScan(secret, { code, via = "barcode" }) {
   return { ok: true };
 }
 
-const extOf = (mime) => (/mp4/i.test(mime) ? "mp4" : "webm");
+const extOf = (mime) => (/mp4/i.test(mime) ? "mp4" : /quicktime/i.test(mime) ? "mov" : "webm");
 
 // A box's video is ready: start its upload to Google Drive
 // videoId: an earlier try for the same video (its upload address expired): start again under it
@@ -190,11 +207,12 @@ function videoFileName(s, mime) {
 }
 
 export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds, startedAt, endedAt = null, capped = false, clientNow = null, videoId = null, sizeBytes = null }, origin) {
-  const link = await linkFor(secret);
+  const link = await resolve(secret);
   if (isSandboxShop(link.workShop)) throw new CameraError("Sandbox: videos aren't uploaded.");
   const s = await db.shipment.findFirst({ where: { shop: link.workShop, id: Number(shipmentId) } });
   if (!s) throw new CameraError("That order isn't in the app anymore.");
-  const mime = /^video\/(webm|mp4)/.test(String(mimeType)) ? String(mimeType).split(";")[0] : "video/webm";
+  // Browsers record WebM or MP4; Pack Cam records QuickTime (HEVC)
+  const mime = /^video\/(webm|mp4|quicktime)/.test(String(mimeType)) ? String(mimeType).split(";")[0] : "video/webm";
   const part = s.partCount > 1 ? ` (${s.partIndex} of ${s.partCount})` : "";
   const earlier = videoId ? await db.packVideo.findFirst({ where: { id: Number(videoId), shop: link.shop, shipmentId: s.id, status: { not: "done" } } }) : null;
   // Only the recording of the box's last packing (it's packed, and was packed during
@@ -220,6 +238,8 @@ export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds,
           seconds: Number.isFinite(Number(seconds)) ? Math.round(Number(seconds)) : null,
           sizeBytes: Number(sizeBytes) > 0 ? Math.round(Number(sizeBytes)) : null,
           sentBytes: 0,
+          stationId: link.stationId ?? null,
+          mimeType: mime,
         },
       });
   try {
@@ -233,13 +253,13 @@ export async function cameraUploadStart(secret, { shipmentId, mimeType, seconds,
 
 // How far the upload has got (the pack bench shows a progress bar)
 export async function cameraUploadProgress(secret, { videoId, sentBytes }) {
-  const link = await linkFor(secret);
+  const link = await resolve(secret);
   await db.packVideo.updateMany({ where: { id: Number(videoId), shop: link.shop, status: "uploading" }, data: { sentBytes: Math.max(0, Math.round(Number(sentBytes) || 0)) } });
   return { ok: true };
 }
 
 export async function cameraUploadDone(secret, { videoId, driveFileId, sizeBytes, error }) {
-  const link = await linkFor(secret);
+  const link = await resolve(secret);
   const v = await db.packVideo.findFirst({ where: { id: Number(videoId), shop: link.shop } });
   if (!v) throw new CameraError("Unknown video.");
   const ok = Boolean(driveFileId) && !error;

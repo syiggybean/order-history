@@ -453,7 +453,7 @@ export const action = async ({ request }) => {
     }
     if (intent === "pickPhoneLink") return { intent, ok: true, ...(await pickPhoneLink(session.shop, shop, user, appUrl(request), id)) };
     if (intent === "cameraContext") {
-      await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null });
+      await benchContext(session.shop, shop, user, { batchId: form.get("batchId") || null, shipmentId: form.get("shipmentId") || null, stationId: form.get("stationId") || null });
       return { intent, ok: true };
     }
     if (intent === "cameraScans") return { intent, ok: true, ...(await benchTakeScans(session.shop, shop, user)) };
