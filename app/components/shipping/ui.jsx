@@ -44,8 +44,9 @@ const GAP = 18; // distance from the cursor
 // Only one preview on screen at a time: showing one hides whichever was showing
 let hideShown = null;
 
-// A product thumbnail that shows a large view under the cursor on hover
-export function ProductThumb({ src, size, style }) {
+// A product thumbnail that shows a large view under the cursor on hover.
+// large: the big picture's address, when it isn't a Shopify image
+export function ProductThumb({ src, size, style, large }) {
   const [at, setAt] = useState(null); // { x, y } while hovering
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -116,7 +117,7 @@ export function ProductThumb({ src, size, style }) {
         {/* The small picture fills in until the big one arrives */}
         <img src={src} alt="" style={{ position: "absolute", inset: 8, width: PREVIEW - 16, height: PREVIEW - 16, objectFit: "contain", opacity: loaded ? 0 : 1, filter: failed ? "none" : "blur(2px)" }} />
         <img
-          src={largeImage(src)}
+          src={large ?? largeImage(src)}
           alt=""
           onLoad={() => setLoaded(true)}
           onError={() => setFailed(true)}

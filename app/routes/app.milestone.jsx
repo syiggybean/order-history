@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useFetcher, useLoaderData } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { NoAccess } from "../components/NoAccess";
+import { ProductThumb } from "../components/shipping/ui";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { errorMessage } from "../preorders.server";
 import { MilestoneError, createDrafts, dismiss, getSettings, saveRate, suggestions } from "../milestone.server";
@@ -97,7 +98,7 @@ export default function Milestone() {
       .map((x) => ({
         msCode: x.msCode,
         jan: x.jan,
-        title: val(x, "title", x.details?.title ?? x.title),
+        title: val(x, "title", x.title || x.details?.title),
         maker: x.maker,
         category: x.details?.category ?? null,
         price: priceOf(x),
@@ -131,7 +132,7 @@ export default function Milestone() {
             <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
               Dollars per yen (for prices and costs)
               <span style={{ display: "flex", gap: "6px" }}>
-                <input value={rate} onChange={(e) => setRate(e.target.value)} placeholder="0.0067" inputMode="decimal" style={{ ...input, width: "110px" }} />
+                <input value={rate} onChange={(e) => setRate(e.target.value)} placeholder="e.g. 0.0067" inputMode="decimal" style={{ ...input, width: "110px" }} />
                 {String(data.yenRate ?? "") !== rate && rate && (
                   <s-button onClick={() => rateF.submit({ intent: "rate", rate }, { method: "post" })} {...(rateF.state !== "idle" ? { loading: true } : {})}>
                     Save
@@ -262,14 +263,20 @@ export default function Milestone() {
                         <td style={{ ...cellS, minWidth: "280px" }}>
                           <div style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
                             {img ? (
-                              <img src={img.replace(/(\.\w+)$/, "_350x350$1")} alt="" style={{ width: 56, height: 56, objectFit: "contain", borderRadius: 6, background: "#f6f6f6", flexShrink: 0 }} />
+                              // Hover for the full-size photo
+                              <ProductThumb
+                                src={img.replace(/(\.\w+)$/, "_350x350$1")}
+                                large={img}
+                                size={56}
+                                style={{ objectFit: "contain", borderRadius: 6, background: "#f6f6f6", flexShrink: 0 }}
+                              />
                             ) : (
                               <div style={{ width: 56, height: 56, borderRadius: 6, background: "#f1f1f1", flexShrink: 0 }} />
                             )}
                             <div style={{ display: "flex", flexDirection: "column", gap: "3px", minWidth: 0, flex: 1 }}>
                               {editable ? (
                                 <input
-                                  value={val(x, "title", x.details?.title ?? x.title)}
+                                  value={val(x, "title", x.title || x.details?.title)}
                                   onChange={(e) => setVal(x, "title", e.target.value)}
                                   aria-label="Product title"
                                   style={{ ...input, width: "100%" }}

@@ -97,7 +97,11 @@ export function parseProduct(html) {
   const category = h.match(/<span class="p-4px border[^"]*">([^<]+)<\/span>\s*<\/div>\s*<h2/);
   const copyright = h.match(/<p class="mt-8px break-all text-center">([\s\S]*?)<\/p>/);
   return {
-    title: decode((h.match(/<h2[^>]*>([\s\S]*?)<\/h2>/) || [])[1] ?? "") || null,
+    // The product's own heading (the page has others, like the "Working days" calendar)
+    title:
+      decode((h.match(/<h2[^>]*class="[^"]*text-24px[^"]*"[^>]*>([\s\S]*?)<\/h2>/) || [])[1] ?? "") ||
+      decode((h.match(/Product detail information\s*:\s*([^<]+)</) || [])[1] ?? "") ||
+      null,
     retailYen: yen(dd(h, "Retail Price")),
     // "75% 1,350yen": the yen amount is the last number
     wholesaleYen: wholesale ? yen(decode(wholesale).replace(/^\s*\d+%/, "")) : null,
