@@ -1668,3 +1668,28 @@ model FreebieImage {
   data        Bytes
   createdAt   DateTime @default(now())
 }
+
+// ---------------------------------------------------------------------------
+// Milestone (b2b.mile-stone.jp): items on "View What's Arrived"
+// ---------------------------------------------------------------------------
+
+model MilestoneSettings {
+  shop      String    @id
+  // Dollars per yen, for suggested prices and costs
+  yenRate   Float?
+  lastRunAt DateTime?
+}
+
+// An arrived item someone created in Shopify, or chose not to sell
+model MilestoneItem {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  msCode    String
+  status    String
+  productId String?
+  by        String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([shop, msCode])
+}
