@@ -5,7 +5,7 @@ import { NoAccess } from "../components/NoAccess";
 import { ProductThumb, preloadImages } from "../components/shipping/ui";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { errorMessage } from "../preorders.server";
-import { MilestoneError, createDrafts, dismiss, getSettings, saveRate, suggestions } from "../milestone.server";
+import { MilestoneError, createDrafts, dismiss, getSettings, suggestions } from "../milestone.server";
 
 // Milestone: what's arrived on Milestone's B2B site that the shop doesn't sell
 // yet, with a draft product made in one go.
@@ -31,7 +31,6 @@ export const action = async ({ request }) => {
   try {
     if (intent === "check") return { intent, ok: true, ...(await suggestions(shop, admin)) };
     if (!can(user, "purchaseOrders", "generate")) return denied("purchaseOrders", "generate");
-    if (intent === "rate") return (await saveRate(shop, form.get("rate")), { intent, ok: true });
     if (intent === "dismiss" || intent === "undismiss") {
       await dismiss(shop, JSON.parse(String(form.get("codes") ?? "[]")).map(String), user, intent === "undismiss");
       return { intent, ok: true };
@@ -62,8 +61,8 @@ export default function Milestone() {
   const check = useFetcher();
   const create = useFetcher();
   const mark = useFetcher();
-  const rateF = useFetcher();
-  const [rate, setRate] = useState(data.yenRate ? String(data.yenRate) : "");
+  // Fetched with each check (today's rate); can be changed for this check
+  const [rate, setRate] = useState("");
   const [picked, setPicked] = useState(() => new Set());
   const [edits, setEdits] = useState({}); // msCode → { title, price, cost, sku }
   const [show, setShow] = useState("new");
@@ -72,6 +71,9 @@ export default function Milestone() {
 
   const result = check.data?.intent === "check" && check.data.ok ? check.data : null;
   const items = useMemo(() => result?.items ?? [], [result]);
+  useEffect(() => {
+    if (result?.yenRate) setRate(String(Math.round(result.yenRate * 1e6) / 1e6));
+  }, [result]);
   // Full-size photos load in the background as soon as the list arrives, so
   // hovering shows them sharp straight away
   useEffect(() => {
@@ -114,7 +116,7 @@ export default function Milestone() {
     create.submit({ intent: "create", items: JSON.stringify(list) }, { method: "post" });
   };
   const missingPrice = items.filter((x) => picked.has(x.msCode) && !(Number(priceOf(x)) > 0)).length;
-  const error = check.data?.error ?? create.data?.error ?? mark.data?.error ?? rateF.data?.error;
+  const error = check.data?.error ?? create.data?.error ?? mark.data?.error;
 
   return (
     <s-page heading="Milestone" inlineSize="large">
@@ -133,17 +135,10 @@ export default function Milestone() {
           <s-button variant="primary" onClick={() => check.submit({ intent: "check" }, { method: "post" })} {...(check.state !== "idle" ? { loading: true } : {})}>
             {result ? "Check again" : "Check Milestone"}
           </s-button>
-          {data.canCreate && (
+          {data.canCreate && result && (
             <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
-              Dollars per yen (for prices and costs)
-              <span style={{ display: "flex", gap: "6px" }}>
-                <input value={rate} onChange={(e) => setRate(e.target.value)} placeholder="e.g. 0.0067" inputMode="decimal" style={{ ...input, width: "110px" }} />
-                {String(data.yenRate ?? "") !== rate && rate && (
-                  <s-button onClick={() => rateF.submit({ intent: "rate", rate }, { method: "post" })} {...(rateF.state !== "idle" ? { loading: true } : {})}>
-                    Save
-                  </s-button>
-                )}
-              </span>
+              Dollars per yen
+              <input value={rate} onChange={(e) => setRate(e.target.value)} placeholder="Enter a rate" inputMode="decimal" style={{ ...input, width: "110px" }} />
             </label>
           )}
           <span style={small}>
@@ -156,7 +151,14 @@ export default function Milestone() {
                   : ""}
           </span>
         </div>
-        <div style={{ ...small, marginTop: "6px" }}>Suggested price is Milestone's retail price, and cost the wholesale price, at this rate. Change any of them before creating.</div>
+        <div style={{ ...small, marginTop: "6px" }}>
+          {result?.yenRate
+            ? `Today's rate from the ${result.rateSource}${result.rateDate ? ` (${result.rateDate})` : ""}: ¥1 = $${(Math.round(result.yenRate * 1e6) / 1e6).toString()}, so ¥1,000 = $${(result.yenRate * 1000).toFixed(2)}. `
+            : result
+              ? "Couldn't get today's exchange rate: enter one above. "
+              : "Each check uses today's yen to dollar exchange rate. "}
+          Suggested price is Milestone's retail price, and cost the wholesale price, at that rate. Change any of them before creating.
+        </div>
       </s-section>
 
       {error && (
@@ -213,7 +215,7 @@ export default function Milestone() {
               >
                 Not selling these
               </s-button>
-              {missingPrice > 0 && <span style={{ ...small, color: "#b42318" }}>{missingPrice} without a price: enter one, or set the yen rate.</span>}
+              {missingPrice > 0 && <span style={{ ...small, color: "#b42318" }}>{missingPrice} without a price: enter one.</span>}
             </div>
           )}
 

@@ -1650,6 +1650,8 @@ model FreebieGrant {
   freebieId  Int
   orderId    String
   orderName  String?
+  // Who ordered it, so only they see it in their account
+  customerId String?
   productId  String
   quantity   Int
   returnedAt DateTime?

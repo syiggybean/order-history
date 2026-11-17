@@ -239,7 +239,9 @@ export async function grantFreebies(shop, admin, payload) {
     const n = await takeStock(l.freebieId, bought[l.productId]);
     if (!n) continue;
     try {
-      await db.freebieGrant.create({ data: { shop, freebieId: l.freebieId, orderId, orderName: payload.name ?? null, productId: l.productId, quantity: n } });
+      await db.freebieGrant.create({
+        data: { shop, freebieId: l.freebieId, orderId, orderName: payload.name ?? null, customerId: payload.customer?.admin_graphql_api_id ?? null, productId: l.productId, quantity: n },
+      });
       given.push({ freebieId: l.freebieId, productId: l.productId, quantity: n });
     } catch (e) {
       // Another delivery of the same webhook got there first: put the units back
@@ -251,7 +253,10 @@ export async function grantFreebies(shop, admin, payload) {
   }
   // Ran out: off the product pages
   for (const id of emptied) await syncOffersFor(shop, admin, { freebieId: id }).catch((e) => console.error(`[freebies] offers ${id}:`, errorMessage(e)));
-  if (given.length) await refreshFreebieLines(shop, orderId);
+  if (given.length) {
+    await refreshFreebieLines(shop, orderId);
+    await writeOrderGifts(shop, admin, orderId);
+  }
   return given;
 }
 
@@ -279,6 +284,7 @@ export async function returnFreebies(shop, admin, orderId) {
   if (back.size && !admin) admin = await unauthenticated.admin(shop).then((r) => r.admin).catch(() => null);
   if (admin) for (const id of back) await syncOffersFor(shop, admin, { freebieId: id }).catch((e) => console.error(`[freebies] offers ${id}:`, errorMessage(e)));
   await refreshFreebieLines(shop, orderId);
+  if (admin) await writeOrderGifts(shop, admin, orderId);
   return grants.length;
 }
 
@@ -332,4 +338,49 @@ export async function refreshFreebieLines(shop, orderId) {
     const value = lines.length ? JSON.stringify(lines) : null;
     if (value !== (s.freebieLines ?? null)) await db.shipment.update({ where: { id: s.id }, data: { freebieLines: value } });
   }
+}
+
+// ---------------------------------------------------------------------------
+// The customer's view: their order's gifts
+// ---------------------------------------------------------------------------
+
+// The order's gifts, one entry per freebie
+export async function giftsOfOrder(shop, orderId, { customerId = undefined } = {}) {
+  const where = { shop, orderId, returnedAt: null, ...(customerId !== undefined ? { customerId } : {}) };
+  const grants = await db.freebieGrant.findMany({ where, orderBy: { id: "asc" } });
+  if (!grants.length) return [];
+  const freebies = await db.freebie.findMany({ where: { id: { in: [...new Set(grants.map((g) => g.freebieId))] } } });
+  const out = new Map();
+  for (const g of grants) {
+    const f = freebies.find((x) => x.id === g.freebieId);
+    const had = out.get(g.freebieId);
+    if (had) had.quantity += g.quantity;
+    else out.set(g.freebieId, { title: f?.title ?? "Free gift", description: f?.description ?? "", imageUrl: imageUrlOf(f), quantity: g.quantity });
+  }
+  return [...out.values()];
+}
+
+const ORDER_METAFIELD_SET = METAFIELDS_SET;
+
+// Also on the order in Shopify (oh_freebie.gifts), so staff see it in the admin
+async function writeOrderGifts(shop, admin, orderId) {
+  try {
+    const gifts = await giftsOfOrder(shop, orderId);
+    if (gifts.length) {
+      await gql(admin, ORDER_METAFIELD_SET, {
+        metafields: [{ ownerId: orderId, namespace: MF_NAMESPACE, key: "gifts", type: "json", value: JSON.stringify(gifts.map(({ title, quantity, imageUrl }) => ({ title, quantity, image: imageUrl }))) }],
+      });
+    } else {
+      await gql(admin, METAFIELDS_DELETE, { metafields: [{ ownerId: orderId, namespace: MF_NAMESPACE, key: "gifts" }] });
+    }
+  } catch (e) {
+    console.error(`[freebies] order ${orderId}:`, errorMessage(e));
+  }
+}
+
+// For the customer's account: gifts on this order, only if it's theirs
+export async function customerGifts({ shop, customerId }, orderId) {
+  const gid = /^\d+$/.test(String(orderId)) ? `gid://shopify/Order/${orderId}` : String(orderId ?? "");
+  if (!/^gid:\/\/shopify\/Order\/\d+$/.test(gid)) return [];
+  return giftsOfOrder(shop, gid, { customerId });
 }

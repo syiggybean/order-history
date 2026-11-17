@@ -1,0 +1,21 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "Packing video"
+handle = "packing-video"
+uid = "0d01badd-c388-8b31-d637-ffa97954a07dd9c61eb7"
+type = "ui_extension"
+
+# On the customer's order page in their account: the packing video clip, when
+# staff have made one (MonkeyBean → Packing videos), until it expires
+[[extensions.targeting]]
+module = "./src/OrderStatusBlock.jsx"
+target = "customer-account.order-status.customer-information.render-after"
+
+# Under the items on the same page: the free gifts (Freebies) that came with it
+[[extensions.targeting]]
+module = "./src/FreeGiftBlock.jsx"
+target = "customer-account.order-status.cart-line-list.render-after"
+
+[extensions.capabilities]
+network_access = true

@@ -44,6 +44,12 @@ export const action = async ({ request }) => {
       );
       return { intent, ok: true, id: f.id, created: !id };
     }
+    if (intent === "create") {
+      // A new freebie, straight onto the product it's for
+      const f = await saveFreebie(shop, admin, { title: form.get("title"), description: form.get("description"), stock: form.get("stock"), active: true }, user);
+      await attachProducts(shop, admin, f.id, [String(form.get("productId") ?? "")]);
+      return { intent, ok: true, id: f.id };
+    }
     if (intent === "image") return { intent, ok: true, url: await setImage(shop, admin, id, form.get("file")) };
     if (intent === "attach") return (await attachProducts(shop, admin, id, JSON.parse(String(form.get("productIds") ?? "[]"))), { intent, ok: true });
     if (intent === "detach") return (await detachProduct(shop, admin, id, String(form.get("productId") ?? "")), { intent, ok: true });
@@ -85,82 +91,257 @@ function Status({ f }) {
 
 export default function Freebies() {
   const data = useLoaderData();
-  const [openId, setOpenId] = useState(null); // freebie id, or "new"
+  const [openId, setOpenId] = useState(null); // a freebie being edited
+  const [addFor, setAddFor] = useState(null); // a product getting a freebie
+  const [q, setQ] = useState("");
+  const search = useFetcher();
+  const unlink = useFetcher();
+  const timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
   if (data.noAccess) return <NoAccess />;
   const { freebies, canManage } = data;
-  const open = openId === "new" ? { id: null } : freebies.find((f) => f.id === openId);
+  const open = freebies.find((f) => f.id === openId);
+
+  // Products that have freebies now, and what each has
+  const byProduct = new Map();
+  for (const f of freebies) {
+    for (const p of f.products) {
+      if (!byProduct.has(p.productId)) byProduct.set(p.productId, { ...p, freebies: [] });
+      byProduct.get(p.productId).freebies.push(f);
+    }
+  }
+  const searching = q.trim().length >= 2;
+  const results = search.data?.intent === "search" && searching ? search.data.products ?? [] : [];
+  const rows = searching
+    ? results.map((p) => ({ ...p, freebies: byProduct.get(p.productId)?.freebies ?? [] }))
+    : [...byProduct.values()].sort((a, b) => (a.title ?? "").localeCompare(b.title ?? ""));
+  const find = (text) => {
+    setQ(text);
+    clearTimeout(timer.current);
+    if (text.trim().length < 2) return;
+    timer.current = setTimeout(() => search.submit({ intent: "search", q: text }, { method: "post" }), 250);
+  };
+  const unattached = freebies.filter((f) => !f.products.length);
 
   return (
-    <s-page heading="Freebies">
+    <s-page heading="Freebies" inlineSize="large">
       {open && (
         <Flyout
-          key={open.id ?? "new"}
+          key={open.id}
           onClose={() => setOpenId(null)}
-          label={open.id ? `Freebie: ${open.title}` : "New freebie"}
-          title={open.id ? (canManage ? "Edit freebie" : "Freebie") : "New freebie"}
+          label={`Freebie: ${open.title}`}
+          title={canManage ? "Edit freebie" : "Freebie"}
           width={480}
           bodyStyle={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}
         >
           <Editor f={open} canManage={canManage} onCreated={(id) => setOpenId(id)} />
         </Flyout>
       )}
+      {addFor && (
+        <Flyout
+          key={`add-${addFor.productId}`}
+          onClose={() => setAddFor(null)}
+          label={`Add a freebie to ${addFor.title}`}
+          title="Add a freebie"
+          width={480}
+          bodyStyle={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}
+        >
+          <AddFreebie
+            product={addFor}
+            freebies={freebies}
+            onCreated={(id) => {
+              setAddFor(null);
+              setOpenId(id);
+            }}
+          />
+        </Flyout>
+      )}
       <s-section>
         <s-paragraph>
-          A free gift that comes with a product. While it's on and has stock, the product page shows it with its photo and description (add the
-          “Freebie” block to the product template in the theme editor). Every unit bought gets one while stock lasts, and it's added to the order's
-          box: on the pick list, the packing screen and the packing slip. A cancelled order puts its freebies back.
+          Free gifts that come with a product. Find the product, then add a freebie to it: a new one or one you've made already. While it's on and
+          has stock, the product page shows it (with the “Freebie” block in the theme). Every unit bought gets one while stock lasts, packed with the
+          order, and the customer sees it on their order in their account.
         </s-paragraph>
-        {canManage && (
-          <div style={{ marginTop: "10px" }}>
-            <s-button variant="primary" onClick={() => setOpenId("new")}>
-              New freebie
-            </s-button>
-          </div>
-        )}
+        <div style={{ marginTop: "12px" }}>
+          <input
+            type="search"
+            value={q}
+            onChange={(e) => find(e.target.value)}
+            placeholder="Find a product by title or SKU"
+            aria-label="Find a product"
+            style={{ ...input, width: "100%", maxWidth: "560px" }}
+          />
+        </div>
       </s-section>
-      <s-section heading={`Freebies (${freebies.length})`}>
-        {freebies.length === 0 ? (
-          <s-paragraph>No freebies yet.{canManage ? " Choose New freebie to make one." : ""}</s-paragraph>
+
+      <s-section heading={searching ? `Products matching “${q.trim()}”` : `Products with freebies (${rows.length})`}>
+        {unlink.data?.error && <div style={{ color: "#b42318", fontSize: "13px", marginBottom: "8px" }}>{unlink.data.error}</div>}
+        {searching && search.state !== "idle" && <span style={small}>Searching…</span>}
+        {rows.length === 0 && !(searching && search.state !== "idle") ? (
+          <s-paragraph>{searching ? "No products found." : "No products have a freebie yet. Find one above to add one."}</s-paragraph>
         ) : (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "12px" }}>
-            {freebies.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setOpenId(f.id)}
-                style={{
-                  appearance: "none",
-                  textAlign: "left",
-                  font: "inherit",
-                  cursor: "pointer",
-                  border: "1px solid #e3e3e3",
-                  borderRadius: "12px",
-                  background: "#fff",
-                  padding: "12px",
-                  display: "flex",
-                  gap: "12px",
-                  alignItems: "flex-start",
-                }}
+          <div style={{ border: "1px solid #e3e3e3", borderRadius: "10px", overflow: "hidden" }}>
+            {rows.map((p, i) => (
+              <div
+                key={p.productId}
+                style={{ display: "flex", gap: "12px", alignItems: "center", padding: "10px 12px", borderTop: i ? "1px solid #ebebeb" : 0, flexWrap: "wrap" }}
               >
-                <Photo src={f.imageUrl} />
-                <span style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: "4px" }}>
-                  <span style={{ display: "flex", gap: "6px", alignItems: "center", justifyContent: "space-between" }}>
-                    <strong style={{ fontSize: "14px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.title}</strong>
-                    <Status f={f} />
-                  </span>
-                  <span style={small}>
-                    {f.stock.toLocaleString()} left · {f.given.toLocaleString()} given
-                  </span>
-                  <span style={{ ...small, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {f.products.length ? `With ${f.products.map((p) => p.title).join(", ")}` : "Not attached to a product"}
-                  </span>
-                </span>
-              </button>
+                <Photo src={p.imageUrl} size={44} />
+                <div style={{ flex: "1 1 240px", minWidth: 0 }}>
+                  <div style={{ fontWeight: 600, fontSize: "14px" }}>{p.title}</div>
+                  <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "4px" }}>
+                    {p.freebies.length === 0 && <span style={small}>No freebie</span>}
+                    {p.freebies.map((f) => (
+                      <span
+                        key={f.id}
+                        style={{ display: "inline-flex", alignItems: "center", gap: "6px", border: "1px solid #f3c2d3", background: "#fff4f8", borderRadius: "999px", padding: "2px 4px 2px 4px" }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setOpenId(f.id)}
+                          style={{ ...linkBtn, color: "#7a1240", fontSize: "12px", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: "6px" }}
+                          title="Edit this freebie"
+                        >
+                          <Photo src={f.imageUrl} size={20} />
+                          {f.title}
+                          <span style={{ fontWeight: 500, color: "#8a5a6c" }}>· {f.stock} left</span>
+                          {!f.active && <span style={{ fontWeight: 500, color: "#616161" }}>· off</span>}
+                        </button>
+                        {canManage && (
+                          <button
+                            type="button"
+                            aria-label={`Remove ${f.title} from ${p.title}`}
+                            onClick={() => unlink.submit({ intent: "detach", id: String(f.id), productId: p.productId }, { method: "post" })}
+                            style={{ ...linkBtn, color: "#8a5a6c", fontSize: "15px", lineHeight: 1, padding: "0 4px" }}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                {canManage && (
+                  <s-button onClick={() => setAddFor(p)}>{p.freebies.length ? "Add another freebie" : "Add freebie"}</s-button>
+                )}
+              </div>
             ))}
           </div>
         )}
       </s-section>
+
+      {unattached.length > 0 && (
+        <s-section heading={`Freebies not on a product (${unattached.length})`}>
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            {unattached.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => setOpenId(f.id)}
+                style={{ ...linkBtn, display: "inline-flex", alignItems: "center", gap: "8px", border: "1px solid #e3e3e3", borderRadius: "10px", padding: "6px 10px", color: "#303030" }}
+              >
+                <Photo src={f.imageUrl} size={28} />
+                <span style={{ fontSize: "13px", fontWeight: 600 }}>{f.title}</span>
+                <span style={small}>{f.stock} left</span>
+              </button>
+            ))}
+          </div>
+        </s-section>
+      )}
     </s-page>
+  );
+}
+
+// Add a freebie to one product: one already made, or a new one
+function AddFreebie({ product, freebies, onCreated }) {
+  const close = useFlyoutClose();
+  const attach = useFetcher();
+  const create = useFetcher();
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [stock, setStock] = useState("");
+  const [find, setFind] = useState("");
+  const others = freebies.filter((f) => !f.products.some((p) => p.productId === product.productId));
+  const shown = others.filter((f) => !find.trim() || f.title.toLowerCase().includes(find.trim().toLowerCase()));
+  useEffect(() => {
+    if (attach.data?.intent === "attach" && attach.data.ok) close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attach.data]);
+  useEffect(() => {
+    if (create.data?.intent === "create" && create.data.ok) onCreated(create.data.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [create.data]);
+  const error = attach.data?.error ?? create.data?.error;
+
+  return (
+    <>
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        <div style={{ ...section, flexDirection: "row", alignItems: "center", gap: "12px" }}>
+          <Photo src={product.imageUrl} size={44} />
+          <strong style={{ fontSize: "14px" }}>{product.title}</strong>
+        </div>
+
+        <div style={section}>
+          <p style={sectionTitle}>A new freebie</p>
+          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+            Name
+            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Exclusive acrylic stand" style={input} />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+            Description (shown on the product page)
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} style={{ ...input, resize: "vertical" }} />
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+            How many to give away
+            <input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} style={{ ...input, width: "130px" }} />
+          </label>
+          <span>
+            <s-button
+              variant="primary"
+              onClick={() => create.submit({ intent: "create", productId: product.productId, title, description, stock: stock || "0" }, { method: "post" })}
+              {...(create.state !== "idle" ? { loading: true } : {})}
+            >
+              Create and add, then add a photo
+            </s-button>
+          </span>
+        </div>
+
+        {others.length > 0 && (
+          <div style={{ ...section, borderBottom: 0 }}>
+            <p style={sectionTitle}>Or one you've made already</p>
+            {others.length > 6 && (
+              <input type="search" value={find} onChange={(e) => setFind(e.target.value)} placeholder="Find a freebie" style={{ ...input, width: "100%" }} />
+            )}
+            {shown.map((f) => (
+              <div key={f.id} style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                <Photo src={f.imageUrl} size={36} />
+                <span style={{ flex: 1, minWidth: 0, fontSize: "13px" }}>
+                  <strong>{f.title}</strong>
+                  <span style={small}>
+                    {" "}
+                    · {f.stock} left{f.products.length ? ` · also with ${f.products.length} other product${f.products.length === 1 ? "" : "s"}` : ""}
+                  </span>
+                </span>
+                <s-button
+                  onClick={() => attach.submit({ intent: "attach", id: String(f.id), productIds: JSON.stringify([product.productId]) }, { method: "post" })}
+                  {...(attach.state !== "idle" && attach.formData?.get("id") === String(f.id) ? { loading: true } : {})}
+                >
+                  Add
+                </s-button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      <footer style={{ padding: "12px 18px", borderTop: "1px solid #ebebeb", background: "#fafafa" }}>
+        {error && <div style={{ color: "#b42318", marginBottom: "8px", fontSize: "13px" }}>{error}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <s-button variant="tertiary" onClick={close}>
+            Cancel
+          </s-button>
+        </div>
+      </footer>
+    </>
   );
 }
 

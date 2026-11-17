@@ -59,13 +59,18 @@ export function preloadImages(urls) {
       const img = new Image();
       active++;
       WARMING.set(u, img);
-      img.onload = img.onerror = (e) => {
-        if (e.type === "load") LOADED.add(u);
+      const done = (ok) => {
+        if (ok) LOADED.add(u);
         WARMING.delete(u);
         active--;
         next();
       };
       img.src = u;
+      // Decoded too, so showing it later doesn't wait a frame
+      img.decode().then(
+        () => done(true),
+        () => done(img.complete && img.naturalWidth > 0),
+      );
     }
   };
   next();
@@ -76,7 +81,9 @@ export function preloadImages(urls) {
 export function ProductThumb({ src, size, style, large }) {
   const [at, setAt] = useState(null); // { x, y } while hovering
   const bigSrc = large ?? (src ? largeImage(src) : null);
-  const [loaded, setLoaded] = useState(() => LOADED.has(bigSrc));
+  const [loadedHere, setLoaded] = useState(false);
+  // Already fetched (here or ahead of time): sharp from the first frame
+  const loaded = loadedHere || LOADED.has(bigSrc);
   const [failed, setFailed] = useState(false);
   const ref = useRef(null);
   const box = { ...thumb, ...(size ? { width: `${size}px`, height: `${size}px` } : {}), ...style };

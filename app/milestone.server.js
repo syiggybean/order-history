@@ -243,6 +243,29 @@ export async function saveRate(shop, rate) {
 
 const money = (n) => (n == null ? null : Math.round(n * 100) / 100);
 
+// Today's yen → dollar rate: the European Central Bank's (via Frankfurter),
+// or open.er-api.com if that's down. Neither needs a key.
+export async function liveYenRate(fetcher = fetch) {
+  const get = async (url) => {
+    const res = await fetcher(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json();
+  };
+  try {
+    const d = await get("https://api.frankfurter.app/latest?from=JPY&to=USD");
+    if (d?.rates?.USD > 0) return { rate: d.rates.USD, date: d.date ?? null, source: "European Central Bank" };
+  } catch {
+    // try the other one
+  }
+  try {
+    const d = await get("https://open.er-api.com/v6/latest/JPY");
+    if (d?.rates?.USD > 0) return { rate: d.rates.USD, date: d.time_last_update_utc ? new Date(d.time_last_update_utc).toISOString().slice(0, 10) : null, source: "ExchangeRate-API" };
+  } catch {
+    // neither answered
+  }
+  return null;
+}
+
 // Everything on "View What's Arrived", grouped by product code, with what the
 // shop has, what was created or dismissed before, and the details of the new ones
 export async function suggestions(shop, admin, { fetcher = fetch } = {}) {
@@ -285,7 +308,10 @@ export async function suggestions(shop, admin, { fetcher = fetch } = {}) {
       }),
     );
   }
-  const rate = settings.yenRate ?? null;
+  // Today's rate; the last one fetched if the rate services don't answer
+  const live = await liveYenRate(fetcher);
+  if (live) await db.milestoneSettings.update({ where: { shop }, data: { yenRate: live.rate } });
+  const rate = live?.rate ?? settings.yenRate ?? null;
   for (const x of items) {
     const retail = x.details?.retailYen ?? null;
     const wholesale = x.details?.wholesaleYen ?? x.wholesaleYen;
@@ -295,7 +321,13 @@ export async function suggestions(shop, admin, { fetcher = fetch } = {}) {
   const order = { new: 0, dismissed: 1, created: 2, inShop: 3 };
   items.sort((a, b) => order[a.status] - order[b.status] || (b.orderDay ?? "").localeCompare(a.orderDay ?? "") || a.title.localeCompare(b.title));
   await db.milestoneSettings.update({ where: { shop }, data: { lastRunAt: new Date() } });
-  return { items, yenRate: rate, checkedAt: new Date().toISOString() };
+  return {
+    items,
+    yenRate: rate,
+    rateSource: live ? live.source : rate ? "last rate fetched (the rate services didn't answer)" : null,
+    rateDate: live?.date ?? null,
+    checkedAt: new Date().toISOString(),
+  };
 }
 
 export async function dismiss(shop, msCodes, user, undo = false) {
