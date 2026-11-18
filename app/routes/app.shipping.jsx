@@ -347,7 +347,31 @@ const NEEDS = {
   packCamRelease: "settings",
 };
 
-export const action = async ({ request }) => {
+// Every Shipping action is timed: a slow or failed one is written to the
+// app's log with what it was doing (to track down errors like 502s)
+export const action = async (args) => {
+  const started = Date.now();
+  const intent = await args.request
+    .clone()
+    .formData()
+    .then((f) => String(f.get("intent") ?? "") || "?")
+    .catch(() => "?");
+  const slow = setTimeout(() => console.warn(`[shipping] still working on "${intent}" after 1 s`), 1000);
+  slow.unref?.();
+  try {
+    const result = await shippingAction(args);
+    const ms = Date.now() - started;
+    if (ms > 1000) console.warn(`[shipping] "${intent}" took ${ms} ms`);
+    return result;
+  } catch (e) {
+    if (!(e instanceof Response)) console.error(`[shipping] "${intent}" failed after ${Date.now() - started} ms:`, e?.stack ?? e);
+    throw e;
+  } finally {
+    clearTimeout(slow);
+  }
+};
+
+const shippingAction = async ({ request }) => {
   const { session, admin: realAdmin, user } = await getStaff(request);
   const form = await request.formData();
   const intent = String(form.get("intent") ?? "");

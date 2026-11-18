@@ -7,6 +7,25 @@ import { addDocumentResponseHeaders } from "./shopify.server";
 
 export const streamTimeout = 5000;
 
+// Unexpected errors in any page's loader or action: logged with the page (no
+// query string, which can hold sign-in tokens), so a 500 or 502 can be traced
+export function handleError(error, { request }) {
+  if (request.signal.aborted) return; // the person left the page
+  let path = "";
+  try {
+    path = new URL(request.url).pathname;
+  } catch {
+    // keep going
+  }
+  console.error(`[error] ${request.method} ${path}:`, error?.stack ?? error);
+}
+
+// Anything that slips past every handler: logged instead of lost
+if (!globalThis.__ohProcessLogging) {
+  globalThis.__ohProcessLogging = true;
+  process.on("unhandledRejection", (reason) => console.error("[unhandled rejection]", reason?.stack ?? reason));
+}
+
 export default async function handleRequest(
   request,
   responseStatusCode,
