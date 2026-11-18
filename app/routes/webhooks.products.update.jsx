@@ -4,6 +4,7 @@ import { productChanged } from "../shipping.server";
 import { wishProductChanged } from "../wishlist.server";
 import { productNotified } from "../catalog.server";
 import { pullProductBins } from "../bins-sync.server";
+import { productChannelsChanged } from "../channels.server";
 
 // Shopify calls this when a product is created or edited.
 // We answer right away and update the product in the background, because
@@ -21,6 +22,8 @@ export const action = async ({ request }) => {
       console.error(`[catalog] product ${productId}:`, errorMessage(e));
       return new Response(null, { status: 500 });
     }
+    // Inventory history: added to or removed from a sales channel
+    productChannelsChanged(shop, productId);
     syncProduct(shop, productId).catch((e) =>
       console.error(`[preorders] product edit ${productId}:`, errorMessage(e)),
     );

@@ -1,5 +1,6 @@
 import db from "./db.server";
 import { unauthenticated } from "./shopify.server";
+import { runChannels } from "./channels.server";
 
 // ---------------------------------------------------------------------------
 // Product and variant creations and deletions, for the inventory history.
@@ -321,6 +322,8 @@ export function runSync(shop, admin = null) {
     try {
       const client = admin ?? (await unauthenticated.admin(shop)).admin;
       const n = await syncEvents(shop, client);
+      // Sales channel changes (their own reading; a slow one doesn't hold this up)
+      runChannels(shop, client).catch(() => {});
       await db.catalogSync.upsert({ where: { shop }, create: { shop, lastRunAt: new Date() }, update: { lastRunAt: new Date(), lastError: null } });
       return n;
     } catch (e) {
@@ -436,7 +439,7 @@ async function storeEvent(shop, type, action, ev) {
 // Rows still without a product name: look again (more may be known now),
 // then ask Shopify for products that still exist
 export async function fillNames(shop, admin) {
-  const rows = await db.catalogEvent.findMany({ where: { shop, productTitle: null }, take: 500 });
+  const rows = await db.catalogEvent.findMany({ where: { shop, productTitle: null, subject: { in: ["product", "variant"] } }, take: 500 });
   const stillMissing = new Map(); // productId -> [rowIds]
   for (const r of rows) {
     const info = r.subject === "product" ? { productTitle: await productName(shop, r.subjectId) } : (await variantInfo(shop, r.subjectId)) ?? {};
@@ -513,6 +516,8 @@ export async function fillWho(shop, admin) {
   const rows = await db.catalogEvent.findMany({
     where: {
       shop,
+      // Channel rows get who only from Shopify's own entry for that change
+      subject: { in: ["product", "variant"] },
       hidden: false,
       staffName: null,
       appName: null,
@@ -997,6 +1002,9 @@ export async function catalogDetail(shop, id) {
     subject: e.subject,
     action: e.action,
     at: iso(e.occurredAt),
+    channel: e.channel,
+    earliest: iso(e.earliest),
+    channelsNow: e.subject === "channel" && e.productId ? await channelsNow(shop, e.productId) : null,
     who: e.staffName && e.appName ? `${e.staffName} · ${e.appName}` : e.staffName ?? e.appName ?? null,
     shopifyMessage: e.message,
     nameSource: e.nameSource,
@@ -1025,6 +1033,14 @@ export async function catalogDetail(shop, id) {
     likelyTitle: e.likelyTitle,
     pair: e.pairId ? await pairView(shop, e) : null,
   };
+}
+
+// The channels a product is on now, as the app last saw
+async function channelsNow(shop, productId) {
+  const on = await db.productChannel.findMany({ where: { shop, productId } });
+  if (!on.length) return [];
+  const names = await db.salesChannel.findMany({ where: { shop, publicationId: { in: on.map((o) => o.publicationId) } } });
+  return names.map((n) => n.name ?? "Unnamed channel").sort();
 }
 
 async function pairView(shop, e) {
@@ -1070,8 +1086,12 @@ const LABELS = {
   "product:deleted": "Product deleted",
   "variant:created": "Variant added",
   "variant:deleted": "Variant deleted",
+  "channel:added": "Added to sales channel",
+  "channel:removed": "Removed from sales channel",
 };
 const WHO_WAIT_MS = 10 * 60 * 1000;
+const fmtPacific = (d) =>
+  new Date(d).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" });
 
 export function catalogChange(e) {
   const variant = e.variantTitle && e.variantTitle !== "Default Title" ? e.variantTitle : null;
@@ -1088,19 +1108,31 @@ export function catalogChange(e) {
       : e.likelyTitle
         ? `Probably “${e.likelyTitle}”`
         : "A product (name not recorded)";
-  const label = LABELS[`${e.subject}:${e.action}`];
+  const isChannel = e.subject === "channel";
+  const label = isChannel
+    ? e.channel
+      ? `${e.action === "removed" ? "Removed from" : "Added to"} ${e.channel}`
+      : `${e.action === "removed" ? "Removed from" : "Added to"} a sales channel`
+    : LABELS[`${e.subject}:${e.action}`];
+  // Found by a routine check: say when it could have happened
+  const between = isChannel && e.earliest ? `Changed between ${fmtPacific(e.earliest)} and ${fmtPacific(e.occurredAt)} (found by the half-hourly check)` : null;
+  const channelNote = isChannel && !e.channel ? (e.message ? e.message : "Shopify's log doesn't say which channel") : null;
   const lookingForWho = !e.eventId && !e.staffName && !e.appName && Date.now() - e.occurredAt.getTime() < WHO_WAIT_MS;
   return {
     key: `catalog-${e.id}`,
     catalogId: e.id,
-    catalog: { subject: e.subject, action: e.action, label, recreated: Boolean(e.pairId) },
+    catalog: { subject: e.subject, action: e.action, label, recreated: Boolean(e.pairId), channel: e.channel ?? null },
     pending: false,
     at: e.occurredAt.toISOString(),
     parts: [],
     available: null,
     staff: e.staffName,
     app: e.appName,
-    who: lookingForWho ? "Checking who…" : e.staffName && e.appName ? `${e.staffName} · ${e.appName}` : e.staffName ?? e.appName ?? "Unknown",
+    who: lookingForWho
+      ? "Checking who…"
+      : e.staffName && e.appName
+        ? `${e.staffName} · ${e.appName}`
+        : e.staffName ?? e.appName ?? (isChannel && !e.eventId ? "Unknown (not in Shopify's log)" : "Unknown"),
     reason: null,
     reasonLabel: label,
     location: null,
@@ -1108,7 +1140,8 @@ export function catalogChange(e) {
     inventoryItemId: e.inventoryItemId,
     productId: e.productId,
     item,
-    note: unnamed ? e.message ?? null : null,
+    note: isChannel ? null : unnamed ? e.message ?? null : null,
+    detail: between ?? (channelNote ? `Shopify: “${channelNote}”` : null),
     variant,
     sku: e.sku,
     order: null,
@@ -1117,10 +1150,11 @@ export function catalogChange(e) {
 }
 
 // The where clause for catalog rows matching a history filter
-export function catalogWhere(shop, { productId, inventoryItemId, who, occurredAt } = {}) {
+export function catalogWhere(shop, { productId, inventoryItemId, who, occurredAt, subjects } = {}) {
   return {
     shop,
     hidden: false,
+    ...(subjects ? { subject: { in: subjects } } : {}),
     ...(productId ? { productId } : {}),
     ...(inventoryItemId ? { inventoryItemId } : {}),
     ...(who ? { appName: who.app ?? null, staffName: who.staff ?? null } : {}),

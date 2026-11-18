@@ -1191,9 +1191,9 @@ model PurchaseOrderEvent {
 model CatalogEvent {
   id              Int      @id @default(autoincrement())
   shop            String
-  subject         String   // "product" | "variant"
-  subjectId       String   // gid of the product or variant
-  action          String   // "created" | "deleted"
+  subject         String   // "product" | "variant" | "channel"
+  subjectId       String   // gid of the product or variant (channel rows: product|channel|time)
+  action          String   // "created" | "deleted" (channel rows: "added" | "removed")
   productId       String?
   productTitle    String?
   variantTitle    String?
@@ -1213,6 +1213,11 @@ model CatalogEvent {
   source          String   @default("webhook")
   // A variant created or deleted along with its whole product: shown as the product
   hidden          Boolean  @default(false)
+  // Channel rows: which sales channel, and (when found by a routine check
+  // rather than a product notification) the earliest it could have happened
+  channelId       String?
+  channel         String?
+  earliest        DateTime?
   occurredAt      DateTime
   createdAt       DateTime @default(now())
 
@@ -1727,4 +1732,35 @@ model MilestoneDetail {
   fetchedAt DateTime @default(now())
 
   @@unique([shop, msCode])
+}
+
+// Sales channels (Online Store, Shop, POS…) each product is on, so the
+// inventory history can show products added to or removed from a channel
+model SalesChannel {
+  shop          String
+  publicationId String
+  name          String?
+  baselineAt    DateTime? // first full read of its products (changes count from here)
+  sweptAt       DateTime? // last full read
+  goneAt        DateTime? // no longer in Shopify
+  @@id([shop, publicationId])
+}
+
+// One row per product currently on a channel (absent = not on it)
+model ProductChannel {
+  shop          String
+  productId     String
+  publicationId String
+  since         DateTime  @default(now())
+  @@id([shop, productId, publicationId])
+  @@index([shop, publicationId])
+}
+
+model ChannelSync {
+  shop           String    @id
+  eventsCursor   String?   // newest published/unpublished event read
+  scopeOk        Boolean?  // the app may read sales channels (read_publications)
+  scopeCheckedAt DateTime?
+  lastSweepAt    DateTime?
+  lastError      String?
 }

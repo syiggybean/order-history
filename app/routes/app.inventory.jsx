@@ -7,6 +7,7 @@ import { getSyncStatus, kick, setPaused } from "../inventory-sync.server";
 import { KIND_OPTIONS, SINCE_OPTIONS, itemName, listChanges, whoItems, whoSummary } from "../inventory-history.server";
 import { UndoError, listUndos, previewUndo, undoChange } from "../inventory-undo.server";
 import { catalogDetail, kickCatalog } from "../catalog.server";
+import { channelStatus } from "../channels.server";
 
 const PAGE_SIZE = 10;
 
@@ -22,11 +23,12 @@ export const loader = async ({ request }) => {
   kick(shop); // make sure the sync is running (e.g. right after a deploy)
   kickCatalog(shop); // products/variants created or deleted (who, and past ones)
 
-  const [status, recent, who, undos] = await Promise.all([
+  const [status, recent, who, undos, channels] = await Promise.all([
     getSyncStatus(shop),
     listChanges(shop, { kind }, { page: 1, pageSize: PAGE_SIZE }),
     whoSummary(shop, sinceKey),
     listUndos(shop, { page: 1, pageSize: PAGE_SIZE }),
+    channelStatus(shop).catch(() => ({ state: "starting" })),
   ]);
   const sinceOptions = Object.entries(SINCE_OPTIONS).map(([value, o]) => ({ value, label: o.label }));
   return {
@@ -40,6 +42,7 @@ export const loader = async ({ request }) => {
     sinceOptions,
     isAdmin: Boolean(user?.isAdmin),
     canUndo: can(user, "inventory", "undo"),
+    channels,
   };
 };
 
@@ -219,7 +222,13 @@ function CatalogPanel({ id, onItem, onClose }) {
             Close
           </button>
         </div>
-        {field(deletedNow ? "Deleted" : "Created", `${fmtTime(d.at)}${d.who ? ` by ${d.who}` : ""}`)}
+        {d.subject === "channel"
+          ? field(
+              d.action === "removed" ? "Removed from" : "Added to",
+              `${d.channel ?? "a sales channel (Shopify's log doesn't say which)"} · ${d.earliest ? `between ${fmtTime(d.earliest)} and ${fmtTime(d.at)}` : fmtTime(d.at)}${d.who ? ` by ${d.who}` : ""}`,
+            )
+          : field(deletedNow ? "Deleted" : "Created", `${fmtTime(d.at)}${d.who ? ` by ${d.who}` : ""}`)}
+        {d.channelsNow && field("On now", d.channelsNow.length ? d.channelsNow.join(", ") : "No sales channels")}
         {field("SKU", d.subject === "variant" ? d.sku : null)}
         {p && field("Vendor", p.vendor)}
         {p && field("Type", p.productType)}
@@ -316,8 +325,58 @@ function CatalogPanel({ id, onItem, onClose }) {
   );
 }
 
+// What the channel list can and can't show yet
+function ChannelNote({ channels }) {
+  const box = { marginBottom: "10px" };
+  if (channels?.state === "noScope")
+    return (
+      <div style={box}>
+        <s-banner tone="warning" heading="Which channel isn't known yet">
+          <s-paragraph>
+            The app needs permission to read sales channels (read_publications). Until then this list comes only from Shopify&apos;s log: who
+            and when, but usually not which channel.
+          </s-paragraph>
+        </s-banner>
+      </div>
+    );
+  if (channels?.state === "starting")
+    return (
+      <div style={box}>
+        <s-banner tone="info">
+          <s-paragraph>Reading which channels each product is on. Changes are tracked from the end of that first read.</s-paragraph>
+        </s-banner>
+      </div>
+    );
+  return (
+    <div style={{ ...muted, fontSize: "12px", marginBottom: "8px" }}>
+      Channels are compared after every product edit and checked fully every half hour
+      {channels?.since ? `, since ${fmtTime(channels.since)}` : ""}. Earlier entries come from Shopify&apos;s log.
+    </div>
+  );
+}
+
 // Product or variant created / deleted
 function CatalogTag({ catalog }) {
+  if (catalog.subject === "channel") {
+    const removed = catalog.action === "removed";
+    return (
+      <span
+        title={catalog.label}
+        style={{
+          display: "inline-block",
+          padding: "1px 8px",
+          borderRadius: "8px",
+          fontSize: "12px",
+          fontWeight: 600,
+          whiteSpace: "nowrap",
+          background: removed ? "#fff1d6" : "#e0f0ff",
+          color: removed ? "#7a4f01" : "#0b4a8b",
+        }}
+      >
+        {removed ? "Off channel" : "On channel"}
+      </span>
+    );
+  }
   const deleted = catalog.action === "deleted";
   return (
     <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "flex-start" }}>
@@ -516,6 +575,7 @@ function ChangesTable({
               )}
               {c.sku && <div style={{ ...muted, fontSize: "12px" }}>{c.sku}</div>}
               {c.note && <div style={{ ...muted, fontSize: "12px" }}>Shopify: “{c.note}”</div>}
+              {c.detail && <div style={{ ...muted, fontSize: "12px" }}>{c.detail}</div>}
             </td>
           )}
           <td style={cell}>
@@ -770,7 +830,7 @@ export default function InventoryHistory() {
 }
 
 function InventoryHistoryPage() {
-  const { status, recent, kind, kindOptions, who, undos, since, sinceOptions, isAdmin, canUndo } = useLoaderData();
+  const { status, recent, kind, kindOptions, who, undos, since, sinceOptions, isAdmin, canUndo, channels } = useLoaderData();
   const setParam = (name, value, fallback) =>
     setSearchParams(
       (p) => {
@@ -892,6 +952,7 @@ function InventoryHistoryPage() {
           </select>
           {navigation.state === "loading" && <span style={muted}>Loading…</span>}
         </div>
+        {(kind === "channels" || kind === "channelsRemoved") && <ChannelNote channels={channels} />}
         {recentList.changes.length === 0 && kind !== "all" ? (
           <s-paragraph>No changes of this kind yet.</s-paragraph>
         ) : (

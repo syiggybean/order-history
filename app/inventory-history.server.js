@@ -88,6 +88,8 @@ export const KIND_OPTIONS = {
   catalogCreated: { label: "Products/variants created" },
   catalogDeleted: { label: "Products/variants deleted" },
   catalogRecreated: { label: "Products deleted and re-created" },
+  channels: { label: "Sales channel changes" },
+  channelsRemoved: { label: "Removed from a sales channel" },
 };
 
 function kindWhere(kind) {
@@ -335,10 +337,24 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
 
   // Products and variants created or deleted live in their own table.
   // "All activity" shows them mixed in by time; their own filter shows only them.
-  const catWhere = catalogWhere(shop, { productId: filter.productId, inventoryItemId: filter.inventoryItemId, who: filter.who, occurredAt: time.occurredAt });
-  const CATALOG_KINDS = { catalog: null, catalogCreated: "created", catalogDeleted: "deleted", catalogRecreated: null };
+  // Sales channel changes live there too (subject "channel")
+  const CATALOG_KINDS = {
+    catalog: [null, ["product", "variant"]],
+    catalogCreated: ["created", ["product", "variant"]],
+    catalogDeleted: ["deleted", ["product", "variant"]],
+    catalogRecreated: [null, ["product"]],
+    channels: [null, ["channel"]],
+    channelsRemoved: ["removed", ["channel"]],
+  };
+  const catWhere = catalogWhere(shop, {
+    productId: filter.productId,
+    inventoryItemId: filter.inventoryItemId,
+    who: filter.who,
+    occurredAt: time.occurredAt,
+    subjects: CATALOG_KINDS[filter.kind]?.[1],
+  });
   if (filter.kind in CATALOG_KINDS) {
-    if (CATALOG_KINDS[filter.kind]) catWhere.action = CATALOG_KINDS[filter.kind];
+    if (CATALOG_KINDS[filter.kind][0]) catWhere.action = CATALOG_KINDS[filter.kind][0];
     if (filter.kind === "catalogRecreated") catWhere.pairId = { not: null };
     const rows = await db.catalogEvent.findMany({ where: catWhere, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], skip, take: pageSize + 1 });
     return { changes: rows.slice(0, pageSize).map(catalogChange), hasMore: rows.length > pageSize };

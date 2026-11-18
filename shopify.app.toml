@@ -6,7 +6,7 @@ embedded = true
 name = "order-history"
 
 [access_scopes]
-scopes = "read_orders,read_customers,read_all_orders"
+scopes = "read_orders,read_customers,read_all_orders,read_publications"
 
 [app_proxy]
 url = "https://order-history-production.up.railway.app/proxy/purchase-history"
