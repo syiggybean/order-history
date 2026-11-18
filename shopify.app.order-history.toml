@@ -37,7 +37,7 @@ topics = [ "orders/updated" ]
 uri = "/webhooks/orders/updated"
 
 [access_scopes]
-scopes = "read_orders,write_orders,read_customers,write_customers,read_all_orders,read_products,write_products,read_shipping,write_shipping,read_inventory,write_inventory,read_reports,read_locations,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_discounts,write_discounts"
+scopes = "read_orders,write_orders,read_customers,write_customers,read_all_orders,read_products,write_products,read_shipping,write_shipping,read_inventory,write_inventory,read_reports,read_locations,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_discounts,write_discounts,read_publications"
 
 [app_proxy]
 url = "https://order-history-production.up.railway.app/proxy/purchase-history"
