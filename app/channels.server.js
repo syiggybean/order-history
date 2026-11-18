@@ -63,7 +63,9 @@ const SCOPES = `#graphql
 
 async function canReadChannels(shop, admin) {
   const s = await db.channelSync.upsert({ where: { shop }, create: { shop }, update: {} });
-  if (s.scopeOk != null && s.scopeCheckedAt && Date.now() - s.scopeCheckedAt.getTime() < SCOPE_RECHECK_MS) return s.scopeOk;
+  // Not allowed yet: look again soon, so approving it takes effect within minutes
+  const wait = s.scopeOk ? SCOPE_RECHECK_MS : 3 * 60 * 1000;
+  if (s.scopeOk != null && s.scopeCheckedAt && Date.now() - s.scopeCheckedAt.getTime() < wait) return s.scopeOk;
   let ok = false;
   try {
     const data = await gql(admin, SCOPES, {});
