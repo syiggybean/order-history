@@ -353,6 +353,15 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
     occurredAt: time.occurredAt,
     subjects: CATALOG_KINDS[filter.kind]?.[1],
   });
+  // One item's history: its product's sales channel changes belong there too
+  // (they're recorded for the whole product, not each variant)
+  if (filter.inventoryItemId && !filter.productId) {
+    const info = await db.inventoryItemInfo.findFirst({ where: { shop, inventoryItemId: filter.inventoryItemId } });
+    if (info?.productId) {
+      delete catWhere.inventoryItemId;
+      catWhere.OR = [{ inventoryItemId: filter.inventoryItemId }, { subject: "channel", productId: info.productId }];
+    }
+  }
   if (filter.kind in CATALOG_KINDS) {
     if (CATALOG_KINDS[filter.kind][0]) catWhere.action = CATALOG_KINDS[filter.kind][0];
     if (filter.kind === "catalogRecreated") catWhere.pairId = { not: null };

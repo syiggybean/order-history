@@ -390,18 +390,33 @@ export function syncEvents(shop, admin) {
   return serial(shop, () => syncEventsNow(shop, admin));
 }
 
+// Where reading Shopify's log got to, separately for each kind of entry
+// (bumping VERSION reads the past year again; entries already stored are skipped)
+const CURSOR_VERSION = 2;
+function readCursors(raw) {
+  try {
+    const c = JSON.parse(raw ?? "");
+    if (c && typeof c === "object" && c.v === CURSOR_VERSION) return c;
+  } catch {
+    // older single date: read again
+  }
+  return { v: CURSOR_VERSION };
+}
+
 async function syncEventsNow(shop, admin) {
-  const s = await db.channelSync.upsert({ where: { shop }, create: { shop }, update: {} });
-  const from = s.eventsCursor
-    ? new Date(new Date(s.eventsCursor).getTime() - 2 * 60 * 1000).toISOString()
-    : new Date(Date.now() - BACKFILL_DAYS * 24 * 3600 * 1000).toISOString();
-  let newest = s.eventsCursor ?? null;
+  await db.channelSync.upsert({ where: { shop }, create: { shop }, update: {} });
+  const yearAgo = new Date(Date.now() - BACKFILL_DAYS * 24 * 3600 * 1000).toISOString();
   let stored = 0;
   const channels = await db.salesChannel.findMany({ where: { shop } });
   for (const verb of ["published", "unpublished"]) {
+    const cursors = readCursors((await db.channelSync.findUnique({ where: { shop } }))?.eventsCursor);
+    const from = cursors[verb] ? new Date(new Date(cursors[verb]).getTime() - 2 * 60 * 1000).toISOString() : yearAgo;
     const q = `subject_type:PRODUCT action:${verb} created_at:>='${from}'`;
     let after = null;
-    for (let page = 0; page < 200; page++) {
+    let newest = cursors[verb] ?? null;
+    // A lot to read (a year of every product added to every channel): keep
+    // going on later runs from where this one stopped
+    for (let page = 0; page < 50; page++) {
       const data = await gql(admin, EVENTS, { q, after });
       const conn = data?.events;
       for (const ev of conn?.nodes ?? []) {
@@ -409,11 +424,14 @@ async function syncEventsNow(shop, admin) {
         if (await storeEvent(shop, admin, verb, ev, channels)) stored++;
         if (!newest || ev.createdAt > newest) newest = ev.createdAt;
       }
+      if (newest) {
+        const now = readCursors((await db.channelSync.findUnique({ where: { shop } }))?.eventsCursor);
+        await db.channelSync.update({ where: { shop }, data: { eventsCursor: JSON.stringify({ ...now, [verb]: newest }) } });
+      }
       if (!conn?.pageInfo?.hasNextPage) break;
       after = conn.pageInfo.endCursor;
     }
   }
-  if (newest) await db.channelSync.update({ where: { shop }, data: { eventsCursor: newest } });
   // Rows from the log without a channel: Shopify's wording usually names it
   const unnamed = await db.catalogEvent.findMany({ where: { shop, subject: SUBJECT, channel: null, message: { not: null } }, take: 2000 });
   for (const r of unnamed) {
