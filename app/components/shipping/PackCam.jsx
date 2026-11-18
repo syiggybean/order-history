@@ -14,13 +14,23 @@ const btn = { appearance: "none", border: "1px solid #c9c9c9", background: "#fff
 const linkBtn = { ...btn, border: 0, color: "#005bd3", padding: 0, background: "none" };
 const mb = (n) => `${(n / 1024 / 1024).toFixed(1)} MB`;
 
-// Opens packcam:// links without leaving the page (does nothing if Pack Cam isn't installed)
-// (browsers only allow this straight after a click)
+// Opens packcam:// links without leaving the page (does nothing if Pack Cam isn't installed).
+// Only straight after a click. Inside Shopify admin MonkeyBean runs in a frame that
+// can't open another app itself (Chrome replaces the frame with "This content is
+// blocked"), so the link goes to the whole window: the browser asks to open Pack
+// Cam and the page stays where it is.
 export function openPackCam(url) {
   if (!url) return;
   const a = document.createElement("a");
   a.href = url;
   a.rel = "noopener";
+  let framed = true;
+  try {
+    framed = window.top !== window.self;
+  } catch {
+    // Cross-origin parent: framed
+  }
+  if (framed) a.target = "_top";
   a.style.display = "none";
   document.body.appendChild(a);
   a.click();
@@ -58,8 +68,8 @@ function usePairCode(stationId) {
   };
   const d = f.data?.intent === "packCamPairCode" && f.data.stationId === Number(stationId) ? f.data : null;
   useEffect(() => {
-    // Best effort: some browsers only open apps straight after a click, so the code also has its own button
-    if (d?.ok && d.url && open.current) openPackCam(d.url);
+    // Not opened by itself: the code arrives after the click, and browsers only
+    // let a page open another app straight after one ("Open Pack Cam" does that)
     open.current = false;
   }, [d?.code, d?.ok, d?.url]);
   return { get, code: d?.ok ? d : null, error: d?.error ?? null, busy: f.state !== "idle" };
@@ -72,8 +82,8 @@ function PairCode({ pair, station }) {
     <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", alignItems: "center", padding: "10px 12px", background: "#f4f8ff", border: "1px solid #c9d8f5", borderRadius: "8px", marginTop: "8px" }}>
       <span style={{ fontSize: "26px", fontWeight: 700, letterSpacing: "4px", fontVariantNumeric: "tabular-nums" }}>{pair.code.code}</span>
       <span style={{ fontSize: "13px", flex: "1 1 240px" }}>
-        Pack Cam should open and connect to <strong>{station}</strong> by itself. If it doesn't, open Pack Cam on that Mac and enter this code. It works once, for {left} more
-        minute{left === 1 ? "" : "s"}.
+        On the packing Mac, click <strong>Open Pack Cam</strong> to connect it to <strong>{station}</strong>, or open Pack Cam there and enter this code. It works once, for{" "}
+        {left} more minute{left === 1 ? "" : "s"}.
       </span>
       <button type="button" style={btn} onClick={() => openPackCam(pair.code.url)}>
         Open Pack Cam
