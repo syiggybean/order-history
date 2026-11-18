@@ -1218,6 +1218,7 @@ model CatalogEvent {
   channelId       String?
   channel         String?
   earliest        DateTime?
+  alertedAt       DateTime? // emailed (channel removals)
   occurredAt      DateTime
   createdAt       DateTime @default(now())
 
@@ -1763,4 +1764,14 @@ model ChannelSync {
   scopeCheckedAt DateTime?
   lastSweepAt    DateTime?
   lastError      String?
+}
+
+// Emails when products are taken off a sales channel
+model ChannelAlertSettings {
+  shop       String    @id
+  enabled    Boolean   @default(true)
+  recipients String    // comma-separated
+  startedAt  DateTime  @default(now()) // removals noticed from here on are emailed
+  lastSentAt DateTime?
+  lastError  String?
 }

@@ -8,6 +8,7 @@ import { KIND_OPTIONS, SINCE_OPTIONS, itemName, listChanges, whoItems, whoSummar
 import { UndoError, listUndos, previewUndo, undoChange } from "../inventory-undo.server";
 import { catalogDetail, kickCatalog } from "../catalog.server";
 import { channelStatus } from "../channels.server";
+import { getAlertSettings, saveAlertSettings, view as alertView } from "../channel-alerts.server";
 
 const PAGE_SIZE = 10;
 
@@ -23,12 +24,13 @@ export const loader = async ({ request }) => {
   kick(shop); // make sure the sync is running (e.g. right after a deploy)
   kickCatalog(shop); // products/variants created or deleted (who, and past ones)
 
-  const [status, recent, who, undos, channels] = await Promise.all([
+  const [status, recent, who, undos, channels, channelAlerts] = await Promise.all([
     getSyncStatus(shop),
     listChanges(shop, { kind }, { page: 1, pageSize: PAGE_SIZE }),
     whoSummary(shop, sinceKey),
     listUndos(shop, { page: 1, pageSize: PAGE_SIZE }),
     channelStatus(shop).catch(() => ({ state: "starting" })),
+    getAlertSettings(shop).then(alertView).catch(() => null),
   ]);
   const sinceOptions = Object.entries(SINCE_OPTIONS).map(([value, o]) => ({ value, label: o.label }));
   return {
@@ -43,6 +45,7 @@ export const loader = async ({ request }) => {
     isAdmin: Boolean(user?.isAdmin),
     canUndo: can(user, "inventory", "undo"),
     channels,
+    channelAlerts,
   };
 };
 
@@ -74,6 +77,10 @@ export const action = async ({ request }) => {
       console.error("Undo failed:", e);
       return { intent, key, error: "Something went wrong. Please try again." };
     }
+  }
+  if (intent === "channelAlerts") {
+    if (!user?.isAdmin) return { intent, error: "Only app admins can change who gets these emails." };
+    return { intent, ...(await saveAlertSettings(shop, { enabled: form.get("enabled") === "on", recipients: String(form.get("recipients") ?? "") })) };
   }
   if (intent === "undos") {
     return { intent, ...(await listUndos(shop, { page, pageSize: PAGE_SIZE })) };
@@ -351,6 +358,51 @@ function ChannelNote({ channels }) {
     <div style={{ ...muted, fontSize: "12px", marginBottom: "8px" }}>
       Channels are compared after every product edit and checked fully every half hour
       {channels?.since ? `, since ${fmtTime(channels.since)}` : ""}. Earlier entries come from Shopify&apos;s log.
+    </div>
+  );
+}
+
+// Who gets an email when products are taken off a channel
+function ChannelAlerts({ settings, isAdmin }) {
+  const fetcher = useFetcher();
+  const [open, setOpen] = useState(false);
+  if (!settings) return null;
+  const saved = fetcher.data?.intent === "channelAlerts" && fetcher.data.ok ? fetcher.data.settings : null;
+  const s = saved ?? settings;
+  const error = fetcher.data?.intent === "channelAlerts" ? fetcher.data.error : null;
+  const summary = s.enabled ? `Emails go to ${s.recipients} when products are removed from a channel.` : "Emails about removed products are off.";
+  return (
+    <div style={{ marginBottom: "10px", padding: "8px 12px", border: "1px solid #e3e3e3", borderRadius: "8px", fontSize: "13px" }}>
+      <div style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}>
+        <span>{summary}</span>
+        {s.lastSentAt && <span style={muted}>Last sent {fmtTime(s.lastSentAt)}.</span>}
+        {isAdmin && (
+          <button type="button" style={linkBtn} onClick={() => setOpen(!open)}>
+            {open ? "Close" : "Change"}
+          </button>
+        )}
+      </div>
+      {!s.mailReady && <div style={{ color: "#8e1f0b", marginTop: "4px" }}>Email isn&apos;t set up in Railway, so nothing can be sent.</div>}
+      {s.lastError && <div style={{ color: "#8e1f0b", marginTop: "4px" }}>The last email didn&apos;t send: {s.lastError}. It will try again.</div>}
+      {open && isAdmin && (
+        <fetcher.Form method="post" style={{ display: "grid", gap: "6px", marginTop: "8px", maxWidth: "520px" }}>
+          <input type="hidden" name="intent" value="channelAlerts" />
+          <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <input type="checkbox" name="enabled" defaultChecked={s.enabled} /> Email when products are removed from a sales channel
+          </label>
+          <label style={muted} htmlFor="alert-recipients">
+            Send to (separate addresses with commas)
+          </label>
+          <input id="alert-recipients" name="recipients" defaultValue={s.recipients} style={{ ...selectStyle, width: "100%" }} />
+          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <s-button type="submit" {...(fetcher.state !== "idle" ? { loading: true } : {})}>
+              Save
+            </s-button>
+            {saved && <span style={{ color: "#1a5e20" }}>Saved</span>}
+            {error && <span style={{ color: "#8e1f0b" }}>{error}</span>}
+          </div>
+        </fetcher.Form>
+      )}
     </div>
   );
 }
@@ -830,7 +882,7 @@ export default function InventoryHistory() {
 }
 
 function InventoryHistoryPage() {
-  const { status, recent, kind, kindOptions, who, undos, since, sinceOptions, isAdmin, canUndo, channels } = useLoaderData();
+  const { status, recent, kind, kindOptions, who, undos, since, sinceOptions, isAdmin, canUndo, channels, channelAlerts } = useLoaderData();
   const setParam = (name, value, fallback) =>
     setSearchParams(
       (p) => {
@@ -952,7 +1004,12 @@ function InventoryHistoryPage() {
           </select>
           {navigation.state === "loading" && <span style={muted}>Loading…</span>}
         </div>
-        {(kind === "channels" || kind === "channelsRemoved") && <ChannelNote channels={channels} />}
+        {(kind === "channels" || kind === "channelsRemoved") && (
+          <>
+            <ChannelNote channels={channels} />
+            <ChannelAlerts settings={channelAlerts} isAdmin={isAdmin} />
+          </>
+        )}
         {recentList.changes.length === 0 && kind !== "all" ? (
           <s-paragraph>No changes of this kind yet.</s-paragraph>
         ) : (
