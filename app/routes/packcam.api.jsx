@@ -9,6 +9,7 @@ import {
   packCamScan,
   packCamStation,
   packCamState,
+  packCamStopRecording,
   packCamUploadDone,
   packCamUploadProgress,
   packCamUploadStart,
@@ -19,6 +20,7 @@ import {
 //   pair            { shop, code, host, version }       → { key, station }
 //   state           { info, version, host }             → the open box (polled about once a second)
 //   scan            { code, via }
+//   stopRecording   { shipmentId }                      → that box's recording is thrown away and not restarted
 //   uploadStart     { shipmentId, mimeType, seconds, startedAt, endedAt, clientNow, sizeBytes, videoId? } → { videoId, uploadUrl }
 //   uploadProgress  { videoId, sentBytes }
 //   uploadDone      { videoId, driveFileId, sizeBytes, md5, error? } → { verified }: only then may the Mac clear its copy
@@ -45,6 +47,7 @@ export const action = async ({ request }) => {
     const origin = appUrl(request);
     if (intent === "state") return json(await packCamState(st, body));
     if (intent === "scan") return json(await packCamScan(st, body));
+    if (intent === "stopRecording") return json(await packCamStopRecording(st, body));
     if (intent === "uploadStart") return json(await packCamUploadStart(st, body));
     if (intent === "uploadProgress") return json(await packCamUploadProgress(st, body));
     if (intent === "uploadDone") return json(await packCamUploadDone(st, body));

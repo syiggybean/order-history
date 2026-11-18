@@ -157,8 +157,43 @@ export async function packCamState(st, { info = null, version = null, host = nul
   const clipWaiting = (await db.packClip.count({ where: { shop: st.shop, status: "queued" } })) > 0;
   const station = { id: st.id, name: st.name };
   const link = await stationLink(st);
-  if (!link) return { ok: true, idle: true, station, box: null, batch: null, update, clipWaiting, recording: !driveSetupProblem(), driveProblem: driveSetupProblem() };
-  return { ...(await cameraState(link, { info })), station, idle: false, update, clipWaiting };
+  if (!link) return { ok: true, idle: true, station, box: null, batch: null, update, clipWaiting, recording: !driveSetupProblem(), driveProblem: driveSetupProblem(), stopShipmentId: null };
+  const state = await cameraState(link, { info });
+  return { ...state, station, idle: false, update, clipWaiting, stopShipmentId: await stoppedFor(st, state.box?.id ?? null) };
+}
+
+// ---------------------------------------------------------------------------
+// Stopping a recording by hand (Pack Cam's button or the pack bench's): the
+// video is thrown away and that box isn't recorded again until another opens
+// ---------------------------------------------------------------------------
+
+// The box whose recording was stopped, while it's still the open one
+async function stoppedFor(st, openBoxId) {
+  if (!st.packCamStopShipmentId) return null;
+  if (st.packCamStopShipmentId === openBoxId) return openBoxId;
+  // Another box (or none) is open now: the stop is over
+  await db.printStation.update({ where: { id: st.id }, data: { packCamStopShipmentId: null, packCamStopAt: null } });
+  return null;
+}
+
+async function stopBox(stationId, shipmentId) {
+  const id = Number(shipmentId);
+  if (!Number.isInteger(id) || id <= 0) throw new PackCamError("No box is open.");
+  await db.printStation.update({ where: { id: stationId }, data: { packCamStopShipmentId: id, packCamStopAt: new Date() } });
+  return { ok: true, stopShipmentId: id };
+}
+
+// Pack Cam's own Stop button
+export async function packCamStopRecording(st, { shipmentId } = {}) {
+  await seen(st);
+  return stopBox(st.id, shipmentId);
+}
+
+// The pack bench's Stop button, for the box open there
+export async function benchStopRecording(shop, stationId, shipmentId) {
+  const st = await db.printStation.findFirst({ where: { id: Number(stationId), shop } });
+  if (!st || !st.packCamKeyHash) throw new PackCamError("Pack Cam isn't connected on this packing computer.");
+  return stopBox(st.id, shipmentId);
 }
 
 export async function packCamScan(st, body) {
@@ -226,6 +261,8 @@ export async function packCamStatus(shop, stationId) {
     camera: st.packCamInfo,
     seenAt: st.packCamSeenAt?.toISOString() ?? null,
     latest,
+    // A box whose recording was stopped by hand (the bench shows "Recording stopped")
+    stoppedShipmentId: st.packCamStopShipmentId ?? null,
     // packcam:// opens (or relaunches) the app when it's installed; the browser ignores it otherwise
     launchUrl: st.packCamKeyHash ? "packcam://open" : null,
   };

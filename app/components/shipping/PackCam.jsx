@@ -58,45 +58,29 @@ function useDownload() {
   return { start, busy: f.state !== "idle", error: f.data?.intent === "packCamDownload" ? f.data.error : null };
 }
 
-// The one-time code to connect a Mac to a packing computer (also opens Pack Cam to it)
-function usePairCode(stationId) {
+// A ready-made link that opens Pack Cam already connected to this bench's
+// packing computer (packcam://connect with a one-time code). Fetched ahead of
+// time, because browsers only let a page open another app straight after a
+// click. Codes last 15 minutes, so it's renewed every 10.
+function useConnectLink(stationId, wanted) {
   const f = useFetcher();
-  const open = useRef(false);
-  const get = (andOpen = true) => {
-    open.current = andOpen;
-    f.submit({ intent: "packCamPairCode", stationId: String(stationId) }, { method: "post" });
-  };
-  const d = f.data?.intent === "packCamPairCode" && f.data.stationId === Number(stationId) ? f.data : null;
+  const submit = useRef(f.submit);
+  submit.current = f.submit;
   useEffect(() => {
-    // Not opened by itself: the code arrives after the click, and browsers only
-    // let a page open another app straight after one ("Open Pack Cam" does that)
-    open.current = false;
-  }, [d?.code, d?.ok, d?.url]);
-  return { get, code: d?.ok ? d : null, error: d?.error ?? null, busy: f.state !== "idle" };
-}
-
-function PairCode({ pair, station }) {
-  if (!pair.code) return null;
-  const left = Math.max(0, Math.round((Date.parse(pair.code.expiresAt) - Date.now()) / 60000));
-  return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", alignItems: "center", padding: "10px 12px", background: "#f4f8ff", border: "1px solid #c9d8f5", borderRadius: "8px", marginTop: "8px" }}>
-      <span style={{ fontSize: "26px", fontWeight: 700, letterSpacing: "4px", fontVariantNumeric: "tabular-nums" }}>{pair.code.code}</span>
-      <span style={{ fontSize: "13px", flex: "1 1 240px" }}>
-        On the packing Mac, click <strong>Open Pack Cam</strong> to connect it to <strong>{station}</strong>, or open Pack Cam there and enter this code. It works once, for{" "}
-        {left} more minute{left === 1 ? "" : "s"}.
-      </span>
-      <button type="button" style={btn} onClick={() => openPackCam(pair.code.url)}>
-        Open Pack Cam
-      </button>
-    </div>
-  );
+    if (!wanted || !stationId) return undefined;
+    const ask = () => submit.current({ intent: "packCamPairCode", stationId: String(stationId) }, { method: "post" });
+    ask();
+    const t = setInterval(ask, 10 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [stationId, wanted]);
+  const d = f.data?.intent === "packCamPairCode" && f.data.stationId === Number(stationId) ? f.data : null;
+  return { url: d?.ok ? d.url : null, code: d?.ok ? d.code : null, error: d?.error ?? null };
 }
 
 // ---- Settings: one packing computer's Pack Cam ------------------------------
 
 export function PackCamStationRow({ st, canSettings, latest }) {
   const pc = st.packCam ?? {};
-  const pair = usePairCode(st.id);
   const forget = useFetcher();
   const [confirm, setConfirm] = useState(false);
   const outdated = Boolean(latest && pc.version && isOlder(pc.version, latest.version));
@@ -112,9 +96,7 @@ export function PackCamStationRow({ st, canSettings, latest }) {
         <span style={{ color: status.color }}>● {status.text}</span>
         {pc.paired && (pc.host || pc.camera) && <span style={small}>{[pc.host, pc.camera].filter(Boolean).join(" · ")}</span>}
         <span style={{ flex: 1 }} />
-        <button type="button" style={btn} onClick={() => pair.get(true)} disabled={pair.busy}>
-          {pc.paired ? "Reconnect…" : "Connect this Mac"}
-        </button>
+        {!pc.paired && <span style={small}>Connects from the pack bench on that Mac (Open Pack Cam).</span>}
         {canSettings &&
           pc.paired &&
           (confirm ? (
@@ -139,10 +121,9 @@ export function PackCamStationRow({ st, canSettings, latest }) {
               Disconnect
             </button>
           ))}
-        {(pair.error || forget.data?.error) && <span style={{ color: "#b42318" }}>{pair.error || forget.data.error}</span>}
+        {forget.data?.error && <span style={{ color: "#b42318" }}>{forget.data.error}</span>}
         {forget.data?.ok && !pc.paired && <span style={small}>Disconnected.</span>}
       </div>
-      <PairCode pair={pair} station={st.name} />
     </div>
   );
 }
@@ -243,10 +224,16 @@ export function usePackCamStatus(stationId, enabled = true) {
   return status;
 }
 
-// What the bench offers when Pack Cam isn't recording here
+// What the bench offers when Pack Cam isn't recording here: one "Open Pack Cam"
+// button that opens it (connecting this bench's computer if it isn't yet). If
+// Pack Cam doesn't answer soon after, it's probably not installed (or broken),
+// so installing it becomes the main choice.
+const GIVE_UP_MS = 15_000;
+
 export function PackCamPrompt({ status, usingBuiltIn, onBuiltIn }) {
   const dl = useDownload();
-  const pair = usePairCode(status?.station?.id);
+  const unpaired = status?.state === "notInstalled";
+  const link = useConnectLink(status?.station?.id, Boolean(status) && unpaired);
   const [dismissed, setDismissed] = useState(() => {
     try {
       return localStorage.getItem(DISMISS) === "1";
@@ -254,7 +241,14 @@ export function PackCamPrompt({ status, usingBuiltIn, onBuiltIn }) {
       return false;
     }
   });
-  const [tried, setTried] = useState(0);
+  const [tried, setTried] = useState(null); // when "Open Pack Cam" was last clicked
+  const [now, setNow] = useState(() => Date.now());
+  const [showCode, setShowCode] = useState(false);
+  useEffect(() => {
+    if (!tried) return undefined;
+    const t = setTimeout(() => setNow(Date.now()), GIVE_UP_MS + 200);
+    return () => clearTimeout(t);
+  }, [tried]);
   if (!status || status.state === "none" || status.state === "ready" || dismissed) return null;
   const hasInstaller = Boolean(status.latest);
   const dismiss = () => {
@@ -266,14 +260,24 @@ export function PackCamPrompt({ status, usingBuiltIn, onBuiltIn }) {
     setDismissed(true);
   };
   const where = status.station?.name ?? "this computer";
+  const openUrl = unpaired ? link.url : status.launchUrl;
+  const noAnswer = Boolean(tried && now - tried >= GIVE_UP_MS);
+  const open = () => {
+    if (!openUrl) return;
+    openPackCam(openUrl);
+    setTried(Date.now());
+    setNow(Date.now());
+  };
   const msg =
-    status.state === "notInstalled"
-      ? `Pack Cam isn't set up on ${where}.`
-      : status.state === "outdated"
-        ? `Pack Cam on ${where} is out of date (${status.version}; ${status.latest?.version} is available).`
+    status.state === "outdated"
+      ? `Pack Cam on ${where} is out of date (${status.version}; ${status.latest?.version} is available).`
+      : noAnswer
+        ? `Pack Cam didn't open on ${where}. It may not be installed, or it needs reinstalling.`
         : tried
-          ? `Pack Cam still isn't responding on ${where}.`
+          ? "Opening Pack Cam…"
           : `Pack Cam isn't running on ${where}.`;
+  const dark = { ...btn, background: "#1a1a1a", color: "#fff", borderColor: "#1a1a1a" };
+  const installFirst = noAnswer || status.state === "outdated";
   return (
     <div
       role="region"
@@ -285,26 +289,14 @@ export function PackCamPrompt({ status, usingBuiltIn, onBuiltIn }) {
         <span style={{ color: "#5c4b00" }}>{usingBuiltIn ? "The built-in camera is recording this bench meanwhile." : "You can use the built-in camera meanwhile."}</span>
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", marginTop: "8px" }}>
-        {status.state === "notRunning" && (
-          <button
-            type="button"
-            style={btn}
-            onClick={() => {
-              openPackCam(status.launchUrl);
-              setTried((n) => n + 1);
-            }}
-          >
-            {tried ? "Try again" : "Open Pack Cam"}
+        {status.state !== "outdated" && (
+          <button type="button" style={installFirst ? btn : dark} onClick={open} disabled={!openUrl}>
+            {noAnswer ? "Try opening again" : "Open Pack Cam"}
           </button>
         )}
         {hasInstaller && (
-          <button type="button" style={status.state === "notRunning" ? btn : { ...btn, background: "#1a1a1a", color: "#fff", borderColor: "#1a1a1a" }} onClick={dl.start} disabled={dl.busy}>
-            {status.state === "notInstalled" ? "Install Pack Cam" : status.state === "outdated" ? `Update to ${status.latest.version}` : "Reinstall"}
-          </button>
-        )}
-        {status.state === "notInstalled" && hasInstaller && (
-          <button type="button" style={btn} onClick={() => pair.get(true)} disabled={pair.busy}>
-            Already installed? Connect this Mac
+          <button type="button" style={installFirst ? dark : btn} onClick={dl.start} disabled={dl.busy}>
+            {status.state === "outdated" ? `Update to ${status.latest.version}` : noAnswer ? "Install Pack Cam" : "Install or reinstall"}
           </button>
         )}
         {!usingBuiltIn && (
@@ -313,16 +305,31 @@ export function PackCamPrompt({ status, usingBuiltIn, onBuiltIn }) {
           </button>
         )}
         <span style={{ flex: 1 }} />
-        <button type="button" style={{ ...linkBtn, color: "#616161", fontSize: "12px" }} onClick={dismiss} title="This browser stops offering Pack Cam (Shipping → Settings can still connect it)">
+        <button type="button" style={{ ...linkBtn, color: "#616161", fontSize: "12px" }} onClick={dismiss} title="This browser stops offering Pack Cam">
           Don't ask again on this computer
         </button>
       </div>
-      {!hasInstaller && status.state === "notInstalled" && <div style={{ ...small, marginTop: "6px" }}>No installer has been uploaded yet (Shipping → Settings → Packing computers).</div>}
-      {status.state === "notInstalled" && hasInstaller && (
-        <div style={{ ...small, marginTop: "6px" }}>After installing, choose “Connect this Mac” so Pack Cam records this bench.</div>
+      {!hasInstaller && <div style={{ ...small, marginTop: "6px" }}>No installer has been uploaded yet (Shipping → Settings → Packing computers).</div>}
+      {noAnswer && hasInstaller && (
+        <div style={{ ...small, marginTop: "6px" }}>
+          After installing, Pack Cam opens by itself. If it asks to connect, come back here and click Open Pack Cam.
+          {unpaired && link.code && (
+            <>
+              {" "}
+              {showCode ? (
+                <>
+                  Or type this code in Pack Cam: <strong style={{ letterSpacing: "2px" }}>{link.code}</strong>
+                </>
+              ) : (
+                <button type="button" style={{ ...linkBtn, fontSize: "12px" }} onClick={() => setShowCode(true)}>
+                  Show a code to type instead
+                </button>
+              )}
+            </>
+          )}
+        </div>
       )}
-      {(dl.error || pair.error) && <div style={{ color: "#b42318", marginTop: "6px" }}>{dl.error || pair.error}</div>}
-      <PairCode pair={pair} station={where} />
+      {(dl.error || link.error) && <div style={{ color: "#b42318", marginTop: "6px" }}>{dl.error || link.error}</div>}
     </div>
   );
 }

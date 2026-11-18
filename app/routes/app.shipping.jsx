@@ -27,7 +27,7 @@ import { slipsPdf } from "../slips-pdf.server";
 import { checkShipped, createMerge, customerPlan, listMerges, mergeCandidates, saveBoxes, searchCustomers, undoMerge } from "../merge.server";
 import { MergeTab } from "../components/shipping/Merge";
 import { benchContext, benchLink, benchTakeScans, benchUnlink, pickPhoneLink, videosFor } from "../camera.server";
-import { PackCamError, currentRelease, listReleases, packCamForget, packCamPairCode, packCamStatus, releaseDownloadUrl, saveRelease } from "../packcam.server";
+import { PackCamError, benchStopRecording, currentRelease, listReleases, packCamForget, packCamPairCode, packCamStatus, releaseDownloadUrl, saveRelease } from "../packcam.server";
 import { DEFAULT_METHOD_RULES } from "../components/shipping/methods";
 import { IN_APP_LABELS } from "../components/shipping/features";
 import { redirect, useFetcher, useLoaderData, useNavigation, useRevalidator, useSearchParams } from "react-router";
@@ -343,6 +343,7 @@ const NEEDS = {
   packCamStatus: "view",
   packCamDownload: "view",
   packCamPairCode: ["settings", "pack"],
+  packCamStopRecording: "pack",
   packCamForget: "settings",
   packCamRelease: "settings",
 };
@@ -492,6 +493,7 @@ const shippingAction = async ({ request }) => {
     if (intent === "packCamStatus") return { intent, ok: true, ...(await packCamStatus(session.shop, Number(form.get("stationId")) || null)) };
     if (intent === "packCamDownload") return { intent, ok: true, ...(await releaseDownloadUrl(session.shop, appUrl(request))) };
     if (intent === "packCamPairCode") return { intent, ok: true, stationId: Number(form.get("stationId")), ...(await packCamPairCode(session.shop, form.get("stationId"), appUrl(request))) };
+    if (intent === "packCamStopRecording") return { intent, ...(await benchStopRecording(session.shop, form.get("stationId"), form.get("shipmentId"))) };
     if (intent === "packCamForget") return { intent, ok: true, ...(await packCamForget(session.shop, form.get("stationId"))) };
     if (intent === "packCamRelease") {
       const file = form.get("file");

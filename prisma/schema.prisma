@@ -1382,6 +1382,9 @@ model PrintStation {
   packCamInfo         String?   // the camera in use
   packCamSeenAt       DateTime?
   packCamPairedAt     DateTime?
+  // A box whose recording was stopped by hand (its video thrown away; not recorded again until another box opens)
+  packCamStopShipmentId Int?
+  packCamStopAt       DateTime?
   createdAt     DateTime  @default(now())
   createdBy     String?
 

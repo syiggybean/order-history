@@ -81,7 +81,45 @@ export function usePackCamera({ batchId, box, onScans, enabled = true }) {
 
   // What's open now, for a new camera link to start from
   const context = { batchId: batchId ? String(batchId) : "", shipmentId: box ? String(box.id) : "" };
-  return { cameras, linked: polling, context, packCam, packCamReady, startPolling: () => setPolling(true), stopPolling: () => setPolling(false) };
+  const packingBox = box && box.state === "batched" ? box : null;
+  return { cameras, linked: polling, context, packCam, packCamReady, stationId, packingBox, startPolling: () => setPolling(true), stopPolling: () => setPolling(false) };
+}
+
+// Pack Cam: stop recording the open box by hand (its video is thrown away)
+function StopRecording({ cam }) {
+  const stop = useFetcher();
+  const [confirm, setConfirm] = useState(false);
+  const box = cam.packingBox;
+  const stoppedId = stop.data?.ok ? stop.data.stopShipmentId : cam.packCam?.stoppedShipmentId;
+  if (!cam.packCamReady || !box || !cam.stationId) return null;
+  const btn = { appearance: "none", border: "1px solid #c9c9c9", background: "#fff", borderRadius: "8px", padding: "5px 10px", font: "inherit", fontSize: "13px", cursor: "pointer" };
+  if (stoppedId === box.id) return <span style={{ ...small, color: "#8a6116" }}>⏹ Not recording this box (stopped by hand)</span>;
+  if (!confirm)
+    return (
+      <button type="button" style={{ ...btn, color: "#b42318" }} onClick={() => setConfirm(true)}>
+        ⏹ Stop recording
+      </button>
+    );
+  return (
+    <span style={{ display: "inline-flex", gap: "6px", alignItems: "center", fontSize: "13px" }}>
+      Stop recording {box.orderName ?? "this box"} and delete its video?
+      <button
+        type="button"
+        style={{ ...btn, borderColor: "#b42318", color: "#b42318" }}
+        disabled={stop.state !== "idle"}
+        onClick={() => {
+          stop.submit({ intent: "packCamStopRecording", stationId: String(cam.stationId), shipmentId: String(box.id) }, { method: "post" });
+          setConfirm(false);
+        }}
+      >
+        Stop and delete
+      </button>
+      <button type="button" style={btn} onClick={() => setConfirm(false)}>
+        Keep recording
+      </button>
+      {stop.data?.error && <span style={{ color: "#b42318" }}>{stop.data.error}</span>}
+    </span>
+  );
 }
 
 export function PackCameraBar({ cam }) {
@@ -149,6 +187,7 @@ export function PackCameraBar({ cam }) {
             🎥 Pack Cam on {cam.packCam?.station?.name}: {packCamLive ? "● connected" : "○ starting…"}
           </span>
         )}
+        <StopRecording cam={cam} />
         <button type="button" style={btn} onClick={() => open(false)} disabled={busy}>
           📷 {usingBuiltIn ? "Camera window" : cam.packCamReady ? "Built-in camera" : "Open pack camera"}
         </button>
