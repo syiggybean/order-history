@@ -82,7 +82,13 @@ async function canReadChannels(shop, admin) {
 export async function channelStatus(shop) {
   const s = await db.channelSync.findUnique({ where: { shop } });
   if (!s || s.scopeOk == null) return { state: "starting" };
-  if (!s.scopeOk) return { state: "noScope" };
+  if (!s.scopeOk) {
+    // Look again now (it may have just been approved); the page shows it on the next load
+    if (!s.scopeCheckedAt || Date.now() - s.scopeCheckedAt.getTime() > 60_000) {
+      db.channelSync.update({ where: { shop }, data: { scopeCheckedAt: new Date(0) } }).then(() => runChannels(shop)).catch(() => {});
+    }
+    return { state: "noScope" };
+  }
   const started = await db.salesChannel.findFirst({ where: { shop, baselineAt: { not: null } }, orderBy: { baselineAt: "asc" } });
   return { state: started ? "on" : "starting", since: started?.baselineAt?.toISOString() ?? null };
 }
@@ -348,7 +354,7 @@ function plain(message) {
 export function whoOf(ev) {
   const text = plain(ev?.message);
   const app = ev?.attributeToApp ? clean(ev.appTitle) : null;
-  const fromText = ev?.attributeToUser ? text.match(/^(.+?) (published|unpublished|hid|removed|made)\b/i)?.[1] ?? null : null;
+  const fromText = ev?.attributeToUser ? text.match(/^(.+?) (published|unpublished|included|excluded|hid|removed|added|made)\b/i)?.[1] ?? null : null;
   const staff = clean(ev?.author) ?? clean(fromText);
   return { staffName: staff, appName: staff && app === staff ? null : app };
 }
@@ -361,8 +367,23 @@ export function channelIn(ev, channels) {
     .sort((a, b) => b.name.length - a.name.length); // "Online Store" before "Store"
   if (named[0]) return named[0];
   const pubId = hay.match(/gid:\/\/shopify\/publication\/\d+/i)?.[0];
-  if (pubId) return channels.find((c) => c.publicationId.toLowerCase() === pubId) ?? null;
-  return null;
+  if (pubId) {
+    const c = channels.find((x) => x.publicationId.toLowerCase() === pubId);
+    if (c) return c;
+  }
+  // Shopify's wording: "Rosie excluded a product from Online Store: <title>."
+  const said = channelFromWords(ev?.message);
+  return said ? { publicationId: null, name: said } : null;
+}
+
+export function channelFromWords(message) {
+  const text = plain(message);
+  const head = text.includes(": ") ? text.slice(0, text.indexOf(": ")) : text;
+  const m = head.match(/\b(?:from|to|on|in)(?: the)? ([^:]+?)\s*$/i);
+  const name = clean(m?.[1]);
+  // Not a channel: "…a product" / "…this product"
+  if (!name || /^(a|an|this|the)?\s*product$/i.test(name) || name.length > 60) return null;
+  return name;
 }
 
 export function syncEvents(shop, admin) {
@@ -393,6 +414,12 @@ async function syncEventsNow(shop, admin) {
     }
   }
   if (newest) await db.channelSync.update({ where: { shop }, data: { eventsCursor: newest } });
+  // Rows from the log without a channel: Shopify's wording usually names it
+  const unnamed = await db.catalogEvent.findMany({ where: { shop, subject: SUBJECT, channel: null, message: { not: null } }, take: 2000 });
+  for (const r of unnamed) {
+    const name = channelFromWords(r.message);
+    if (name) await db.catalogEvent.update({ where: { id: r.id }, data: { channel: name } });
+  }
   return stored;
 }
 
