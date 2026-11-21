@@ -39,6 +39,7 @@ export default function App() {
         {allows(user, "analytics") && <s-link href="/app/reporting">Reporting</s-link>}
         {allows(user, "shipping") && <s-link href="/app/shipping">Shipping</s-link>}
         {allows(user, "stock") && <s-link href="/app/stock">Stock</s-link>}
+        {allows(user, "tickets") && <s-link href="/app/tickets">Tickets</s-link>}
         {allows(user, "wishlist") && <s-link href="/app/wishlist">Wishlists</s-link>}
       </s-app-nav>
       <StarView user={user} />

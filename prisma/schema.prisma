@@ -1778,3 +1778,75 @@ model ChannelAlertSettings {
   lastSentAt DateTime?
   lastError  String?
 }
+
+// Tickets from the help@ mailbox (see helpdesk.server.js)
+model Ticket {
+  id               Int       @id @default(autoincrement())
+  shop             String
+  number           Int
+  subject          String
+  status           String    @default("open") // open | waiting | closed
+  customerEmail    String?
+  customerName     String?
+  shopifyCustomerId String?
+  assigneeId       Int?      // StaffMember id
+  assigneeName     String?
+  gmailThreadId    String
+  needsReply       Boolean   @default(true)
+  lastMessageAt    DateTime?
+  lastInboundAt    DateTime?
+  closedAt         DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@unique([shop, number])
+  @@unique([shop, gmailThreadId])
+  @@index([shop, status, lastMessageAt])
+}
+
+model TicketMessage {
+  id               Int       @id @default(autoincrement())
+  shop             String
+  ticketId         Int
+  kind             String    // email (from the customer) | reply (from us) | note (staff only)
+  gmailMessageId   String?
+  messageIdHeader  String?
+  referencesHeader String?
+  fromName         String?
+  fromEmail        String?
+  toLine           String?
+  ccLine           String?
+  subject          String?
+  body             String    // plain text (for emails we received, the only version kept)
+  bodyHtml         String?   // our replies: the cleaned HTML that was sent
+  attachments      String?   // JSON: [{ name, mime, size, id }]
+  staffName        String?
+  staffId          Int?
+  sentAt           DateTime
+  createdAt        DateTime  @default(now())
+
+  @@unique([shop, gmailMessageId])
+  @@index([shop, ticketId, sentAt])
+}
+
+// Each staff member's reply signature (cleaned HTML)
+model TicketSignature {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  staffId   Int
+  html      String
+  updatedAt DateTime @updatedAt
+
+  @@unique([shop, staffId])
+}
+
+model HelpdeskSync {
+  shop           String    @id
+  mailbox        String
+  enabledAt      DateTime? // mail from here on becomes tickets
+  pausedAt       DateTime?
+  labelId        String?   // Gmail's id for the "MonkeyBean" label
+  lastSyncAt     DateTime?
+  lastSentScanAt DateTime?
+  lastError      String?
+}

@@ -61,6 +61,11 @@ export const FEATURES = {
     levels: ["hidden", "view", "clips"],
     levelLabels: { hidden: "Hidden", view: "Watch recordings", clips: "Watch + make customer clips" },
   },
+  tickets: {
+    label: "Tickets",
+    levels: ["hidden", "view", "reply"],
+    levelLabels: { hidden: "Hidden", view: "View tickets", reply: "View + reply, notes, status and assign" },
+  },
   debug: {
     label: "Debug",
     levels: ["hidden", "view"],
@@ -114,7 +119,7 @@ export const CAPABILITY_FEATURES = {
 export const isCapabilityFeature = (f) => Boolean(CAPABILITY_FEATURES[f]);
 
 // Higher levels include everything below them
-export const LEVEL_RANK = { hidden: 0, view: 1, undo: 2, manage: 2, checkIn: 2, print: 2, clips: 2 };
+export const LEVEL_RANK = { hidden: 0, view: 1, undo: 2, manage: 2, checkIn: 2, print: 2, clips: 2, reply: 2 };
 
 export const emptyAccess = () => ({
   ...Object.fromEntries(Object.keys(FEATURES).map((f) => [f, "hidden"])),

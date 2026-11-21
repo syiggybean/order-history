@@ -32,6 +32,7 @@ export const VIEWS = [
   { id: "loyalty-members", page: "loyalty", param: ["tab", "members"], label: "Members", group: "Loyalty", need: ["loyalty", "view"], isDefault: true },
   { id: "loyalty-activity", page: "loyalty", param: ["tab", "activity"], label: "Activity", group: "Loyalty", need: ["loyalty", "view"] },
   { id: "loyalty-settings", page: "loyalty", param: ["tab", "settings"], label: "Settings", group: "Loyalty", need: ["loyalty", "view"] },
+  { id: "tickets", page: "tickets", label: "Tickets", group: null, need: ["tickets", "view"] },
   { id: "blocked", page: "blocked", label: "Blocked customers", group: null, need: ["blocklist", "view"] },
   { id: "ordoro", page: "ordoro", label: "Ordoro reconciliation", group: null, need: ["reconciliation", "view"] },
   { id: "debug", page: "debug", label: "Debug", group: null, need: ["debug", "view"] },

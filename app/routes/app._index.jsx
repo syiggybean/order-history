@@ -30,6 +30,14 @@ export const loader = async ({ request }) => {
 // Add new tools here as they're built
 const TOOLS = [
   {
+    title: "Tickets",
+    feature: "tickets",
+    description: "Emails to help@yiggybean.com become tickets: reply from here in the same email conversation, add staff notes, assign, and see the customer's orders.",
+    href: "/app/tickets",
+    action: "Open tickets",
+    status: "live",
+  },
+  {
     title: "Pre-orders",
     feature: "preorders",
     description:
