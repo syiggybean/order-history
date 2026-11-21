@@ -575,6 +575,7 @@ export async function customerFor(shop, admin, email) {
     tags: c.tags ?? [],
     url: `https://admin.shopify.com/store/${store}/customers/${num(c.id)}`,
     recent: (c.orders?.nodes ?? []).map((o) => ({
+      id: o.id,
       name: o.name,
       at: o.createdAt,
       paid: o.displayFinancialStatus,
@@ -583,6 +584,133 @@ export async function customerFor(shop, admin, email) {
       total: o.totalPriceSet?.shopMoney ? `${Number(o.totalPriceSet.shopMoney.amount).toFixed(2)} ${o.totalPriceSet.shopMoney.currencyCode}` : null,
       url: `https://admin.shopify.com/store/${store}/orders/${num(o.id)}`,
     })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Flyouts: a customer's full details, and one order's
+// ---------------------------------------------------------------------------
+
+const money = (m) => (m?.shopMoney ? `${Number(m.shopMoney.amount).toFixed(2)} ${m.shopMoney.currencyCode}` : null);
+const adminUrl = (shop, kind, gid) => `https://admin.shopify.com/store/${shop.replace(/\.myshopify\.com$/, "")}/${kind}/${String(gid).split("/").pop()}`;
+
+const CUSTOMER_DETAIL = `#graphql
+  query TicketCustomerDetail($id: ID!) {
+    customer(id: $id) {
+      id displayName email phone note tags createdAt numberOfOrders
+      amountSpent { amount currencyCode }
+      defaultAddress { formatted(withName: true) }
+      orders(first: 25, reverse: true) {
+        nodes {
+          id name createdAt displayFinancialStatus displayFulfillmentStatus cancelledAt
+          totalPriceSet { shopMoney { amount currencyCode } }
+        }
+      }
+    }
+  }`;
+
+export async function customerDetail(shop, admin, id) {
+  if (!/^gid:\/\/shopify\/Customer\/\d+$/.test(String(id ?? ""))) throw new HelpdeskError("That customer can't be shown.");
+  const res = await admin.graphql(CUSTOMER_DETAIL, { variables: { id } });
+  const body = await res.json();
+  if (body?.errors?.length) throw new HelpdeskError(`Shopify: ${body.errors.map((e) => e.message).join("; ")}`);
+  const c = body?.data?.customer;
+  if (!c) throw new HelpdeskError("That customer isn't in Shopify any more.");
+  return {
+    id: c.id,
+    name: c.displayName,
+    email: c.email,
+    phone: c.phone,
+    note: c.note,
+    tags: c.tags ?? [],
+    since: c.createdAt,
+    orders: c.numberOfOrders != null ? Number(c.numberOfOrders) : null,
+    spent: c.amountSpent ? `${Number(c.amountSpent.amount).toFixed(2)} ${c.amountSpent.currencyCode}` : null,
+    address: c.defaultAddress?.formatted ?? [],
+    url: adminUrl(shop, "customers", c.id),
+    recent: (c.orders?.nodes ?? []).map((o) => ({
+      id: o.id,
+      name: o.name,
+      at: o.createdAt,
+      paid: o.displayFinancialStatus,
+      fulfilled: o.displayFulfillmentStatus,
+      cancelled: Boolean(o.cancelledAt),
+      total: money(o.totalPriceSet),
+    })),
+  };
+}
+
+const ORDER_DETAIL = `#graphql
+  query TicketOrderDetail($id: ID!) {
+    order(id: $id) {
+      id name createdAt cancelledAt cancelReason displayFinancialStatus displayFulfillmentStatus note tags email
+      customer { id displayName }
+      subtotalPriceSet { shopMoney { amount currencyCode } }
+      totalShippingPriceSet { shopMoney { amount currencyCode } }
+      totalTaxSet { shopMoney { amount currencyCode } }
+      totalDiscountsSet { shopMoney { amount currencyCode } }
+      totalRefundedSet { shopMoney { amount currencyCode } }
+      totalPriceSet { shopMoney { amount currencyCode } }
+      shippingAddress { formatted(withName: true) }
+      shippingLine { title }
+      lineItems(first: 60) {
+        nodes {
+          id title variantTitle sku quantity currentQuantity
+          image { url(transform: { maxWidth: 96, maxHeight: 96 }) }
+          originalUnitPriceSet { shopMoney { amount currencyCode } }
+        }
+      }
+      fulfillments(first: 10) {
+        createdAt displayStatus
+        trackingInfo(first: 5) { number url company }
+      }
+    }
+  }`;
+
+export async function orderDetail(shop, admin, id) {
+  if (!/^gid:\/\/shopify\/Order\/\d+$/.test(String(id ?? ""))) throw new HelpdeskError("That order can't be shown.");
+  const res = await admin.graphql(ORDER_DETAIL, { variables: { id } });
+  const body = await res.json();
+  if (body?.errors?.length) throw new HelpdeskError(`Shopify: ${body.errors.map((e) => e.message).join("; ")}`);
+  const o = body?.data?.order;
+  if (!o) throw new HelpdeskError("That order isn't in Shopify any more.");
+  return {
+    id: o.id,
+    name: o.name,
+    at: o.createdAt,
+    cancelled: o.cancelledAt ? { at: o.cancelledAt, reason: o.cancelReason } : null,
+    paid: o.displayFinancialStatus,
+    fulfilled: o.displayFulfillmentStatus,
+    note: o.note,
+    tags: o.tags ?? [],
+    email: o.email,
+    customer: o.customer ? { id: o.customer.id, name: o.customer.displayName } : null,
+    totals: {
+      subtotal: money(o.subtotalPriceSet),
+      shipping: money(o.totalShippingPriceSet),
+      tax: money(o.totalTaxSet),
+      discounts: Number(o.totalDiscountsSet?.shopMoney?.amount) > 0 ? money(o.totalDiscountsSet) : null,
+      refunded: Number(o.totalRefundedSet?.shopMoney?.amount) > 0 ? money(o.totalRefundedSet) : null,
+      total: money(o.totalPriceSet),
+    },
+    shipTo: o.shippingAddress?.formatted ?? [],
+    shippingMethod: o.shippingLine?.title ?? null,
+    items: (o.lineItems?.nodes ?? []).map((l) => ({
+      id: l.id,
+      title: l.title,
+      variant: l.variantTitle && l.variantTitle !== "Default Title" ? l.variantTitle : null,
+      sku: l.sku,
+      qty: l.quantity,
+      current: l.currentQuantity,
+      image: l.image?.url ?? null,
+      price: money(l.originalUnitPriceSet),
+    })),
+    fulfillments: (o.fulfillments ?? []).map((f) => ({
+      at: f.createdAt,
+      status: f.displayStatus,
+      tracking: (f.trackingInfo ?? []).map((t) => ({ number: t.number, url: t.url, company: t.company })),
+    })),
+    url: adminUrl(shop, "orders", o.id),
   };
 }
 

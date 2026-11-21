@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useFetcher, useLoaderData, useRevalidator, useSearchParams } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { NoAccess } from "../components/NoAccess";
+import { Flyout } from "../components/Flyout";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import {
   HelpdeskError,
@@ -10,12 +11,14 @@ import {
   assignees,
   attachment,
   connect,
+  customerDetail,
   customerFor,
   getSignature,
   getSync,
   getTicket,
   listTickets,
   mailbox,
+  orderDetail,
   pause,
   reply,
   saveSignature,
@@ -77,6 +80,8 @@ export const action = async ({ request }) => {
   const id = form.get("id");
   try {
     if (intent === "customer") return { intent, customer: await customerFor(shop, admin, String(form.get("email") ?? "")) };
+    if (intent === "customerDetail") return { intent, customer: await customerDetail(shop, admin, String(form.get("customerId") ?? "")) };
+    if (intent === "orderDetail") return { intent, order: await orderDetail(shop, admin, String(form.get("orderId") ?? "")) };
     if (intent === "attachment") return { intent, file: await attachment(shop, form.get("messageId"), form.get("index")) };
     if (intent === "connect" || intent === "pause" || intent === "resume") {
       if (!user?.isAdmin) return { intent, error: "Only app admins can connect or pause the mailbox." };
@@ -714,6 +719,7 @@ function CustomerPanel({ ticket }) {
   const email = ticket.customerEmail;
   const submit = useRef(f.submit);
   submit.current = f.submit;
+  const [fly, setFly] = useState(null); // { kind: "customer" | "order", id }
   useEffect(() => {
     if (email) submit.current({ intent: "customer", email }, { method: "post" });
   }, [email]);
@@ -722,7 +728,12 @@ function CustomerPanel({ ticket }) {
     <div style={{ border: "1px solid #e3e3e3", borderRadius: "12px", background: "#fff", padding: "12px 14px", display: "grid", gap: "8px", fontSize: "13px" }}>
       <strong>Customer</strong>
       <span style={{ overflowWrap: "anywhere" }}>
-        {ticket.customerName && <>{ticket.customerName}<br /></>}
+        {ticket.customerName && (
+          <>
+            {ticket.customerName}
+            <br />
+          </>
+        )}
         <span style={muted}>{email}</span>
       </span>
       {f.state !== "idle" && c === undefined && <span style={muted}>Looking them up…</span>}
@@ -730,9 +741,9 @@ function CustomerPanel({ ticket }) {
       {c === null && <span style={muted}>No Shopify customer with this email.</span>}
       {c && (
         <>
-          <a href={c.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
-            {c.name || c.email} in Shopify ↗
-          </a>
+          <button type="button" style={{ ...linkStyle, textAlign: "left" }} onClick={() => setFly({ kind: "customer", id: c.id })}>
+            {c.name || c.email}: customer details
+          </button>
           <span style={muted}>
             {c.orders ?? 0} order{c.orders === 1 ? "" : "s"}
             {c.spent ? ` · ${c.spent} spent` : ""}
@@ -742,22 +753,225 @@ function CustomerPanel({ ticket }) {
             <div style={{ display: "grid", gap: "6px", marginTop: "4px" }}>
               <span style={{ ...small, fontWeight: 600 }}>Recent orders</span>
               {c.recent.map((o) => (
-                <a key={o.name} href={o.url} target="_blank" rel="noreferrer" style={{ display: "grid", gap: "1px", color: "inherit", textDecoration: "none", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px" }}>
-                  <span style={{ display: "flex", justifyContent: "space-between", gap: "6px" }}>
-                    <span style={{ color: "#005bd3", fontWeight: 600 }}>{o.name}</span>
-                    <span>{o.total}</span>
-                  </span>
-                  <span style={small}>
-                    {new Date(o.at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })} · {o.cancelled ? "Cancelled" : `${titleCase(o.paid)} · ${titleCase(o.fulfilled)}`}
-                  </span>
-                </a>
+                <OrderRow key={o.id} o={o} onOpen={() => setFly({ kind: "order", id: o.id })} />
               ))}
             </div>
           )}
         </>
       )}
+      {fly?.kind === "customer" && <CustomerFlyout id={fly.id} onClose={() => setFly(null)} onOrder={(id) => setFly({ kind: "order", id, back: fly })} />}
+      {fly?.kind === "order" && (
+        <OrderFlyout
+          id={fly.id}
+          onClose={() => setFly(null)}
+          onBack={fly.back ? () => setFly(fly.back) : null}
+          onCustomer={(id) => setFly({ kind: "customer", id })}
+        />
+      )}
     </div>
   );
+}
+
+function OrderRow({ o, onOpen }) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      style={{ display: "grid", gap: "1px", width: "100%", textAlign: "left", font: "inherit", fontSize: "13px", color: "inherit", background: "#fff", cursor: "pointer", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px" }}
+    >
+      <span style={{ display: "flex", justifyContent: "space-between", gap: "6px" }}>
+        <span style={{ color: "#005bd3", fontWeight: 600 }}>{o.name}</span>
+        <span>{o.total}</span>
+      </span>
+      <span style={small}>
+        {new Date(o.at).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })} · {o.cancelled ? "Cancelled" : `${titleCase(o.paid)} · ${titleCase(o.fulfilled)}`}
+      </span>
+    </button>
+  );
+}
+
+// Loads one thing for a flyout when it opens
+function useDetail(intent, key, id) {
+  const f = useFetcher();
+  const submit = useRef(f.submit);
+  submit.current = f.submit;
+  useEffect(() => {
+    if (id) submit.current({ intent, [key]: id }, { method: "post" });
+  }, [intent, key, id]);
+  return { data: f.data?.intent === intent ? f.data : null, loading: f.state !== "idle" || !f.data };
+}
+
+const section = { display: "grid", gap: "6px", paddingBottom: "14px", marginBottom: "14px", borderBottom: "1px solid #eee", fontSize: "13px" };
+const heading = { fontSize: "12px", fontWeight: 600, color: "#616161", textTransform: "uppercase", letterSpacing: "0.03em" };
+
+function CustomerFlyout({ id, onClose, onOrder }) {
+  const { data, loading } = useDetail("customerDetail", "customerId", id);
+  const c = data?.customer;
+  return (
+    <Flyout onClose={onClose} label="Customer" title={c?.name || "Customer"} width={460}>
+      {loading && !c && <span style={muted}>Loading…</span>}
+      {data?.error && <span style={{ color: "#8e1f0b" }}>{data.error}</span>}
+      {c && (
+        <>
+          <div style={section}>
+            {c.email && (
+              <a href={`mailto:${c.email}`} style={{ color: "#005bd3" }}>
+                {c.email}
+              </a>
+            )}
+            {c.phone && <span>{c.phone}</span>}
+            <span style={muted}>
+              {c.orders ?? 0} order{c.orders === 1 ? "" : "s"}
+              {c.spent ? ` · ${c.spent} spent` : ""} · customer since {new Date(c.since).toLocaleDateString("en-US", { month: "short", year: "numeric" })}
+            </span>
+            {c.tags.length > 0 && <span style={small}>Tags: {c.tags.join(", ")}</span>}
+            <a href={c.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
+              Open in Shopify ↗
+            </a>
+          </div>
+          {c.address.length > 0 && (
+            <div style={section}>
+              <span style={heading}>Default address</span>
+              <span style={{ whiteSpace: "pre-line" }}>{c.address.join("\n")}</span>
+            </div>
+          )}
+          {c.note && (
+            <div style={section}>
+              <span style={heading}>Note</span>
+              <span style={{ whiteSpace: "pre-wrap" }}>{c.note}</span>
+            </div>
+          )}
+          <div style={{ ...section, borderBottom: "none" }}>
+            <span style={heading}>Orders</span>
+            {c.recent.length === 0 && <span style={muted}>No orders.</span>}
+            {c.recent.map((o) => (
+              <OrderRow key={o.id} o={o} onOpen={() => onOrder(o.id)} />
+            ))}
+          </div>
+        </>
+      )}
+    </Flyout>
+  );
+}
+
+function OrderFlyout({ id, onClose, onBack, onCustomer }) {
+  const { data, loading } = useDetail("orderDetail", "orderId", id);
+  const o = data?.order;
+  const line = (label, value, strong) =>
+    value ? (
+      <span style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontWeight: strong ? 600 : 400 }}>
+        <span style={strong ? {} : muted}>{label}</span>
+        <span>{value}</span>
+      </span>
+    ) : null;
+  return (
+    <Flyout onClose={onClose} label="Order" title={o ? `Order ${o.name}` : "Order"} width={520}>
+      {onBack && (
+        <button type="button" style={{ ...linkStyle, fontSize: "13px", marginBottom: "10px" }} onClick={onBack}>
+          ← Back to customer
+        </button>
+      )}
+      {loading && !o && <span style={muted}>Loading…</span>}
+      {data?.error && <span style={{ color: "#8e1f0b" }}>{data.error}</span>}
+      {o && (
+        <>
+          <div style={section}>
+            <span style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+              <span>{new Date(o.at).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}</span>
+              {o.cancelled ? (
+                <Pill tone="red">Cancelled{o.cancelled.reason ? ` (${titleCase(o.cancelled.reason)})` : ""}</Pill>
+              ) : (
+                <>
+                  <Pill tone={/PAID/i.test(o.paid ?? "") && !/PARTIALLY|UN/i.test(o.paid ?? "") ? "green" : "yellow"}>{titleCase(o.paid)}</Pill>
+                  <Pill tone={/^FULFILLED$/i.test(o.fulfilled ?? "") ? "green" : "yellow"}>{titleCase(o.fulfilled)}</Pill>
+                </>
+              )}
+            </span>
+            {o.customer && (
+              <button type="button" style={{ ...linkStyle, textAlign: "left", fontSize: "13px" }} onClick={() => onCustomer(o.customer.id)}>
+                {o.customer.name}
+              </button>
+            )}
+            <a href={o.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
+              Open in Shopify ↗
+            </a>
+          </div>
+          <div style={section}>
+            <span style={heading}>Items</span>
+            {o.items.map((l) => (
+              <div key={l.id} style={{ display: "grid", gridTemplateColumns: "44px minmax(0, 1fr) auto", gap: "8px", alignItems: "center", opacity: l.current === 0 ? 0.55 : 1 }}>
+                {l.image ? (
+                  <img src={l.image} alt="" width={44} height={44} style={{ objectFit: "cover", borderRadius: "6px", border: "1px solid #eee" }} />
+                ) : (
+                  <span style={{ width: 44, height: 44, borderRadius: "6px", background: "#f3f3f3" }} />
+                )}
+                <span style={{ display: "grid" }}>
+                  <span style={{ textDecoration: l.current === 0 ? "line-through" : "none" }}>{l.title}</span>
+                  <span style={small}>
+                    {[l.variant, l.sku].filter(Boolean).join(" · ")}
+                    {l.current !== l.qty ? ` · ${l.qty - l.current} removed or refunded` : ""}
+                  </span>
+                </span>
+                <span style={{ whiteSpace: "nowrap" }}>
+                  {l.current} × {l.price}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div style={section}>
+            {line("Subtotal", o.totals.subtotal)}
+            {line("Discounts", o.totals.discounts && `−${o.totals.discounts}`)}
+            {line(`Shipping${o.shippingMethod ? ` (${o.shippingMethod})` : ""}`, o.totals.shipping)}
+            {line("Tax", o.totals.tax)}
+            {line("Total", o.totals.total, true)}
+            {line("Refunded", o.totals.refunded && `−${o.totals.refunded}`)}
+          </div>
+          <div style={section}>
+            <span style={heading}>Shipping</span>
+            {o.shipTo.length > 0 ? <span style={{ whiteSpace: "pre-line" }}>{o.shipTo.join("\n")}</span> : <span style={muted}>No shipping address.</span>}
+            {o.fulfillments.length === 0 && <span style={muted}>Not shipped yet.</span>}
+            {o.fulfillments.map((fl, i) => (
+              <div key={i} style={{ display: "grid", gap: "2px", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px" }}>
+                <span>
+                  {titleCase(fl.status)} · {new Date(fl.at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                </span>
+                {fl.tracking.map((t, j) =>
+                  t.url ? (
+                    <a key={j} href={t.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
+                      {t.company ? `${t.company} ` : ""}
+                      {t.number} ↗
+                    </a>
+                  ) : (
+                    <span key={j}>
+                      {t.company ? `${t.company} ` : ""}
+                      {t.number}
+                    </span>
+                  ),
+                )}
+              </div>
+            ))}
+          </div>
+          {(o.note || o.tags.length > 0) && (
+            <div style={{ ...section, borderBottom: "none" }}>
+              {o.note && (
+                <>
+                  <span style={heading}>Order note</span>
+                  <span style={{ whiteSpace: "pre-wrap" }}>{o.note}</span>
+                </>
+              )}
+              {o.tags.length > 0 && <span style={small}>Tags: {o.tags.join(", ")}</span>}
+            </div>
+          )}
+        </>
+      )}
+    </Flyout>
+  );
+}
+
+const PILL = { green: ["#d9f2df", "#1a5e20"], yellow: ["#fff1d6", "#7a4f01"], red: ["#fde2dd", "#8e1f0b"] };
+function Pill({ tone, children }) {
+  const [bg, fg] = PILL[tone] ?? PILL.yellow;
+  return <span style={{ background: bg, color: fg, padding: "1px 8px", borderRadius: "8px", fontSize: "12px", fontWeight: 600 }}>{children}</span>;
 }
 
 const titleCase = (s) =>
