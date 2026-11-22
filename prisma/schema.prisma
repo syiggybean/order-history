@@ -1808,7 +1808,7 @@ model TicketMessage {
   id               Int       @id @default(autoincrement())
   shop             String
   ticketId         Int
-  kind             String    // email (from the customer) | reply (from us) | note (staff only)
+  kind             String    // email (from the customer) | reply (from us) | auto (an automatic email) | note (staff only)
   gmailMessageId   String?
   messageIdHeader  String?
   referencesHeader String?
@@ -1822,11 +1822,27 @@ model TicketMessage {
   attachments      String?   // JSON: [{ name, mime, size, id }]
   staffName        String?
   staffId          Int?
+  editedAt         DateTime? // notes: last edited
+  editedBy         String?
   sentAt           DateTime
   createdAt        DateTime  @default(now())
 
   @@unique([shop, gmailMessageId])
   @@index([shop, ticketId, sentAt])
+}
+
+// Email templates (auto-reply, status changes); missing rows use the built-in wording
+model TicketTemplate {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  key       String   // autoReply | status.open | status.closed
+  subject   String
+  html      String
+  enabled   Boolean  @default(false)
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+
+  @@unique([shop, key])
 }
 
 // Each staff member's reply signature (cleaned HTML)

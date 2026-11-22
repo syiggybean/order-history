@@ -13,6 +13,11 @@ import {
   connect,
   customerDetail,
   customerFor,
+  editNote,
+  getTemplates,
+  resetTemplate,
+  saveTemplate,
+  sendTest,
   getSignature,
   getSync,
   getTicket,
@@ -24,9 +29,10 @@ import {
   saveSignature,
   setStatus,
   setupProblem,
+  updateTicket,
   sync,
 } from "../helpdesk.server";
-import { STATUS_LABELS } from "../tickets";
+import { STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
 
 // Tickets: emails to help@ as tickets, answered from here
 
@@ -39,14 +45,16 @@ export const loader = async ({ request }) => {
   const who = url.searchParams.get("who") || "all";
   const q = url.searchParams.get("q") || "";
   const id = Number(url.searchParams.get("id")) || null;
+  const view = url.searchParams.get("view") === "templates" ? "templates" : "tickets";
   const s = await getSync(shop);
   // Check the mailbox now if it's been a little while (the minute timer does the rest)
   if (s?.enabledAt && !s.pausedAt && (!s.lastSyncAt || Date.now() - s.lastSyncAt.getTime() > 20_000)) sync(shop).catch(() => {});
-  const [list, ticket, people, signature] = await Promise.all([
+  const [list, ticket, people, signature, templates] = await Promise.all([
     listTickets(shop, { status, who, q, userId: user?.id }),
     id ? getTicket(shop, id) : null,
     assignees(shop),
     getSignature(shop, user?.id),
+    view === "templates" ? getTemplates(shop) : null,
   ]);
   return {
     mailbox: s?.mailbox ?? mailbox(),
@@ -60,7 +68,8 @@ export const loader = async ({ request }) => {
         }
       : { on: false },
     setupProblem: setupProblem(),
-    filters: { status, who, q, id },
+    filters: { status, who, q, id, view },
+    templates,
     ...list,
     ticket,
     people,
@@ -96,7 +105,16 @@ export const action = async ({ request }) => {
       return { intent, ok: true };
     }
     if (intent === "signature") return { intent, ok: true, signature: await saveSignature(shop, user?.id, form.get("html")) };
+    if (intent === "editNote") return (await editNote(shop, form.get("messageId"), form.get("text"), user), { intent, ok: true });
+    if (intent === "testTemplate") return { intent, ok: true, sentTo: await sendTest(shop, { subject: form.get("subject"), html: form.get("html") }, user) };
+    if (intent === "saveTemplate" || intent === "resetTemplate") {
+      if (!user?.isAdmin) return { intent, error: "Only app admins can change email templates." };
+      if (intent === "resetTemplate") return (await resetTemplate(shop, String(form.get("key") ?? "")), { intent, ok: true });
+      await saveTemplate(shop, String(form.get("key") ?? ""), { subject: form.get("subject"), html: form.get("html"), enabled: form.get("enabled") === "true" }, user);
+      return { intent, ok: true };
+    }
     if (intent === "note") return (await addNote(shop, id, form.get("text"), user), { intent, ok: true });
+    if (intent === "update") return (await updateTicket(shop, id, { status: String(form.get("status") ?? ""), staffId: Number(form.get("staffId")) || null }), { intent, ok: true });
     if (intent === "status") return (await setStatus(shop, id, String(form.get("status") ?? "")), { intent, ok: true });
     if (intent === "assign") return (await assign(shop, id, Number(form.get("staffId")) || null), { intent, ok: true });
     if (intent === "assignMe") return (await assign(shop, id, user?.id), { intent, ok: true });
@@ -190,7 +208,18 @@ function TicketsPage({ data }) {
         .tk-html img { max-width: 100%; height: auto; }
       `}</style>
       <Connection data={data} />
-      {data.sync.on && (
+      <div style={{ display: "flex", gap: "4px", marginBottom: "12px" }}>
+        {[
+          ["tickets", "Tickets"],
+          ["templates", "Email templates"],
+        ].map(([k, label]) => (
+          <button key={k} type="button" onClick={() => set({ view: k === "tickets" ? null : k })} style={{ ...btn, ...(data.filters.view === k ? chosen : {}) }}>
+            {label}
+          </button>
+        ))}
+      </div>
+      {data.filters.view === "templates" && <TemplateDesigner data={data} />}
+      {data.filters.view !== "templates" && data.sync.on && (
         <div style={{ display: "grid", gridTemplateColumns: "minmax(280px, 380px) minmax(0, 1fr)", gap: "16px", alignItems: "start" }}>
           <TicketList data={data} set={set} />
           {data.ticket ? (
@@ -358,8 +387,15 @@ function TicketList({ data, set }) {
 function TicketView({ ticket, data }) {
   const act = useFetcher();
   const busy = act.state !== "idle";
-  const run = (intent, extra = {}) => act.submit({ intent, id: String(ticket.id), ...extra }, { method: "post" });
   const error = act.data?.error;
+  // Status and assignee are edited here and only saved with Save (status
+  // changes will notify customers in a later update)
+  const saved = { status: ticket.status, assigneeId: ticket.assigneeId ?? "" };
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => setDraft({ status: ticket.status, assigneeId: ticket.assigneeId ?? "" }), [ticket.status, ticket.assigneeId]);
+  const dirty = draft.status !== saved.status || String(draft.assigneeId) !== String(saved.assigneeId);
+  const save = () => act.submit({ intent: "update", id: String(ticket.id), status: draft.status, staffId: String(draft.assigneeId ?? "") }, { method: "post" });
+  const discard = () => setDraft(saved);
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 260px", gap: "16px", alignItems: "start" }}>
@@ -374,9 +410,9 @@ function TicketView({ ticket, data }) {
             <span style={muted}>Status</span>
             <select
               aria-label="Status"
-              value={ticket.status}
+              value={draft.status}
               disabled={!data.canReply || busy}
-              onChange={(e) => run("status", { status: e.target.value })}
+              onChange={(e) => setDraft({ ...draft, status: e.target.value })}
               style={field}
             >
               {Object.entries(STATUS_LABELS).map(([k, label]) => (
@@ -388,9 +424,9 @@ function TicketView({ ticket, data }) {
             <span style={{ ...muted, marginLeft: "8px" }}>Assigned to</span>
             <select
               aria-label="Assigned to"
-              value={ticket.assigneeId ?? ""}
+              value={draft.assigneeId ?? ""}
               disabled={!data.canReply || busy}
-              onChange={(e) => run("assign", { staffId: e.target.value })}
+              onChange={(e) => setDraft({ ...draft, assigneeId: e.target.value ? Number(e.target.value) : "" })}
               style={field}
             >
               <option value="">Nobody</option>
@@ -402,16 +438,27 @@ function TicketView({ ticket, data }) {
                 </option>
               ))}
             </select>
-            {data.canReply && ticket.assigneeId !== data.me && data.me && (
-              <button type="button" style={{ ...btn, padding: "3px 10px" }} disabled={busy} onClick={() => run("assignMe")}>
+            {data.canReply && draft.assigneeId !== data.me && data.me && (
+              <button type="button" style={{ ...btn, padding: "3px 10px" }} disabled={busy} onClick={() => setDraft({ ...draft, assigneeId: data.me })}>
                 Assign to me
               </button>
             )}
           </div>
+          {data.canReply && (dirty || busy) && (
+            <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#fff8e6", border: "1px solid #ecd58f", borderRadius: "8px", padding: "6px 10px", fontSize: "13px" }}>
+              <span style={{ flex: 1 }}>Unsaved changes to this ticket.</span>
+              <button type="button" style={btn} disabled={busy} onClick={discard}>
+                Discard
+              </button>
+              <button type="button" style={dark} disabled={busy} onClick={save}>
+                {busy ? "Saving…" : "Save"}
+              </button>
+            </div>
+          )}
         </div>
 
         {ticket.messages.map((m) => (
-          <Message key={m.id} m={m} />
+          <Message key={m.id} m={m} data={data} />
         ))}
         {data.canReply ? (
           <Composer ticket={ticket} signature={data.signature} />
@@ -425,7 +472,14 @@ function TicketView({ ticket, data }) {
   );
 }
 
-function Message({ m }) {
+function Message({ m, data }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(m.body);
+  const ed = useFetcher();
+  useEffect(() => {
+    if (ed.state === "idle" && ed.data?.intent === "editNote" && ed.data.ok) setEditing(false);
+  }, [ed.state, ed.data]);
+  const canEdit = m.kind === "note" && data?.canReply && (data.isAdmin || (data.me && m.staffId === data.me));
   const [open, setOpen] = useState(false);
   const dl = useFetcher();
   useEffect(() => {
@@ -440,9 +494,18 @@ function Message({ m }) {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }, [dl.data]);
   const note = m.kind === "note";
-  const ours = m.kind === "reply";
+  const auto = m.kind === "auto";
+  const ours = m.kind === "reply" || auto;
   const [main, quoted] = note || m.html ? [m.body, ""] : splitQuoted(m.body);
-  const who = note ? `${m.staffName ?? "Staff"} · internal note` : ours ? `${m.staffName ?? m.fromName ?? "Yiggybean"} (reply)` : m.fromName ? `${m.fromName} <${m.fromEmail}>` : m.fromEmail;
+  const who = note
+    ? `${m.staffName ?? "Staff"} · internal note`
+    : auto
+      ? "Automatic reply"
+      : ours
+        ? `${m.staffName ?? m.fromName ?? "Yiggybean"} (reply)`
+        : m.fromName
+          ? `${m.fromName} <${m.fromEmail}>`
+          : m.fromEmail;
   return (
     <div
       style={{
@@ -457,10 +520,31 @@ function Message({ m }) {
     >
       <div style={{ display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" }}>
         <strong style={{ fontSize: "13px", flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>{who}</strong>
-        <span style={small}>{fmt(m.sentAt)}</span>
+        <span style={small}>
+          {fmt(m.sentAt)}
+          {m.editedAt ? ` · edited ${fmt(m.editedAt)}${m.editedBy && m.editedBy !== m.staffName ? ` by ${m.editedBy}` : ""}` : ""}
+        </span>
+        {canEdit && !editing && (
+          <button type="button" style={{ ...linkStyle, fontSize: "12px" }} onClick={() => (setDraft(m.body), setEditing(true))}>
+            Edit
+          </button>
+        )}
       </div>
       {!note && m.cc && <span style={small}>Cc: {m.cc}</span>}
-      {m.html ? (
+      {editing ? (
+        <div style={{ display: "grid", gap: "6px" }}>
+          <textarea aria-label="Edit note" rows={4} value={draft} onChange={(e) => setDraft(e.target.value)} style={{ ...field, width: "100%", boxSizing: "border-box", resize: "vertical", fontSize: "14px" }} />
+          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <button type="button" style={dark} disabled={ed.state !== "idle" || !draft.trim()} onClick={() => ed.submit({ intent: "editNote", messageId: String(m.id), text: draft }, { method: "post" })}>
+              {ed.state !== "idle" ? "Saving…" : "Save note"}
+            </button>
+            <button type="button" style={btn} onClick={() => setEditing(false)}>
+              Cancel
+            </button>
+            {ed.data?.error && <span style={{ color: "#8e1f0b", fontSize: "13px" }}>{ed.data.error}</span>}
+          </div>
+        </div>
+      ) : m.html ? (
         // Our own replies: HTML cleaned on the server (only simple formatting, links and https images)
         <div className="tk-html" style={{ overflowWrap: "anywhere", fontSize: "14px", lineHeight: 1.45 }} dangerouslySetInnerHTML={{ __html: m.html }} />
       ) : (
@@ -612,8 +696,22 @@ function SignatureEditor({ value, onDone }) {
 
 // A small formatting editor: bold, italic, underline, lists, links, images.
 // The server cleans whatever comes out of it before anything is stored or sent.
-function RichEditor({ initial = "", onChange, placeholder, label, minHeight = "130px" }) {
+function RichEditor({ initial = "", onChange, placeholder, label, minHeight = "130px", apiRef }) {
   const ref = useRef(null);
+  if (apiRef) {
+    apiRef.current = {
+      insert: (text) => {
+        ref.current?.focus();
+        if (saved.current) {
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(saved.current);
+        }
+        document.execCommand("insertText", false, text);
+        onChange?.(ref.current?.innerHTML ?? "");
+      },
+    };
+  }
   const saved = useRef(null);
   const [linking, setLinking] = useState(null); // "link" | "image" | null
   const [url, setUrl] = useState("");
@@ -710,6 +808,188 @@ function RichEditor({ initial = "", onChange, placeholder, label, minHeight = "1
         className="tk-editor tk-html"
         style={{ minHeight, padding: "8px 10px", outline: "none", fontSize: "14px", lineHeight: 1.45, overflowWrap: "anywhere" }}
       />
+    </div>
+  );
+}
+
+// ---- Email templates -------------------------------------------------------
+
+function TemplateDesigner({ data }) {
+  const list = data.templates ?? [];
+  const [key, setKey] = useState(list[0]?.key ?? null);
+  const tpl = list.find((t) => t.key === key) ?? list[0];
+  if (!tpl) return <div style={muted}>Loading templates…</div>;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "260px minmax(0, 1fr)", gap: "16px", alignItems: "start" }}>
+      <div style={{ border: "1px solid #e3e3e3", borderRadius: "12px", background: "#fff", overflow: "hidden" }}>
+        {list.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            onClick={() => setKey(t.key)}
+            style={{
+              display: "grid",
+              gap: "3px",
+              width: "100%",
+              textAlign: "left",
+              padding: "10px 12px",
+              border: "none",
+              borderBottom: "1px solid #f0f0f0",
+              background: t.key === tpl.key ? "#f1f6ff" : "#fff",
+              font: "inherit",
+              cursor: "pointer",
+            }}
+          >
+            <span style={{ fontWeight: 600, fontSize: "13px" }}>{t.name}</span>
+            <span style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              {t.live ? (
+                <span style={{ ...tagStyle, ...(t.enabled ? { background: "#d9f2df", color: "#1a5e20" } : {}) }}>{t.enabled ? "On" : "Off"}</span>
+              ) : (
+                <span style={tagStyle}>Not sent yet</span>
+              )}
+              {t.customized && <span style={small}>edited</span>}
+            </span>
+          </button>
+        ))}
+      </div>
+      <TemplateEditor key={`${tpl.key}:${tpl.updatedAt ?? "default"}`} tpl={tpl} data={data} />
+    </div>
+  );
+}
+
+const tagStyle = { background: "#ebebeb", color: "#4a4a4a", padding: "1px 8px", borderRadius: "8px", fontSize: "12px", fontWeight: 600 };
+
+function TemplateEditor({ tpl, data }) {
+  const save = useFetcher();
+  const test = useFetcher();
+  const [subject, setSubject] = useState(tpl.subject);
+  const [html, setHtml] = useState(tpl.html);
+  const [enabled, setEnabled] = useState(tpl.enabled);
+  const [target, setTarget] = useState("body"); // where Insert puts a variable
+  const editor = useRef(null);
+  const subjectRef = useRef(null);
+  const canEdit = data.isAdmin;
+  const dirty = subject !== tpl.subject || html !== tpl.html || enabled !== tpl.enabled;
+  const samples = sampleValues();
+  const unknown = unknownVariables(subject, html);
+  const insert = (name) => {
+    const token = `{{${name}}}`;
+    if (target === "subject" && subjectRef.current) {
+      const el = subjectRef.current;
+      const start = el.selectionStart ?? subject.length;
+      const end = el.selectionEnd ?? subject.length;
+      const next = subject.slice(0, start) + token + subject.slice(end);
+      setSubject(next);
+      requestAnimationFrame(() => {
+        el.focus();
+        el.setSelectionRange(start + token.length, start + token.length);
+      });
+    } else editor.current?.insert(token);
+  };
+  return (
+    <div style={{ display: "grid", gap: "12px" }}>
+      <div style={{ border: "1px solid #e3e3e3", borderRadius: "12px", background: "#fff", padding: "14px", display: "grid", gap: "10px" }}>
+        <div style={{ display: "grid", gap: "2px" }}>
+          <strong style={{ fontSize: "15px" }}>{tpl.name}</strong>
+          <span style={muted}>{tpl.description}</span>
+          {!tpl.live && <span style={{ ...small, color: "#7a4f01" }}>Not sent yet: status-change emails are switched on in a later update. You can write it now.</span>}
+          {tpl.updatedBy && <span style={small}>Last edited by {tpl.updatedBy} {fmt(tpl.updatedAt)}</span>}
+        </div>
+        {tpl.live && (
+          <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "13px" }}>
+            <input type="checkbox" checked={enabled} disabled={!canEdit} onChange={(e) => setEnabled(e.target.checked)} />
+            Send this automatically
+            <span style={small}>(once per customer every 12 hours; never to mailing lists, no-reply addresses or other auto-replies)</span>
+          </label>
+        )}
+        <label style={{ display: "grid", gap: "4px", fontSize: "13px" }}>
+          <span style={muted}>Subject</span>
+          <input
+            ref={subjectRef}
+            value={subject}
+            disabled={!canEdit}
+            onFocus={() => setTarget("subject")}
+            onChange={(e) => setSubject(e.target.value)}
+            style={{ ...field, fontSize: "14px" }}
+          />
+        </label>
+        <div style={{ display: "grid", gap: "4px", fontSize: "13px" }} onFocusCapture={(e) => e.target !== subjectRef.current && setTarget("body")}>
+          <span style={muted}>Email</span>
+          {canEdit ? (
+            <RichEditor initial={tpl.html} onChange={setHtml} label="Email body" apiRef={editor} minHeight="180px" />
+          ) : (
+            <div className="tk-html" style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }} dangerouslySetInnerHTML={{ __html: tpl.html }} />
+          )}
+        </div>
+        {canEdit && (
+          <div style={{ display: "grid", gap: "6px" }}>
+            <span style={{ ...small, fontWeight: 600 }}>Insert a variable into the {target === "subject" ? "subject" : "email"}:</span>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
+              {VARIABLES.map((v) => (
+                <button
+                  key={v.name}
+                  type="button"
+                  title={`{{${v.name}}}: e.g. ${v.sample}`}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => insert(v.name)}
+                  style={{ ...btn, padding: "2px 8px", fontSize: "12px", background: "#f6f6f6" }}
+                >
+                  {v.label}
+                </button>
+              ))}
+            </div>
+            <span style={small}>
+              Write a fallback for empty values like <code>{'{{customer.first_name | default: "there"}}'}</code>.
+            </span>
+          </div>
+        )}
+        {unknown.length > 0 && <span style={{ color: "#8e1f0b", fontSize: "13px" }}>Not a variable: {unknown.map((u) => `{{${u}}}`).join(", ")}. It would be sent as typed.</span>}
+        {canEdit ? (
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              style={dark}
+              disabled={!dirty || save.state !== "idle"}
+              onClick={() => save.submit({ intent: "saveTemplate", key: tpl.key, subject, html, enabled: String(enabled) }, { method: "post" })}
+            >
+              {save.state !== "idle" ? "Saving…" : "Save template"}
+            </button>
+            <button type="button" style={btn} disabled={test.state !== "idle"} onClick={() => test.submit({ intent: "testTemplate", subject, html }, { method: "post" })}>
+              {test.state !== "idle" ? "Sending…" : "Send a test to me"}
+            </button>
+            {tpl.customized && (
+              <button type="button" style={{ ...linkStyle, fontSize: "13px" }} onClick={() => save.submit({ intent: "resetTemplate", key: tpl.key }, { method: "post" })}>
+                Reset to the original wording
+              </button>
+            )}
+            {dirty && <span style={small}>Unsaved changes</span>}
+            {save.data?.error && <span style={{ color: "#8e1f0b" }}>{save.data.error}</span>}
+            {test.data?.sentTo && <span style={{ color: "#1a5e20", fontSize: "13px" }}>Test sent to {test.data.sentTo}</span>}
+            {test.data?.error && <span style={{ color: "#8e1f0b", fontSize: "13px" }}>{test.data.error}</span>}
+          </div>
+        ) : (
+          <span style={small}>Only app admins can change email templates.</span>
+        )}
+      </div>
+      <div style={{ border: "1px solid #e3e3e3", borderRadius: "12px", background: "#fff", overflow: "hidden" }}>
+        <div style={{ padding: "10px 14px", borderBottom: "1px solid #eee", background: "#fafafa", fontSize: "13px", display: "grid", gap: "2px" }}>
+          <span style={small}>Preview with a sample customer</span>
+          <span>
+            <span style={muted}>From:</span> {data.mailbox}
+          </span>
+          <span>
+            <span style={muted}>To:</span> {samples["customer.name"]} &lt;{samples["customer.email"]}&gt;
+          </span>
+          <span>
+            <span style={muted}>Subject:</span> <strong>{renderTemplate(subject, samples)}</strong>
+          </span>
+        </div>
+        <div
+          className="tk-html"
+          style={{ padding: "14px", fontFamily: "Arial, Helvetica, sans-serif", fontSize: "14px", lineHeight: 1.5 }}
+          dangerouslySetInnerHTML={{ __html: renderTemplate(html, samples, { html: true }) }}
+        />
+      </div>
     </div>
   );
 }

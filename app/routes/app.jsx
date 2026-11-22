@@ -1,25 +1,29 @@
 import { Outlet, useFetcher, useLoaderData, useLocation, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
-import { getStaff, publicUser } from "../permissions.server";
+import db from "../db.server";
+import { can, getStaff, publicUser } from "../permissions.server";
 import { allows } from "../permissions";
 import { viewForLocation, viewTitle } from "../my-views";
 
 export const loader = async ({ request }) => {
-  const { user } = await getStaff(request);
+  const { session, user } = await getStaff(request);
+  // Open tickets (a customer is waiting on us), shown next to Tickets in the app menu
+  const openTickets = can(user, "tickets", "view") ? await db.ticket.count({ where: { shop: session.shop, status: "open" } }).catch(() => 0) : 0;
 
   // eslint-disable-next-line no-undef
-  return { apiKey: process.env.SHOPIFY_API_KEY || "", user: publicUser(user) };
+  return { apiKey: process.env.SHOPIFY_API_KEY || "", user: publicUser(user), openTickets };
 };
 
 export default function App() {
-  const { apiKey, user } = useLoaderData();
+  const { apiKey, user, openTickets } = useLoaderData();
 
   return (
     <AppProvider embedded apiKey={apiKey}>
       <s-app-nav>
-        {/* Home first, then the rest A–Z */}
+        {/* Home first, then Tickets, then the rest A–Z */}
         <s-link href="/app">Home</s-link>
+        {allows(user, "tickets") && <s-link href="/app/tickets">{openTickets > 0 ? `Tickets (${openTickets > 99 ? "99+" : openTickets})` : "Tickets"}</s-link>}
         <s-link href="/app/my-views">My Views</s-link>
         {allows(user, "barcodeLabels") && <s-link href="/app/barcode-labels">Barcode labels</s-link>}
         {allows(user, "packingVideos") && <s-link href="/app/packing-videos">Packing videos</s-link>}
@@ -39,7 +43,6 @@ export default function App() {
         {allows(user, "analytics") && <s-link href="/app/reporting">Reporting</s-link>}
         {allows(user, "shipping") && <s-link href="/app/shipping">Shipping</s-link>}
         {allows(user, "stock") && <s-link href="/app/stock">Stock</s-link>}
-        {allows(user, "tickets") && <s-link href="/app/tickets">Tickets</s-link>}
         {allows(user, "wishlist") && <s-link href="/app/wishlist">Wishlists</s-link>}
       </s-app-nav>
       <StarView user={user} />

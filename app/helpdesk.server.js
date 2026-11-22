@@ -37,7 +37,7 @@ const SYNC_EVERY_MS = 60_000;
 const MAX_PER_RUN = 100;
 const BODY_LIMIT = 200_000; // characters of text kept per email
 
-import { STATUSES } from "./tickets";
+import { STATUSES, TEMPLATES, renderTemplate, templateDef, ticketValues } from "./tickets";
 
 export { STATUSES };
 
@@ -193,6 +193,12 @@ export function readMessage(msg) {
     text,
     attachments,
     autoReply: /auto-replied|auto-generated/i.test(headers["auto-submitted"] ?? "") || /^(mailer-daemon|postmaster)@/i.test(from.email ?? ""),
+    // Mail that must never get an auto-reply back (other robots, lists, newsletters)
+    noAutoReply:
+      /^(?!no$)./i.test(headers["auto-submitted"] ?? "") ||
+      /bulk|list|junk/i.test(headers.precedence ?? "") ||
+      Boolean(headers["list-id"] || headers["list-unsubscribe"] || headers["x-autoreply"] || headers["x-autorespond"]) ||
+      /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?|bounces?)[@+._-]/i.test(from.email ?? ""),
   };
 }
 
@@ -261,7 +267,9 @@ async function syncNow(shop) {
     for (const m of incoming) full.push(readMessage(await gmail(`/messages/${m.id}?format=full`)));
     full.sort((a, b) => a.sentAt - b.sentAt);
     for (const m of full) {
-      if (await importMessage(shop, m, { outgoing: m.from.email === mailbox() })) imported++;
+      const done = await importMessage(shop, m, { outgoing: m.from.email === mailbox() });
+      if (done) imported++;
+      if (done === "created") await autoReply(shop, m).catch((e) => console.error(`[helpdesk] auto-reply:`, e?.message ?? e));
       await gmail(`/messages/${m.gmailId}/modify`, { method: "POST", body: { addLabelIds: [label] } });
     }
     const threads = new Set((await db.ticket.findMany({ where: { shop, gmailThreadId: { in: sent.map((m) => m.threadId) } }, select: { gmailThreadId: true } })).map((t) => t.gmailThreadId));
@@ -284,7 +292,9 @@ async function syncNow(shop) {
 export async function importMessage(shop, m, { outgoing = false } = {}) {
   if (await db.ticketMessage.findFirst({ where: { shop, gmailMessageId: m.gmailId } })) return false;
   let ticket = await db.ticket.findFirst({ where: { shop, gmailThreadId: m.threadId } });
+  let isNew = false;
   if (!ticket) {
+    isNew = true;
     // Staff's own emails start no tickets; neither do bounces
     if (outgoing || m.autoReply) return false;
     const last = await db.ticket.findFirst({ where: { shop }, orderBy: { number: "desc" }, select: { number: true } });
@@ -333,7 +343,7 @@ export async function importMessage(shop, m, { outgoing = false } = {}) {
           ...(ticket.status !== "open" && !m.autoReply ? { status: "open", closedAt: null } : {}),
         },
   });
-  return true;
+  return isNew ? "created" : true;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +405,9 @@ export async function getTicket(shop, id) {
       // Our replies are HTML (cleaned again on the way out, to be safe)
       html: m.bodyHtml ? sanitizeHtml(m.bodyHtml) : null,
       staffName: m.staffName,
+      staffId: m.staffId,
+      editedAt: m.editedAt?.toISOString() ?? null,
+      editedBy: m.editedBy ?? null,
       attachments: m.attachments ? JSON.parse(m.attachments).map(({ name, mime, size }, i) => ({ i, name, mime, size })) : [],
       sentAt: m.sentAt.toISOString(),
     })),
@@ -419,6 +432,25 @@ export async function assign(shop, id, staffId) {
   const member = await db.staffMember.findFirst({ where: { shop, id: Number(staffId) } });
   if (!member) throw new HelpdeskError("That staff member isn't in MonkeyBean.");
   await db.ticket.update({ where: { id: Number(id) }, data: { assigneeId: member.id, assigneeName: member.name ?? member.email } });
+}
+
+// Status and assignee together, from the ticket's Save button. Returns what changed.
+export async function updateTicket(shop, id, { status, staffId }) {
+  const t = await ticketOr404(shop, id);
+  if (!STATUSES.includes(status)) throw new HelpdeskError("Unknown status.");
+  const data = {};
+  if (status !== t.status) Object.assign(data, { status, closedAt: status === "closed" ? new Date() : null });
+  const nextAssignee = staffId ? Number(staffId) : null;
+  if (nextAssignee !== (t.assigneeId ?? null)) {
+    if (!nextAssignee) Object.assign(data, { assigneeId: null, assigneeName: null });
+    else {
+      const member = await db.staffMember.findFirst({ where: { shop, id: nextAssignee } });
+      if (!member) throw new HelpdeskError("That staff member isn't in MonkeyBean.");
+      Object.assign(data, { assigneeId: member.id, assigneeName: member.name ?? member.email });
+    }
+  }
+  if (Object.keys(data).length) await db.ticket.update({ where: { id: t.id }, data });
+  return { statusChanged: "status" in data, from: t.status, to: status, assigneeChanged: "assigneeId" in data };
 }
 
 export async function addNote(shop, id, text, user) {
@@ -459,23 +491,35 @@ export async function reply(shop, id, html, user, { status = "waiting", signatur
   const message = sanitizeHtml(html);
   if (isBlank(message)) throw new HelpdeskError("Write a reply first.");
   const t = await ticketOr404(shop, id);
+  const sig = signature && user?.id ? await getSignature(shop, user.id) : null;
+  const full = sig && !isBlank(sig) ? `${message}<br><div class="signature">${sig}</div>` : message;
+  const now = await sendInThread(shop, t, { html: full, kind: "reply", user });
+  await db.ticket.update({
+    where: { id: t.id },
+    data: { lastMessageAt: now, needsReply: false, status: STATUSES.includes(status) ? status : "waiting", closedAt: status === "closed" ? now : null },
+  });
+}
+
+// An email from the help mailbox in the ticket's conversation, recorded on the ticket
+async function sendInThread(shop, t, { html, subject = null, kind, user = null, auto = false }) {
   if (!t.customerEmail) throw new HelpdeskError("This ticket has no customer email address to reply to.");
   const s = await getSync(shop);
   if (!s?.enabledAt) throw new HelpdeskError("Tickets aren't connected to the mailbox yet.");
-  const sig = signature && user?.id ? await getSignature(shop, user.id) : null;
-  const full = sig && !isBlank(sig) ? `${message}<br><div class="signature">${sig}</div>` : message;
-  const text = htmlToText(full);
+  const text = htmlToText(html);
   // Thread it under the customer's latest email
   const lastIn = await db.ticketMessage.findFirst({ where: { shop, ticketId: t.id, kind: "email" }, orderBy: { sentAt: "desc" } });
   const refs = [lastIn?.referencesHeader, lastIn?.messageIdHeader].filter(Boolean).join(" ").trim() || undefined;
+  const subj = (subject ?? "").trim() || reSubject(lastIn?.subject ?? t.subject);
   const { message: raw } = await composer.sendMail({
     from: fromLine(),
     to: t.customerName ? `"${t.customerName.replace(/"/g, "")}" <${t.customerEmail}>` : t.customerEmail,
-    subject: reSubject(lastIn?.subject ?? t.subject),
+    subject: subj,
     text,
-    html: emailDocument(full),
+    html: emailDocument(html),
     inReplyTo: lastIn?.messageIdHeader ?? undefined,
     references: refs,
+    // Robots on the other end shouldn't answer an automatic email
+    headers: auto ? { "Auto-Submitted": "auto-replied", "X-Auto-Response-Suppress": "All" } : undefined,
   });
   const sent = await gmail("/messages/send", { method: "POST", body: { raw: b64url(raw), threadId: t.gmailThreadId } });
   const now = new Date();
@@ -483,24 +527,120 @@ export async function reply(shop, id, html, user, { status = "waiting", signatur
     data: {
       shop,
       ticketId: t.id,
-      kind: "reply",
+      kind,
       gmailMessageId: sent.id ?? null,
       fromName: user?.name ?? null,
       fromEmail: mailbox(),
       toLine: t.customerEmail,
-      subject: reSubject(t.subject),
+      subject: subj.slice(0, 500),
       body: text,
-      bodyHtml: full,
+      bodyHtml: html,
       staffName: user?.name ?? null,
       staffId: user?.id ?? null,
       sentAt: now,
     },
   });
   if (sent.id && s.labelId) await gmail(`/messages/${sent.id}/modify`, { method: "POST", body: { addLabelIds: [s.labelId] } }).catch(() => {});
-  await db.ticket.update({
-    where: { id: t.id },
-    data: { lastMessageAt: now, needsReply: false, status: STATUSES.includes(status) ? status : "waiting", closedAt: status === "closed" ? now : null },
+  return now;
+}
+
+// ---------------------------------------------------------------------------
+// Email templates (designed on the Tickets page; see tickets.js)
+// ---------------------------------------------------------------------------
+
+const AUTO_REPLY_GAP_MS = 12 * 3600 * 1000; // one auto-reply per customer this often, at most
+const shopName = () => process.env.HELPDESK_SHOP_NAME || "Yiggybean";
+
+export async function getTemplates(shop) {
+  const rows = await db.ticketTemplate.findMany({ where: { shop } });
+  return TEMPLATES.map((d) => {
+    const r = rows.find((x) => x.key === d.key);
+    return {
+      key: d.key,
+      name: d.name,
+      description: d.description,
+      live: d.live,
+      subject: r?.subject ?? d.subject,
+      html: r?.html ? sanitizeHtml(r.html) : d.html,
+      enabled: Boolean(r?.enabled),
+      updatedAt: r?.updatedAt?.toISOString() ?? null,
+      updatedBy: r?.updatedBy ?? null,
+      customized: Boolean(r),
+    };
   });
+}
+
+async function template(shop, key) {
+  return (await getTemplates(shop)).find((t) => t.key === key) ?? null;
+}
+
+export async function saveTemplate(shop, key, { subject, html, enabled }, user) {
+  const def = templateDef(key);
+  if (!def) throw new HelpdeskError("Unknown template.");
+  const clean = sanitizeHtml(html, { maxLength: 50_000 });
+  if (isBlank(clean)) throw new HelpdeskError("The email needs some text.");
+  const subj = String(subject ?? "").trim().slice(0, 300) || def.subject;
+  const data = { subject: subj, html: clean, enabled: def.live ? Boolean(enabled) : false, updatedBy: user?.name ?? null };
+  await db.ticketTemplate.upsert({ where: { shop_key: { shop, key } }, create: { shop, key, ...data }, update: data });
+}
+
+// Back to the original wording
+export async function resetTemplate(shop, key) {
+  await db.ticketTemplate.deleteMany({ where: { shop, key } });
+}
+
+// What a template looks like for a ticket (or the sample customer)
+export function renderFor(tpl, ticket, { agentName } = {}) {
+  const values = ticketValues({ ticket, agentName, shopName: shopName() });
+  return { subject: renderTemplate(tpl.subject, values).replace(/\s+/g, " ").trim(), html: sanitizeHtml(renderTemplate(tpl.html, values, { html: true })) };
+}
+
+// The auto-reply for a brand-new ticket
+async function autoReply(shop, m) {
+  if (m.noAutoReply || m.autoReply || !m.from.email || m.from.email === mailbox()) return false;
+  const tpl = await template(shop, "autoReply");
+  if (!tpl?.enabled) return false;
+  const t = await db.ticket.findFirst({ where: { shop, gmailThreadId: m.threadId } });
+  if (!t) return false;
+  // Several emails in a row from one person get one auto-reply
+  const recent = await db.ticketMessage.findFirst({
+    where: { shop, kind: "auto", toLine: t.customerEmail, sentAt: { gte: new Date(Date.now() - AUTO_REPLY_GAP_MS) } },
+  });
+  if (recent) return false;
+  const { subject, html } = renderFor(tpl, t);
+  await sendInThread(shop, t, { html, subject, kind: "auto", auto: true });
+  return true;
+}
+
+// "Send a test to me": the template with the sample customer, to the staff member
+export async function sendTest(shop, { subject, html }, user) {
+  if (!user?.email) throw new HelpdeskError("MonkeyBean doesn't know your email address.");
+  const s = await getSync(shop);
+  if (!s?.enabledAt) throw new HelpdeskError("Connect the mailbox first: tests are sent from it.");
+  const sample = { number: 1042, subject: "Where is my order?", status: "open", customerName: "Jane Doe", customerEmail: "jane@example.com" };
+  const r = renderFor({ subject, html: sanitizeHtml(html) }, sample, { agentName: user.name });
+  const { message: raw } = await composer.sendMail({
+    from: fromLine(),
+    to: user.email,
+    subject: `[Test] ${r.subject}`,
+    text: htmlToText(r.html),
+    html: emailDocument(r.html),
+  });
+  await gmail("/messages/send", { method: "POST", body: { raw: b64url(raw) } });
+  return user.email;
+}
+
+// ---------------------------------------------------------------------------
+// Editing internal notes (the person who wrote it, or an admin)
+// ---------------------------------------------------------------------------
+
+export async function editNote(shop, messageId, text, user) {
+  const body = String(text ?? "").trim();
+  if (!body) throw new HelpdeskError("A note can't be empty.");
+  const m = await db.ticketMessage.findFirst({ where: { shop, id: Number(messageId), kind: "note" } });
+  if (!m) throw new HelpdeskError("That note doesn't exist.");
+  if (!user?.isAdmin && m.staffId !== user?.id) throw new HelpdeskError("Only the person who wrote a note (or an app admin) can edit it.");
+  await db.ticketMessage.update({ where: { id: m.id }, data: { body: body.slice(0, BODY_LIMIT), editedAt: new Date(), editedBy: user?.name ?? null } });
 }
 
 // ---------------------------------------------------------------------------
