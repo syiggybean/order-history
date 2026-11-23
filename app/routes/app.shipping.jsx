@@ -45,6 +45,8 @@ import { completeBatch, flowPickAll, logBulkLabelOverride, setFlowMode, findBox,
 import { createPortal } from "react-dom";
 import { assertInBatch, batchLabelFile, bulkStatus, buyLabel, labelFile, startBulkLabels } from "../labels.server";
 import { flagOrder, listFlags, openFlagCount, reopenFlag, resolveFlag } from "../flags.server";
+import { listReturns, returnCounts, returnStatus } from "../returns.server";
+import { ReturnsTab } from "../components/shipping/ReturnsTab";
 import { enterSandbox, inSandbox, leaveSandbox, resetSandbox, sandboxAdmin, sandboxShopOf, sandboxSummary } from "../sandbox.server";
 import { EnterSandboxButton, SandboxBanner, SandboxSettings } from "../components/shipping/Sandbox";
 import { BatchHeader, BatchList, RemoveBar, SelectionBar } from "../components/shipping/Batches";
@@ -111,7 +113,7 @@ async function batchLocksFor(shop, list, user, early) {
 const releaseDayLabel = (day) => new Date(`${day}T12:00:00Z`).toLocaleDateString("en-US", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" });
 
 const PAGE_SIZE = 50;
-const TABS = ["ready", "waiting", "batches", "review", "merge", "stock", "settings"];
+const TABS = ["ready", "waiting", "batches", "review", "returns", "merge", "stock", "settings"];
 
 const filterFrom = (params) => ({
   q: params.get("q") || "",
@@ -188,8 +190,23 @@ export const loader = async ({ request }) => {
         ? { plan: await customerPlan(shop, mergeAdmin, params.get("customer")), merges: [] }
         : { ...(await mergeCandidates(shop, mergeAdmin)), merges: await listMerges(shop) }
       : null;
+  // Returns: always the real store (Shopify's returns), with counts for the tab
+  const rCounts = await returnCounts(session.shop).catch(() => ({ requested: 0, awaiting: 0 }));
+  const rStage = ["awaiting", "done", "all"].includes(params.get("rstage")) ? params.get("rstage") : "requested";
+  const returns =
+    tab === "returns"
+      ? {
+          stage: rStage,
+          q: params.get("rq") || "",
+          list: await listReturns(session.shop, { stage: rStage === "all" ? null : rStage, q: params.get("rq") || "" }),
+          counts: rCounts,
+          status: await returnStatus(session.shop),
+        }
+      : null;
   return {
     merge,
+    returns,
+    returnCounts: rCounts,
     batchLockList: Object.fromEntries(lockMap),
     lock: batchId ? (lockMap.get(batchId) ?? null) : null,
     tab,
@@ -248,6 +265,7 @@ export const loader = async ({ request }) => {
       batches: canBatches,
       pick: can(user, "shipping", "pick"),
       review: can(user, "shipping", "review"),
+      returns: can(user, "shipping", "returns"),
       pack: can(user, "shipping", "pack"),
       ship: can(user, "shipping", "ship"),
       override: can(user, "shipping", "override"),
@@ -1912,7 +1930,7 @@ export default function Shipping() {
 }
 
 function Page() {
-  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock, merge } =
+  const { tab, filter, overview, list, events, sync, can: allowed, batches, batch, pick, bins, binQuery, show, liveBatchCount, openBatches, flags, flagStatus, flagCount, sandbox, pack, box: packBox, slips, shopAdmin, restricted, mine, hiddenBatch, me, staff, printing, pairs, variants, tiles, batchLockList, lock, merge, returns, returnCounts: rCounts } =
     useLoaderData();
   const [, setParams] = useSearchParams();
   const revalidator = useRevalidator();
@@ -1934,6 +1952,7 @@ function Page() {
     { id: "waiting", label: "Waiting", n: c.waiting ?? 0 },
     { id: "batches", label: "Batches", n: liveBatchCount },
     { id: "review", label: "Review", n: flagCount, alert: flagCount > 0 },
+    { id: "returns", label: "Returns", n: (rCounts?.requested ?? 0) + (rCounts?.awaiting ?? 0), alert: (rCounts?.requested ?? 0) > 0 },
     ...(allowed.merge ? [{ id: "merge", label: "Order Merge" }] : []),
     { id: "stock", label: "Stock vs orders" },
     { id: "settings", label: "Settings and activity" },
@@ -2082,6 +2101,7 @@ function Page() {
         <s-paragraph>{hiddenBatch ? "That batch isn't assigned to you. Ask a lead to assign it if you should be working on it." : "That batch couldn't be found."}</s-paragraph>
       )}
       {tab === "review" && flags && <ReviewTab flags={flags} status={flagStatus} canReview={allowed.review} />}
+      {tab === "returns" && returns && <ReturnsTab data={returns} canReturns={allowed.returns} />}
       {tab === "merge" && (allowed.merge ? <MergeTab data={merge} /> : <s-paragraph>Order Merge needs the "Merge orders" permission.</s-paragraph>)}
       {tab === "stock" && <StockTab overview={overview} />}
       {tab === "settings" && <SettingsTab overview={overview} events={events} sync={sync} canSettings={allowed.settings} sandboxOn={Boolean(sandbox)} printing={printing} canPrint={allowed.pack || allowed.ship} />}

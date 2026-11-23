@@ -1,36 +1,54 @@
 import { can, denied, getStaff } from "../permissions.server";
 import { orderAudit } from "../order-audit.server";
+import { orderPanel } from "../order-panel.server";
 import { appUrl } from "../print.server";
 import { ReshipError, createReship, reshipInfo } from "../reship.server";
+import { ReturnsError, approveReturn, declineReturn, listReturns, returnableItems, startReturn, syncNow, verifyReturn } from "../returns.server";
 
-// Order flyouts on any page:
-//   { orderId } or { orderName }      the order's MonkeyBean history (who picked,
-//                                     packed and shipped, batch, scan overrides, videos)
-//   { intent: "reshipInfo", orderId } what can be reshipped
-//   { intent: "reship", orderId, items, reason, note, notify }  make the $0 reship order
+// The order flyout on any page, and returns:
+//   { intent: "panel", orderId }                  everything the order flyout shows
+//   { orderId } or { orderName }                  the order's MonkeyBean history only
+//   { intent: "reshipInfo" | "reship", … }        Reship (needs "Create reship orders")
+//   { intent: "returnable" | "startReturn" | "approveReturn" | "declineReturn" | "verifyReturn" | "syncReturns", … }
+//                                                 Returns (needs "Process returns")
+const ORDER = /^gid:\/\/shopify\/Order\/\d+$/;
+const RETURN_INTENTS = ["returnable", "startReturn", "approveReturn", "declineReturn", "verifyReturn", "syncReturns"];
+
+const parse = (v, fallback) => {
+  try {
+    return JSON.parse(String(v ?? ""));
+  } catch {
+    return fallback;
+  }
+};
+
 export const action = async ({ request }) => {
   const { session, user, admin } = await getStaff(request);
   if (!can(user, "shipping", "view") && !can(user, "tickets", "view")) return { error: "You don't have access to order history.", denied: true };
   const form = await request.formData();
   const intent = String(form.get("intent") ?? "audit");
   const orderId = String(form.get("orderId") ?? "").trim();
+  const shop = session.shop;
+  const canVideo = can(user, "packingVideos", "view");
   const canReship = can(user, "shipping", "reship");
+  const canReturns = can(user, "shipping", "returns");
   try {
+    if (intent === "panel") {
+      if (!ORDER.test(orderId)) return { intent, error: "Which order?" };
+      const panel = await orderPanel(shop, admin, orderId, { appOrigin: appUrl(request), canVideo });
+      if (!panel) return { intent, error: "That order isn't in Shopify." };
+      return { intent, ...panel, can: { reship: canReship, returns: canReturns, video: canVideo } };
+    }
+
     if (intent === "reshipInfo" || intent === "reship") {
       if (!canReship) return { intent, ...denied("shipping", "reship") };
-      if (intent === "reshipInfo") return { intent, info: await reshipInfo(session.shop, admin, orderId) };
-      let items = [];
-      try {
-        items = JSON.parse(String(form.get("items") ?? "[]"));
-      } catch {
-        return { intent, error: "Something was wrong with the form. Reload and try again." };
-      }
+      if (intent === "reshipInfo") return { intent, info: await reshipInfo(shop, admin, orderId) };
       const made = await createReship(
-        session.shop,
+        shop,
         admin,
         {
           orderId,
-          items,
+          items: parse(form.get("items"), []),
           reason: form.get("reason"),
           note: form.get("note"),
           notify: form.get("notify") === "1",
@@ -40,16 +58,34 @@ export const action = async ({ request }) => {
       );
       return { intent, ok: true, made };
     }
+
+    if (RETURN_INTENTS.includes(intent)) {
+      if (!canReturns) return { intent, ...denied("shipping", "returns") };
+      const id = form.get("returnId");
+      if (intent === "returnable") return { intent, info: await returnableItems(shop, admin, orderId) };
+      if (intent === "startReturn")
+        return {
+          intent,
+          ok: true,
+          made: await startReturn(shop, admin, { orderId, items: parse(form.get("items"), []), reason: form.get("reason"), note: form.get("note"), notifyCustomer: form.get("notify") === "1" }, user),
+        };
+      if (intent === "approveReturn") return { intent, ok: true, ret: await approveReturn(shop, admin, id, user, { notifyCustomer: form.get("notify") !== "0" }) };
+      if (intent === "declineReturn")
+        return { intent, ok: true, ret: await declineReturn(shop, admin, id, user, { reason: form.get("reason"), note: form.get("note"), notifyCustomer: form.get("notify") !== "0" }) };
+      if (intent === "verifyReturn") return { intent, ok: true, ret: await verifyReturn(shop, admin, id, { found: parse(form.get("found"), []), note: form.get("note") }, user) };
+      if (intent === "syncReturns") {
+        await syncNow(shop, admin);
+        return { intent, ok: true, returns: await listReturns(shop, {}) };
+      }
+    }
+
+    // The history only (older callers)
     const orderName = String(form.get("orderName") ?? "").trim();
-    if (!/^gid:\/\/shopify\/Order\/\d+$/.test(orderId) && !/^#?[\w-]{1,40}$/.test(orderName)) return { intent, error: "Which order?" };
-    const audit = await orderAudit(
-      session.shop,
-      orderId ? { orderId } : { orderName: orderName.startsWith("#") ? orderName : `#${orderName}` },
-      { appOrigin: appUrl(request), canVideo: can(user, "packingVideos", "view") },
-    );
-    return { intent, audit, canVideo: can(user, "packingVideos", "view"), canReship };
+    if (!ORDER.test(orderId) && !/^#?[\w-]{1,40}$/.test(orderName)) return { intent, error: "Which order?" };
+    const audit = await orderAudit(shop, orderId ? { orderId } : { orderName: orderName.startsWith("#") ? orderName : `#${orderName}` }, { appOrigin: appUrl(request), canVideo, admin });
+    return { intent, audit, canVideo, canReship };
   } catch (e) {
-    if (e instanceof ReshipError) return { intent, error: e.message };
+    if (e instanceof ReshipError || e instanceof ReturnsError) return { intent, error: e.message };
     console.error("[order-audit]", intent, e);
     return { intent, error: `Something went wrong: ${e?.message ?? e}` };
   }

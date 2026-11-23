@@ -3,7 +3,7 @@ import { useFetcher } from "react-router";
 import { Flyout } from "../Flyout";
 import { ShopAdminContext } from "./Notice";
 import { STORE_TZ, muted, pill, small } from "./ui";
-import { OrderAudit } from "../OrderAudit";
+import { OrderFlyout } from "../OrderPanel";
 
 // "Find an order": type an order number, see where it is in Shipping or why it isn't listed.
 
@@ -31,6 +31,11 @@ export function OrderLookupBox({ onGo }) {
   }, [data, busy]);
 
   const submit = (intent) => fetcher.submit({ intent, q: text }, { method: "post" });
+  // A re-sync reloads the order flyout under the answer
+  const [resyncs, setResyncs] = useState(0);
+  useEffect(() => {
+    if (data?.resynced && !busy) setResyncs((n) => n + 1);
+  }, [data, busy]);
   return (
     <>
       <form
@@ -53,20 +58,63 @@ export function OrderLookupBox({ onGo }) {
           Find
         </s-button>
       </form>
-      {open && data && (
+      {open && data && data.found && data.orderId ? (
+        <OrderFlyout
+          orderId={data.orderId}
+          title={`Where is ${data.name}?`}
+          refreshKey={resyncs}
+          onClose={() => setOpen(false)}
+          onOpenBatch={(batchId) => {
+            setOpen(false);
+            onGo?.("batches", data.name, batchId);
+          }}
+          top={
+            <LookupAnswer
+              data={data}
+              busy={busy}
+              onResync={() => submit("resyncOrder")}
+              onGo={(tab, batchId) => {
+                setOpen(false);
+                onGo?.(tab, data.name, batchId);
+              }}
+            />
+          }
+        />
+      ) : open && data ? (
         <Flyout label="Order lookup" title={data.name ? `Where is ${data.name}?` : "Order lookup"} width={500} onClose={() => setOpen(false)}>
-          <LookupResult
-            data={data}
-            busy={busy}
-            onResync={() => submit("resyncOrder")}
-            onGo={(tab, batchId) => {
-              setOpen(false);
-              onGo?.(tab, data.name, batchId);
-            }}
-          />
+          <LookupResult data={data} busy={busy} />
         </Flyout>
-      )}
+      ) : null}
     </>
+  );
+}
+
+// The answer to "where is it?" and what to do about it (above the order's tabs)
+function LookupAnswer({ data, busy, onResync, onGo }) {
+  const anyProblem = data.canResync;
+  const listed = data.parts.find((p) => p.shipment && STATE_TAB[p.shipment.state]);
+  const listedTab = listed ? STATE_TAB[listed.shipment.state] : null;
+  return (
+    <div style={{ display: "grid", gap: "8px", marginTop: "4px" }}>
+      <div
+        role="status"
+        style={{ padding: "8px 10px", borderRadius: "8px", background: anyProblem ? "#fff1e3" : "#f1f8f5", borderLeft: `4px solid ${anyProblem ? "#e3a008" : "#29845a"}` }}
+      >
+        <strong>{anyProblem ? "Not listed" : "Found"}</strong>
+        <div style={{ marginTop: "2px" }}>{data.summary}</div>
+        {data.resynced && <div style={{ ...small, marginTop: "4px" }}>Re-read from Shopify just now.</div>}
+      </div>
+      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+        {listedTab && (
+          <s-button onClick={() => onGo(listedTab, listed.shipment.batchId)}>
+            Show on {listedTab === "ready" ? "Ready to ship" : listedTab === "waiting" ? "Waiting" : (listed.shipment.batchTitle ?? `batch ${listed.shipment.batchId}`)}
+          </s-button>
+        )}
+        <s-button variant={anyProblem ? "primary" : "secondary"} onClick={onResync} disabled={busy || undefined} loading={busy || undefined}>
+          Re-sync from Shopify
+        </s-button>
+      </div>
+    </div>
   );
 }
 
@@ -174,7 +222,6 @@ export function LookupResult({ data, busy, onResync, onGo }) {
         </div>
       </div>
 
-      <OrderAudit orderId={data.orderId} refreshKey={data.resynced ? 1 : 0} />
     </div>
   );
 }

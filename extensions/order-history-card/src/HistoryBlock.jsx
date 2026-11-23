@@ -13,7 +13,7 @@ export default async () => {
 
 const fmtTime = (iso) => (iso ? new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) : "");
 const mins = (s) => (s == null ? null : s >= 60 ? `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s` : `${Math.round(s)}s`);
-const SCAN = { scanned: ["Scanned", "success"], partly: ["Partly scanned", "warning"], not_scanned: ["Not scanned", "critical"] };
+const SCAN = { scanned: ["Scanned", "success"], partly: ["Partly scanned", "warning"], not_scanned: ["Not scanned", "critical"], outside: ["Packed outside MonkeyBean", "neutral"] };
 
 function Step({ label, step, empty }) {
   return (
@@ -56,7 +56,7 @@ function Part({ p, multi }) {
         {(multi || p.overrides.length > 0) && (
           <s-stack direction="inline" gap="small-200" alignItems="center">
             {multi && <s-text type="strong">Part {p.part}</s-text>}
-            {p.overrides.length > 0 && <s-badge tone="critical">Scan overridden</s-badge>}
+            {p.overrides.length > 0 && <s-badge tone="critical">{p.overrides.some((o) => o.scan) ? "Scan overridden" : "Override"}</s-badge>}
           </s-stack>
         )}
         <Items items={p.items} />
@@ -77,8 +77,8 @@ function Part({ p, multi }) {
           step={p.batch ? { by: p.batch.title, detail: [p.batch.createdBy ? `created by ${p.batch.createdBy}` : null, p.batch.priority && p.batch.priority !== "Normal" ? `${p.batch.priority} priority` : null].filter(Boolean).join(" · ") || null } : null}
           empty="Not batched"
         />
-        <Step label="Picked" step={p.picked} empty="Not yet" />
-        <Step label="Packed" step={p.packed} empty="Not yet" />
+        <Step label="Picked" step={p.picked} empty={p.shipped ? "Not in MonkeyBean" : "Not yet"} />
+        <Step label="Packed" step={p.packed} empty={p.shipped ? "Not in MonkeyBean" : "Not yet"} />
         <Step label="Shipped" step={p.shipped} empty="Not yet" />
         {p.overrides.map((o, i) => (
           <s-banner key={i} tone="critical" heading={`${o.kind}${o.by ? ` by ${o.by}` : ""}`}>
@@ -151,9 +151,20 @@ function Extension() {
           </s-stack>
         )}
         {a && a.parts.length === 0 && <s-text color="subdued">MonkeyBean hasn't handled this order yet.</s-text>}
-        {a?.parts.map((p) => (
-          <Part key={p.id} p={p} multi={a.multiPart} />
-        ))}
+        {a?.parts
+          .filter((p) => !p.nothingSent)
+          .map((p) => (
+            <Part key={p.id} p={p} multi={a.multiPart} />
+          ))}
+        {a?.parts.some((p) => p.nothingSent) && (
+          <s-text color="subdued">
+            {a.parts
+              .filter((p) => p.nothingSent)
+              .map((p) => `Part ${p.part}`)
+              .join(", ")}{" "}
+            closed in Shopify with nothing shipped (items moved to another part, cancelled or removed).
+          </s-text>
+        )}
         {a && a.history.length > 0 && (
           <s-stack direction="block" gap="small">
             <s-stack direction="inline">

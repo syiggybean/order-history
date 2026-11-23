@@ -36,7 +36,7 @@ import {
 } from "../helpdesk.server";
 import { STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
 import { emailDocument, sanitizeHtml } from "../email-html";
-import { OrderAudit } from "../components/OrderAudit";
+import { OrderFlyout as SharedOrderFlyout } from "../components/OrderPanel";
 import { AddressError, changeAddresses, openOrders } from "../address-change.server";
 
 // Tickets: emails to help@ as tickets, answered from here
@@ -1535,137 +1535,30 @@ function CustomerFlyout({ id, onClose, onOrder }) {
   );
 }
 
+// The shared order flyout, with a way back to the customer it was opened from
 function OrderFlyout({ id, onClose, onBack, onCustomer }) {
-  const { data, loading } = useDetail("orderDetail", "orderId", id);
-  const o = data?.order;
-  const line = (label, value, strong) =>
-    value ? (
-      <span style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontWeight: strong ? 600 : 400 }}>
-        <span style={strong ? {} : muted}>{label}</span>
-        <span>{value}</span>
-      </span>
-    ) : null;
   return (
-    <Flyout onClose={onClose} label="Order" title={o ? `Order ${o.name}` : "Order"} width={520}>
-      {onBack && (
-        <button type="button" style={{ ...linkStyle, fontSize: "13px", marginBottom: "10px" }} onClick={onBack}>
-          ← Back to customer
-        </button>
-      )}
-      {loading && !o && <span style={muted}>Loading…</span>}
-      {data?.error && <span style={{ color: "#8e1f0b" }}>{data.error}</span>}
-      {o && (
-        <>
-          <div style={section}>
-            <span style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
-              <span>{new Date(o.at).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}</span>
-              {o.cancelled ? (
-                <Pill tone="red">Cancelled{o.cancelled.reason ? ` (${titleCase(o.cancelled.reason)})` : ""}</Pill>
-              ) : (
-                <>
-                  <Pill tone={/PAID/i.test(o.paid ?? "") && !/PARTIALLY|UN/i.test(o.paid ?? "") ? "green" : "yellow"}>{titleCase(o.paid)}</Pill>
-                  <Pill tone={/^FULFILLED$/i.test(o.fulfilled ?? "") ? "green" : "yellow"}>{titleCase(o.fulfilled)}</Pill>
-                </>
-              )}
-            </span>
-            {o.customer && (
-              <button type="button" style={{ ...linkStyle, textAlign: "left", fontSize: "13px" }} onClick={() => onCustomer(o.customer.id)}>
-                {o.customer.name}
+    <SharedOrderFlyout
+      orderId={id}
+      onClose={onClose}
+      zIndex={1000}
+      top={({ order }) =>
+        onBack || order?.customer?.id ? (
+          <span style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
+            {onBack && (
+              <button type="button" style={{ ...linkStyle, fontSize: "13px" }} onClick={onBack}>
+                ← Back to customer
               </button>
             )}
-            <a href={o.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
-              Open in Shopify ↗
-            </a>
-          </div>
-          <div style={section}>
-            <span style={heading}>Items</span>
-            {o.items.map((l) => (
-              <div key={l.id} style={{ display: "grid", gridTemplateColumns: "44px minmax(0, 1fr) auto", gap: "8px", alignItems: "center", opacity: l.current === 0 ? 0.55 : 1 }}>
-                {l.image ? (
-                  <img src={l.image} alt="" width={44} height={44} style={{ objectFit: "cover", borderRadius: "6px", border: "1px solid #eee" }} />
-                ) : (
-                  <span style={{ width: 44, height: 44, borderRadius: "6px", background: "#f3f3f3" }} />
-                )}
-                <span style={{ display: "grid" }}>
-                  <span style={{ textDecoration: l.current === 0 ? "line-through" : "none" }}>{l.title}</span>
-                  <span style={small}>
-                    {[l.variant, l.sku].filter(Boolean).join(" · ")}
-                    {l.current !== l.qty ? ` · ${l.qty - l.current} removed or refunded` : ""}
-                  </span>
-                </span>
-                <span style={{ whiteSpace: "nowrap" }}>
-                  {l.current} × {l.price}
-                </span>
-              </div>
-            ))}
-          </div>
-          <div style={section}>
-            {line("Subtotal", o.totals.subtotal)}
-            {line("Discounts", o.totals.discounts && `−${o.totals.discounts}`)}
-            {line(`Shipping${o.shippingMethod ? ` (${o.shippingMethod})` : ""}`, o.totals.shipping)}
-            {line("Tax", o.totals.tax)}
-            {line("Total", o.totals.total, true)}
-            {line("Refunded", o.totals.refunded && `−${o.totals.refunded}`)}
-          </div>
-          {o.packing?.length > 0 && (
-            <div style={section}>
-              <span style={heading}>In Shipping (not sent yet)</span>
-              {o.packing.map((p, i) => (
-                <div key={i} style={{ display: "grid", gap: "3px", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px" }}>
-                  <span style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
-                    {o.packing.length > 1 && <strong>Part {p.part}</strong>}
-                    <Pill tone={p.batch ? "blue" : p.state === "ready" ? "green" : "yellow"}>{p.batch ? "Batched" : p.label}</Pill>
-                    {p.batch && <span style={{ fontWeight: 600 }}>{p.batch.title}</span>}
-                    {p.batch && p.state !== "batched" && <span style={muted}>({p.label.toLowerCase()})</span>}
-                  </span>
-                  {p.waitingReason && <span style={muted}>{p.waitingReason}</span>}
-                  {p.items.length > 0 && <span style={small}>{p.items.map((it) => `${it.quantity} × ${it.name}`).join(" · ")}</span>}
-                </div>
-              ))}
-            </div>
-          )}
-          <div style={section}>
-            <OrderAudit orderId={o.id} />
-          </div>
-          <div style={section}>
-            <span style={heading}>Shipping</span>
-            {o.shipTo.length > 0 ? <span style={{ whiteSpace: "pre-line" }}>{o.shipTo.join("\n")}</span> : <span style={muted}>No shipping address.</span>}
-            {o.fulfillments.length === 0 && <span style={muted}>Not shipped yet.</span>}
-            {o.fulfillments.map((fl, i) => (
-              <div key={i} style={{ display: "grid", gap: "2px", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px" }}>
-                <span>
-                  {titleCase(fl.status)} · {new Date(fl.at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
-                </span>
-                {fl.tracking.map((t, j) =>
-                  t.url ? (
-                    <a key={j} href={t.url} target="_blank" rel="noreferrer" style={{ color: "#005bd3" }}>
-                      {t.company ? `${t.company} ` : ""}
-                      {t.number} ↗
-                    </a>
-                  ) : (
-                    <span key={j}>
-                      {t.company ? `${t.company} ` : ""}
-                      {t.number}
-                    </span>
-                  ),
-                )}
-              </div>
-            ))}
-          </div>
-          {(o.note || o.tags.length > 0) && (
-            <div style={{ ...section, borderBottom: "none" }}>
-              {o.note && (
-                <>
-                  <span style={heading}>Order note</span>
-                  <span style={{ whiteSpace: "pre-wrap" }}>{o.note}</span>
-                </>
-              )}
-              {o.tags.length > 0 && <span style={small}>Tags: {o.tags.join(", ")}</span>}
-            </div>
-          )}
-        </>
-      )}
-    </Flyout>
+            {!onBack && order?.customer?.id && (
+              <button type="button" style={{ ...linkStyle, fontSize: "13px" }} onClick={() => onCustomer(order.customer.id)}>
+                Customer details
+              </button>
+            )}
+          </span>
+        ) : null
+      }
+    />
   );
 }
 

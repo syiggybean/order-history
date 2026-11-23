@@ -1293,8 +1293,13 @@ const ORDER_DETAILS = `#graphql
       displayFulfillmentStatus
       tags
       note
-      customer { displayName numberOfOrders }
+      email
+      customer { id displayName numberOfOrders }
       currentTotalPriceSet { shopMoney { amount currencyCode } }
+      currentSubtotalPriceSet { shopMoney { amount currencyCode } }
+      totalShippingPriceSet { shopMoney { amount currencyCode } }
+      currentTotalTaxSet { shopMoney { amount currencyCode } }
+      currentTotalDiscountsSet { shopMoney { amount currencyCode } }
       shippingLines(first: 5) { nodes { title } }
       lineItems(first: 100) {
         nodes {
@@ -1317,7 +1322,7 @@ const ORDER_DETAILS = `#graphql
 // of the order should still show without it
 const ORDER_ADDRESS = `#graphql
   query ($id: ID!) {
-    order(id: $id) { shippingAddress { name city provinceCode zip countryCodeV2 } }
+    order(id: $id) { shippingAddress { name company address1 address2 city provinceCode zip countryCodeV2 phone } }
   }`;
 
 const tidy = (s) => (s ? s.toLowerCase().replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()) : null);
@@ -1346,10 +1351,25 @@ export async function orderDetails(shop, admin, orderId) {
     fulfillment: tidy(o.displayFulfillmentStatus),
     tags: o.tags,
     note: o.note,
-    customer: o.customer ? { name: o.customer.displayName, orders: Number(o.customer.numberOfOrders) } : null,
+    customer: o.customer ? { id: o.customer.id, name: o.customer.displayName, orders: Number(o.customer.numberOfOrders), email: o.email ?? null } : null,
     total: o.currentTotalPriceSet?.shopMoney ?? null,
+    money: {
+      subtotal: o.currentSubtotalPriceSet?.shopMoney ?? null,
+      discounts: o.currentTotalDiscountsSet?.shopMoney ?? null,
+      shipping: o.totalShippingPriceSet?.shopMoney ?? null,
+      tax: o.currentTotalTaxSet?.shopMoney ?? null,
+      total: o.currentTotalPriceSet?.shopMoney ?? null,
+    },
     shippingMethods: o.shippingLines.nodes.map((l) => l.title),
-    address: a ? { name: a.name, place: [a.city, a.provinceCode, a.zip].filter(Boolean).join(", "), country: a.countryCodeV2 } : null,
+    address: a
+      ? {
+          name: a.name,
+          place: [a.city, a.provinceCode, a.zip].filter(Boolean).join(", "),
+          country: a.countryCodeV2,
+          lines: [a.name, a.company, a.address1, a.address2, [a.city, a.provinceCode, a.zip].filter(Boolean).join(" "), a.countryCodeV2].filter(Boolean),
+          phone: a.phone ?? null,
+        }
+      : null,
     lines: o.lineItems.nodes
       .filter((l) => l.currentQuantity > 0 || l.quantity > 0)
       .map((l) => ({
@@ -1630,7 +1650,12 @@ export async function lookupOrder(shop, admin, text) {
   const found = (await gql(admin, FIND_ORDER, { q: `name:${JSON.stringify(name)}` }))?.orders?.nodes ?? [];
   const hit = found.find((o) => o.name.toLowerCase() === name.toLowerCase());
   if (!hit) return { name, found: false };
-  const o = (await gql(admin, LOOKUP_ORDER, { id: hit.id }))?.order;
+  return lookupOrderById(shop, admin, hit.id, name);
+}
+
+// Where an order is (by its Shopify ID): each part's state and a plain answer
+export async function lookupOrderById(shop, admin, orderId, name = null) {
+  const o = (await gql(admin, LOOKUP_ORDER, { id: orderId }))?.order;
   if (!o) return { name, found: false };
 
   const [shipments, events] = await Promise.all([

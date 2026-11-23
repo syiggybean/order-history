@@ -60,6 +60,10 @@ export const EVENT_LABELS = {
   pack_clip: "Customer video clip",
   reship_created: "Reship order created",
   reship_of: "This is a reship",
+  return_started: "Return started",
+  return_approved: "Return request approved",
+  return_declined: "Return request declined",
+  return_verified: "Return verified (package arrived)",
   hold_mode: "Hold mode changed",
 };
 // Batch-wide events worth showing on each of its orders
@@ -79,14 +83,17 @@ function scanned(box, lines) {
   const all = [...json(box.lines, []), ...json(box.mergedLines, []), ...json(box.freebieLines, [])];
   const need = {};
   for (const l of all) need[itemKey(l)] = (need[itemKey(l)] ?? 0) + (l.quantity ?? 0);
-  const packed = box.state === "packed" || box.state === "labeling" || box.state === "shipped" || Boolean(box.packedAt);
+  // Packed at MonkeyBean's pack bench (someone scanned, or chose to skip scanning)
+  const packedHere = Boolean(box.packedAt || box.packedBy);
+  const gone = box.state === "shipped" || box.state === "closed";
   return lines.map((l) => {
     const k = itemKey(l);
     const got = Math.min(counts[k] ?? 0, need[k] ?? 0);
+    const full = got > 0 && got >= (need[k] ?? 0);
     return {
       name: itemName(l),
       quantity: l.quantity,
-      scan: !packed && !got ? null : got >= (need[k] ?? 0) && got > 0 ? "scanned" : got > 0 ? "partly" : packed ? "not_scanned" : null,
+      scan: full ? "scanned" : got > 0 ? "partly" : packedHere ? "not_scanned" : gone ? "outside" : null,
     };
   });
 }
@@ -104,7 +111,26 @@ async function carrierOf(shop, s) {
 // The link a staff member can watch a packing video with (2 hours)
 const videoUrl = (v, shop, appOrigin) => (appOrigin ? `${String(appOrigin).replace(/\/+$/, "")}/packcam/media?t=${signLink({ k: "rec", id: v.id, shop }, 2 * 60 * 60_000)}` : null);
 
-export async function orderAudit(shop, { orderId = null, orderName = null } = {}, { appOrigin = null, canVideo = false } = {}) {
+// Closed fulfillment orders with no fulfillment on them: Shopify closed them
+// with nothing shipped (items moved to another part, cancelled, removed)
+const FO_SENT = `#graphql
+  query AuditFulfillmentOrders($ids: [ID!]!) {
+    nodes(ids: $ids) { ... on FulfillmentOrder { id status fulfillments(first: 1) { nodes { id } } } }
+  }`;
+async function nothingSentIds(admin, shipments) {
+  const ids = shipments.filter((s) => (s.state === "shipped" || s.state === "closed") && s.labelStatus !== "bought" && !s.packedAt && s.fulfillmentOrderId).map((s) => s.fulfillmentOrderId);
+  if (!admin || !ids.length) return new Set();
+  try {
+    const res = await admin.graphql(FO_SENT, { variables: { ids: ids.slice(0, 50) } });
+    const nodes = (await res.json())?.data?.nodes ?? [];
+    return new Set(nodes.filter((n) => n?.id && n.status === "CLOSED" && !(n.fulfillments?.nodes ?? []).length).map((n) => n.id));
+  } catch (e) {
+    console.error("[order-audit] fulfillment orders:", e?.message ?? e);
+    return new Set();
+  }
+}
+
+export async function orderAudit(shop, { orderId = null, orderName = null } = {}, { appOrigin = null, canVideo = false, admin = null } = {}) {
   if (!orderId && !orderName) return null;
   const shipments = await db.shipment.findMany({
     where: { shop, ...(orderId ? { orderId: String(orderId) } : { orderName: String(orderName) }) },
@@ -157,11 +183,11 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
     const overrides = [];
     if (box.packOverride) {
       const i = box.packOverride.indexOf(":");
-      overrides.push({ kind: "Packed without a full scan", by: i > 0 ? box.packOverride.slice(0, i).trim() : null, reason: i > 0 ? box.packOverride.slice(i + 1).trim() : box.packOverride, at: iso(box.packedAt) });
+      overrides.push({ kind: "Packed without a full scan", scan: true, by: i > 0 ? box.packOverride.slice(0, i).trim() : null, reason: i > 0 ? box.packOverride.slice(i + 1).trim() : box.packOverride, at: iso(box.packedAt) });
     }
-    if (box.overrideBy || box.overrideReason) overrides.push({ kind: "Let through outside a batch", by: box.overrideBy, reason: box.overrideReason, at: iso(box.overrideAt) });
+    if (box.overrideBy || box.overrideReason) overrides.push({ kind: "Let through outside a batch", scan: false, by: box.overrideBy, reason: box.overrideReason, at: iso(box.overrideAt) });
     for (const e of boxEvents.filter((e) => OVERRIDE_EVENTS.has(e.type) && e.type !== "packed_override" && e.type !== "ship_outside_batch"))
-      overrides.push({ kind: EVENT_LABELS[e.type] ?? e.type, by: e.userName, reason: e.detail, at: iso(e.createdAt) });
+      overrides.push({ kind: EVENT_LABELS[e.type] ?? e.type, scan: e.type === "pack_visual", by: e.userName, reason: e.detail, at: iso(e.createdAt) });
     return {
       batch: b
         ? { id: b.id, title: batchTitle(b), status: b.status, createdBy: b.createdBy, createdAt: iso(b.createdAt), priority: PRIORITY[b.priority] ?? null }
@@ -187,6 +213,7 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
     };
   };
 
+  const emptyFOs = await nothingSentIds(admin, shipments);
   const parts = [];
   for (const s of shipments) {
     const mine = evs.filter((e) => e.shipmentId === s.id);
@@ -208,7 +235,10 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
           id: s.id,
           part: s.partIndex,
           state: s.state,
+          fulfillmentOrderId: s.fulfillmentOrderId,
           ...box,
+          // This part's own overrides, and the box's
+          overrides: [...own.overrides, ...box.overrides],
           // Sent automatically when the main box shipped
           shipped: box.shipped ?? (merged ? { by: merged.userName, at: iso(merged.createdAt), how: "merged", detail: null } : null),
           inBox: { orderName: main.orderName, orderId: main.orderId, done: s.state === "shipped" || s.state === "closed" },
@@ -217,6 +247,11 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
         });
         continue;
       }
+    }
+    // Closed in Shopify with nothing shipped from it
+    if (s.fulfillmentOrderId && emptyFOs.has(s.fulfillmentOrderId) && !merged) {
+      parts.push({ id: s.id, part: s.partIndex, state: s.state, nothingSent: true, closedAt: iso(s.closedAt), batch: null, picked: null, packed: null, shipped: null, overrides: [], videos: [], inBox: null, items: [], carried: [] });
+      continue;
     }
     // Other orders' items this box carried
     const carriedLines = json(s.mergedLines, []);
@@ -233,6 +268,7 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
       id: s.id,
       part: s.partIndex,
       state: s.state,
+      fulfillmentOrderId: s.fulfillmentOrderId,
       ...own,
       shipped:
         own.shipped?.how === "label" || !merged ? own.shipped : { by: merged.userName, at: iso(merged.createdAt), how: "merged", detail: merged.detail },

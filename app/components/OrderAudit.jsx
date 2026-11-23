@@ -17,7 +17,7 @@ const btn = { font: "inherit", fontSize: "13px", padding: "4px 12px", borderRadi
 const dark = { ...btn, background: "#1a1a1a", color: "#fff", border: "1px solid #1a1a1a" };
 const field = { font: "inherit", fontSize: "13px", padding: "6px 8px", border: "1px solid #c9c9c9", borderRadius: "8px", boxSizing: "border-box" };
 
-const when = (iso) =>
+export const when = (iso) =>
   iso ? new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" }) : "";
 const mins = (s) => (s == null ? null : s >= 60 ? `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s` : `${Math.round(s)}s`);
 
@@ -43,8 +43,9 @@ const SCAN = {
   scanned: ["✓ Scanned", "#1a5e20"],
   partly: ["Partly scanned", "#7a4f01"],
   not_scanned: ["Not scanned", "#8e1f0b"],
+  outside: ["Packed outside MonkeyBean", "#616161"],
 };
-function Items({ items }) {
+export function Items({ items }) {
   if (!items?.length) return null;
   return (
     <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "2px" }}>
@@ -62,15 +63,16 @@ function Items({ items }) {
 
 const VIDEO_STATUS = { uploading: "Uploading…", failed: "Upload failed", replaced: "Replaced by a later packing", skipped: "Not recorded" };
 
-function Part({ p, multi, canVideo, openOrder }) {
+export function Part({ p, multi, canVideo, openOrder, extra = null, onOpenBatch = null }) {
   return (
     <div style={{ display: "grid", gap: "6px", border: "1px solid #e3e3e3", borderRadius: "8px", padding: "10px" }}>
       {(multi || p.overrides.length > 0) && (
         <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
           {multi && <strong>Part {p.part}</strong>}
-          {p.overrides.length > 0 && <span style={pill("#fde2dd", "#8e1f0b")}>⚠ Scan overridden</span>}
+          {p.overrides.length > 0 && <span style={pill("#fde2dd", "#8e1f0b")}>{p.overrides.some((o) => o.scan) ? "⚠ Scan overridden" : "⚠ Override"}</span>}
         </div>
       )}
+      {extra}
       <Items items={p.items} />
       {p.inBox && (
         <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", padding: "6px 8px", borderRadius: "6px", background: "#eef3ff", fontSize: "13px" }}>
@@ -84,6 +86,17 @@ function Part({ p, multi, canVideo, openOrder }) {
           )}
         </div>
       )}
+      {onOpenBatch && p.batch?.id ? (
+        <div style={{ display: "grid", gridTemplateColumns: "64px 1fr", gap: "6px", alignItems: "baseline" }}>
+          <span style={small}>Batch</span>
+          <span>
+            <button type="button" style={{ ...linkBtn, fontWeight: 600 }} onClick={() => onOpenBatch(p.batch.id)}>
+              {p.batch.title}
+            </button>
+            {p.batch.createdBy && <span style={small}> · created by {p.batch.createdBy}</span>}
+          </span>
+        </div>
+      ) : (
       <Step
         label="Batch"
         step={
@@ -99,8 +112,9 @@ function Part({ p, multi, canVideo, openOrder }) {
         }
         empty="Not batched"
       />
-      <Step label="Picked" step={p.picked} empty="Not yet" />
-      <Step label="Packed" step={p.packed} empty="Not yet" />
+      )}
+      <Step label="Picked" step={p.picked} empty={p.shipped ? "Not in MonkeyBean" : "Not yet"} />
+      <Step label="Packed" step={p.packed} empty={p.shipped ? "Not in MonkeyBean" : "Not yet"} />
       <Step label="Shipped" step={p.shipped} empty="Not yet" />
       {p.overrides.map((o, i) => (
         <div key={i} style={{ padding: "6px 8px", borderRadius: "6px", background: "#fdecea", color: "#8e1f0b", fontSize: "12px" }}>
@@ -148,6 +162,26 @@ function Part({ p, multi, canVideo, openOrder }) {
   );
 }
 
+// Parts Shopify closed with nothing shipped from them (their items were moved
+// to another part, cancelled or removed): folded away, so they don't read as
+// a second shipment
+export function EmptyParts({ parts }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ display: "grid", gap: "4px" }}>
+      <button type="button" style={{ ...linkBtn, fontSize: "12px", color: "#616161" }} aria-expanded={open} onClick={() => setOpen(!open)}>
+        {open ? "▾" : "▸"} {parts.length === 1 ? `Part ${parts[0].part} was` : `${parts.length} parts were`} closed in Shopify with nothing shipped
+      </button>
+      {open && (
+        <span style={small}>
+          {parts.map((p) => `Part ${p.part}${p.closedAt ? ` (seen closed ${when(p.closedAt)})` : ""}`).join(", ")}. Shopify leaves an empty part behind when items are moved to
+          another part (for example, split off to ship in another order's box), cancelled or removed. Nothing was sent from {parts.length === 1 ? "it" : "them"}.
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function OrderAudit({ orderId = null, orderName = null, refreshKey = 0 }) {
   const f = useFetcher();
   const [open, setOpen] = useState(false);
@@ -177,9 +211,12 @@ export function OrderAudit({ orderId = null, orderName = null, refreshKey = 0 })
       {!f.data && <span style={small}>Loading…</span>}
       {f.data?.error && <span style={{ color: "#8e1f0b" }}>{f.data.error}</span>}
       {a && a.parts.length === 0 && <span style={small}>MonkeyBean hasn't handled this order yet.</span>}
-      {a?.parts.map((p) => (
-        <Part key={p.id} p={p} multi={a.multiPart} canVideo={f.data.canVideo} openOrder={openOrder} />
-      ))}
+      {a?.parts
+        .filter((p) => !p.nothingSent)
+        .map((p) => (
+          <Part key={p.id} p={p} multi={a.multiPart} canVideo={f.data.canVideo} openOrder={openOrder} />
+        ))}
+      {a && a.parts.some((p) => p.nothingSent) && <EmptyParts parts={a.parts.filter((p) => p.nothingSent)} />}
       {a && a.history.length > 0 && (
         <div style={{ display: "grid", gap: "6px" }}>
           <button type="button" style={{ ...linkBtn, fontWeight: 600 }} aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -214,7 +251,7 @@ export function OrderAudit({ orderId = null, orderName = null, refreshKey = 0 })
 }
 
 // A free replacement order for some of the order's items
-function ReshipFlyout({ orderId, onClose, onMade }) {
+export function ReshipFlyout({ orderId, onClose, onMade }) {
   const load = useFetcher();
   const save = useFetcher();
   const [qty, setQty] = useState({});

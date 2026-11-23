@@ -1904,3 +1904,51 @@ model ProductNote {
 
   @@index([shop, productId])
 }
+
+// A Shopify return, tracked in Shipping → Returns: approve requests, see what's
+// coming back, verify each item when it arrives (resellable items are restocked)
+model ReturnCase {
+  id              Int       @id @default(autoincrement())
+  shop            String
+  shopifyReturnId String
+  name            String?
+  orderId         String
+  orderName       String
+  customerName    String?
+  // Shopify's status: requested | open | closed | declined | canceled
+  status          String
+  // customer (requested in Shopify) | staff (started in MonkeyBean) | shopify (made in Shopify admin)
+  source          String    @default("shopify")
+  createdBy       String?
+  reason          String?
+  note            String?
+  totalQuantity   Int       @default(0)
+  // [{returnLineItemId, fulfillmentLineItemId, lineItemId, variantId, title, variantTitle, sku, image, quantity, reason, reasonNote, customerNote}]
+  items           String
+  // Shopify's reverse fulfillment order lines (what's still waiting for a decision)
+  rfoLines        String?
+  declineNote     String?
+  requestedAt     DateTime?
+  approvedAt      DateTime?
+  approvedBy      String?
+  closedAt        DateTime?
+  // Verification (the package arrived): [{returnLineItemId, condition, quantity}]
+  verifiedAt      DateTime?
+  verifiedBy      String?
+  verifyNote      String?
+  conditions      String?
+  restockedUnits  Int       @default(0)
+  restockLocation String?
+  syncedAt        DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+
+  @@unique([shop, shopifyReturnId])
+  @@index([shop, status])
+  @@index([shop, orderId])
+}
+
+model ReturnSync {
+  shop      String    @id
+  lastRunAt DateTime?
+  lastError String?
+}

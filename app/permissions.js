@@ -95,6 +95,7 @@ export const CAPABILITY_FEATURES = {
       understock: "See understocked badges (more on order than in stock)",
       merge: "Merge orders (ship a customer's orders in one box)",
       reship: "Create reship orders (free replacement orders in Shopify)",
+      returns: "Process returns (approve or decline requests, start returns, verify what came back)",
       settings: "Manage shipping settings",
     },
   },

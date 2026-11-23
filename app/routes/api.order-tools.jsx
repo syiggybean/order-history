@@ -26,7 +26,7 @@ export const loader = async ({ request }) => {
     }
     if (!can(user, "shipping", "view") && !can(user, "tickets", "view")) return respond({ hidden: true });
     const canVideo = can(user, "packingVideos", "view");
-    return respond({ audit: await orderAudit(session.shop, { orderId }, { appOrigin: appUrl(request), canVideo }), canReship, canVideo });
+    return respond({ audit: await orderAudit(session.shop, { orderId }, { appOrigin: appUrl(request), canVideo, admin }), canReship, canVideo });
   } catch (e) {
     if (e instanceof ReshipError) return respond({ error: e.message });
     console.error("[order-tools]", e);
