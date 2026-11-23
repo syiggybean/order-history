@@ -36,6 +36,7 @@ import {
 } from "../helpdesk.server";
 import { STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
 import { emailDocument, sanitizeHtml } from "../email-html";
+import { AddressError, changeAddresses, openOrders } from "../address-change.server";
 
 // Tickets: emails to help@ as tickets, answered from here
 
@@ -95,7 +96,7 @@ export const action = async ({ request }) => {
     if (intent === "searchCustomers") return { intent, results: await searchCustomers(admin, form.get("q")) };
     if (intent === "customerDetail") return { intent, customer: await customerDetail(shop, admin, String(form.get("customerId") ?? "")) };
     if (intent === "orderDetail") return { intent, order: await orderDetail(shop, admin, String(form.get("orderId") ?? "")) };
-    if (intent === "attachment") return { intent, file: await attachment(shop, form.get("messageId"), form.get("index")) };
+    if (intent === "attachment") return { intent, i: Number(form.get("index")), file: await attachment(shop, form.get("messageId"), form.get("index")) };
     if (intent === "connect" || intent === "pause" || intent === "resume") {
       if (!user?.isAdmin) return { intent, error: "Only app admins can connect or pause the mailbox." };
       if (intent === "connect") return { intent, ok: true, ...(await connect(shop)) };
@@ -117,6 +118,18 @@ export const action = async ({ request }) => {
       await saveTemplate(shop, String(form.get("key") ?? ""), { subject: form.get("subject"), html: form.get("html"), enabled: form.get("enabled") === "true" }, user);
       return { intent, ok: true };
     }
+    if (intent === "openOrders") return { intent, ...(await openOrders(shop, admin, String(form.get("customerId") ?? ""))) };
+    if (intent === "changeAddresses") {
+      let orderIds = [];
+      let address = {};
+      try {
+        orderIds = JSON.parse(String(form.get("orderIds") ?? "[]"));
+        address = JSON.parse(String(form.get("address") ?? "{}"));
+      } catch {
+        return { intent, error: "Something was wrong with the form. Reload and try again." };
+      }
+      return { intent, ok: true, ...(await changeAddresses(shop, admin, { ticketId: id, customerId: String(form.get("customerId") ?? ""), orderIds, address, user })) };
+    }
     if (intent === "linkCustomer") {
       const cid = form.get("customerId");
       await linkCustomer(shop, id, cid ? { id: cid, name: form.get("name") || null, email: form.get("email") || null } : null, user);
@@ -129,8 +142,9 @@ export const action = async ({ request }) => {
     if (intent === "assignMe") return (await assign(shop, id, user?.id), { intent, ok: true });
     return { intent, error: "Unknown action." };
   } catch (e) {
-    if (!(e instanceof HelpdeskError)) console.error(`[tickets] ${intent}:`, e);
-    return { intent, error: e instanceof HelpdeskError ? e.message : `Something went wrong: ${e?.message ?? e}` };
+    const known = e instanceof HelpdeskError || e instanceof AddressError;
+    if (!known) console.error(`[tickets] ${intent}:`, e);
+    return { intent, error: known ? e.message : `Something went wrong: ${e?.message ?? e}` };
   }
 };
 
@@ -491,6 +505,8 @@ function Message({ m, data }) {
   const canEdit = m.kind === "note" && data?.canReply && (data.isAdmin || (data.me && m.staffId === data.me));
   const [open, setOpen] = useState(false);
   const dl = useFetcher();
+  const [viewing, setViewing] = useState(null); // index of the image open in the viewer
+  const images = m.attachments.filter(isImage);
   useEffect(() => {
     const f = dl.data?.file;
     if (!f) return;
@@ -573,17 +589,123 @@ function Message({ m, data }) {
             <button
               key={a.i}
               type="button"
+              title={isImage(a) ? "View" : "Download"}
               style={{ ...btn, padding: "3px 10px", fontSize: "12px" }}
-              disabled={dl.state !== "idle"}
-              onClick={() => dl.submit({ intent: "attachment", messageId: String(m.id), index: String(a.i) }, { method: "post" })}
+              disabled={!isImage(a) && dl.state !== "idle"}
+              onClick={() => (isImage(a) ? setViewing(a.i) : dl.submit({ intent: "attachment", messageId: String(m.id), index: String(a.i) }, { method: "post" }))}
             >
-              📎 {a.name}
+              {isImage(a) ? "🖼" : "📎"} {a.name}
               {a.size ? ` (${Math.max(1, Math.round(a.size / 1024))} KB)` : ""}
             </button>
           ))}
           {dl.data?.error && <span style={{ color: "#8e1f0b", fontSize: "12px" }}>{dl.data.error}</span>}
         </div>
       )}
+      {viewing != null && <ImageViewer messageId={m.id} images={images} start={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  );
+}
+
+// Pictures a browser can show (phones sometimes send them without a type)
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|bmp|avif)$/i;
+const isImage = (a) => /^image\/(jpeg|png|gif|webp|bmp|avif)$/i.test(a.mime ?? "") || ((!a.mime || a.mime === "application/octet-stream") && IMAGE_EXT.test(a.name ?? ""));
+
+const fileUrl = (f) => {
+  const bytes = Uint8Array.from(atob(f.base64), (c) => c.charCodeAt(0));
+  const type = /^image\//.test(f.mime) ? f.mime : `image/${(f.name.match(IMAGE_EXT)?.[1] ?? "jpeg").toLowerCase().replace("jpg", "jpeg")}`;
+  return URL.createObjectURL(new Blob([bytes], { type }));
+};
+
+// A message's pictures, shown over the ticket. ← → between them, Escape or a
+// click outside to close.
+function ImageViewer({ messageId, images, start, onClose }) {
+  const f = useFetcher();
+  const [at, setAt] = useState(() => Math.max(0, images.findIndex((a) => a.i === start)));
+  const [urls, setUrls] = useState({}); // attachment index → object URL
+  const [zoom, setZoom] = useState(false);
+  const urlsRef = useRef(urls);
+  urlsRef.current = urls;
+  const a = images[at];
+  const submit = useRef(f.submit);
+  submit.current = f.submit;
+  useEffect(() => {
+    if (a && !urlsRef.current[a.i]) submit.current({ intent: "attachment", messageId: String(messageId), index: String(a.i) }, { method: "post" });
+    setZoom(false);
+  }, [a, messageId]);
+  useEffect(() => {
+    if (f.data?.file && f.data.i != null && !urlsRef.current[f.data.i]) setUrls((u) => ({ ...u, [f.data.i]: fileUrl(f.data.file) }));
+  }, [f.data]);
+  useEffect(() => () => Object.values(urlsRef.current).forEach((u) => URL.revokeObjectURL(u)), []);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose();
+      if (e.key === "ArrowRight") setAt((n) => Math.min(images.length - 1, n + 1));
+      if (e.key === "ArrowLeft") setAt((n) => Math.max(0, n - 1));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [images.length, onClose]);
+  if (!a) return null;
+  const url = urls[a.i];
+  const failed = f.state === "idle" && f.data?.error && !url;
+  const ctl = { ...btn, background: "rgba(255,255,255,.95)", padding: "4px 12px" };
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={a.name}
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, zIndex: 1100, background: "rgba(0,0,0,.72)", display: "grid", gridTemplateRows: "auto 1fr", padding: "14px", boxSizing: "border-box" }}
+    >
+      <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", gap: "8px", alignItems: "center", color: "#fff", fontSize: "13px", justifySelf: "center", maxWidth: "100%", flexWrap: "wrap", justifyContent: "center" }}>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "50vw" }}>{a.name}</span>
+        {images.length > 1 && (
+          <span>
+            {at + 1} of {images.length}
+          </span>
+        )}
+        {url && (
+          <a href={url} download={a.name} style={{ ...ctl, color: "#303030", textDecoration: "none" }}>
+            Download
+          </a>
+        )}
+        <button type="button" aria-label="Close" style={ctl} onClick={onClose}>
+          ✕
+        </button>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 0, gap: "10px" }}>
+        {images.length > 1 && (
+          <button type="button" aria-label="Previous picture" disabled={at === 0} style={{ ...ctl, fontSize: "18px", opacity: at === 0 ? 0.4 : 1 }} onClick={(e) => (e.stopPropagation(), setAt(at - 1))}>
+            ‹
+          </button>
+        )}
+        <div style={{ flex: 1, minWidth: 0, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", overflow: zoom ? "auto" : "hidden" }}>
+          {url ? (
+            <img
+              src={url}
+              alt={a.name}
+              title={zoom ? "Click to fit" : "Click for full size"}
+              onClick={(e) => (e.stopPropagation(), setZoom(!zoom))}
+              style={zoom ? { maxWidth: "none", cursor: "zoom-out", alignSelf: "flex-start" } : { maxWidth: "100%", maxHeight: "calc(100vh - 90px)", objectFit: "contain", cursor: "zoom-in", borderRadius: "4px", boxShadow: "0 4px 24px rgba(0,0,0,.4)" }}
+            />
+          ) : failed ? (
+            <span style={{ color: "#fff" }} onClick={(e) => e.stopPropagation()}>{f.data.error}</span>
+          ) : (
+            <span style={{ color: "#fff" }}>Loading…</span>
+          )}
+        </div>
+        {images.length > 1 && (
+          <button
+            type="button"
+            aria-label="Next picture"
+            disabled={at === images.length - 1}
+            style={{ ...ctl, fontSize: "18px", opacity: at === images.length - 1 ? 0.4 : 1 }}
+            onClick={(e) => (e.stopPropagation(), setAt(at + 1))}
+          >
+            ›
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -1043,6 +1165,137 @@ function TemplateEditor({ tpl, data }) {
   );
 }
 
+// One new shipping address onto several of the customer's open orders
+const ADDRESS_INPUTS = [
+  ["firstName", "First name", 1],
+  ["lastName", "Last name", 1],
+  ["company", "Company", 2],
+  ["address1", "Address", 2],
+  ["address2", "Apartment, suite, etc.", 2],
+  ["city", "City", 2],
+  ["provinceCode", "State / province code", 1, "e.g. CA"],
+  ["zip", "ZIP / postal code", 1],
+  ["countryCode", "Country code", 1, "e.g. US"],
+  ["phone", "Phone", 1],
+];
+
+function AddressFlyout({ ticketId, customerId, onClose }) {
+  const load = useFetcher();
+  const save = useFetcher();
+  const [form, setForm] = useState(null);
+  const [chosen, setChosen] = useState(null); // Set of order ids
+  const [confirming, setConfirming] = useState(false);
+  const submit = useRef(load.submit);
+  submit.current = load.submit;
+  const reload = () => submit.current({ intent: "openOrders", customerId }, { method: "post" });
+  useEffect(reload, [customerId]);
+  const data = load.data?.intent === "openOrders" ? load.data : null;
+  useEffect(() => {
+    if (!data?.orders) return;
+    setForm((f) => f ?? data.start);
+    setChosen(new Set(data.orders.filter((o) => !o.locked).map((o) => o.id)));
+  }, [data]);
+  const done = save.data?.intent === "changeAddresses" && save.data.ok ? save.data : null;
+  useEffect(() => {
+    if (done) {
+      setConfirming(false);
+      reload();
+    }
+  }, [done]);
+  const count = chosen?.size ?? 0;
+  const go = () =>
+    save.submit({ intent: "changeAddresses", id: String(ticketId), customerId, orderIds: JSON.stringify([...chosen]), address: JSON.stringify(form) }, { method: "post" });
+  return (
+    <Flyout onClose={onClose} label="Change shipping address" title="Change shipping address" width={520}>
+      <div style={{ display: "grid", gap: "14px", fontSize: "13px" }}>
+        {!data && !load.data?.error && <span style={muted}>Loading open orders…</span>}
+        {load.data?.error && <span style={{ color: "#8e1f0b" }}>{load.data.error}</span>}
+        {done && (
+          <div style={{ display: "grid", gap: "4px", padding: "8px 10px", borderRadius: "8px", background: done.changed ? "#eaf6ec" : "#fdecea" }}>
+            <strong>{done.changed ? `Changed ${done.changed} order${done.changed === 1 ? "" : "s"} in Shopify.` : "No orders were changed."}</strong>
+            {done.results.map((r) => (
+              <span key={r.id} style={{ color: r.ok ? "#1a5e20" : "#8e1f0b" }}>
+                {r.name ?? r.id}: {r.ok ? "changed" : r.error}
+                {r.ok && r.warning ? ` (${r.warning})` : ""}
+              </span>
+            ))}
+            <span style={small}>A note with the old addresses was added to the ticket.</span>
+          </div>
+        )}
+        {data && data.orders.length === 0 && <span style={muted}>{data.customer.name} has no open orders to change.</span>}
+        {data && data.orders.length > 0 && form && chosen && (
+          <>
+            <div style={section}>
+              <span style={heading}>Open orders</span>
+              {data.orders.map((o) => (
+                <label key={o.id} style={{ display: "flex", gap: "8px", alignItems: "flex-start", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px", opacity: o.locked ? 0.6 : 1 }}>
+                  <input
+                    type="checkbox"
+                    disabled={Boolean(o.locked)}
+                    checked={chosen.has(o.id)}
+                    onChange={(e) => {
+                      const next = new Set(chosen);
+                      e.target.checked ? next.add(o.id) : next.delete(o.id);
+                      setChosen(next);
+                      setConfirming(false);
+                    }}
+                    style={{ marginTop: "2px" }}
+                  />
+                  <span style={{ display: "grid", gap: "2px", minWidth: 0 }}>
+                    <span>
+                      <strong>{o.name}</strong> <span style={small}>{fmt(o.at)}</span>
+                    </span>
+                    <span style={{ ...small, overflowWrap: "anywhere" }}>{o.address ?? "No shipping address"}</span>
+                    {o.locked && <span style={{ ...small, color: "#8e1f0b" }}>{o.locked}</span>}
+                    {!o.locked && o.warning && <span style={{ ...small, color: "#7a4f01" }}>{o.warning}</span>}
+                  </span>
+                </label>
+              ))}
+            </div>
+            <div style={section}>
+              <span style={heading}>New address</span>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+                {ADDRESS_INPUTS.map(([k, label, span, ph]) => (
+                  <label key={k} style={{ display: "grid", gap: "3px", gridColumn: span === 2 ? "1 / -1" : "auto" }}>
+                    <span style={small}>{label}</span>
+                    <input
+                      value={form[k] ?? ""}
+                      placeholder={ph}
+                      onChange={(e) => (setForm({ ...form, [k]: e.target.value }), setConfirming(false))}
+                      style={{ ...field, width: "100%", boxSizing: "border-box" }}
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+            {save.data?.error && <span style={{ color: "#8e1f0b" }}>{save.data.error}</span>}
+            {!confirming ? (
+              <button type="button" style={{ ...dark, justifySelf: "start" }} disabled={!count} onClick={() => setConfirming(true)}>
+                Change {count} order{count === 1 ? "" : "s"}
+              </button>
+            ) : (
+              <div style={{ display: "grid", gap: "8px", padding: "10px", border: "1px solid #ecd58f", background: "#fffbea", borderRadius: "8px" }}>
+                <span>
+                  This changes the shipping address in Shopify on{" "}
+                  <strong>{data.orders.filter((o) => chosen.has(o.id)).map((o) => o.name).join(", ")}</strong>. The customer isn't emailed.
+                </span>
+                <span style={{ display: "flex", gap: "8px" }}>
+                  <button type="button" style={dark} disabled={save.state !== "idle"} onClick={go}>
+                    {save.state !== "idle" ? "Changing…" : "Yes, change them"}
+                  </button>
+                  <button type="button" style={btn} disabled={save.state !== "idle"} onClick={() => setConfirming(false)}>
+                    Cancel
+                  </button>
+                </span>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Flyout>
+  );
+}
+
 // Search Shopify customers (name, email, phone or an order number) and pick one
 function CustomerFinder({ busy, onPick, onCancel }) {
   const f = useFetcher();
@@ -1168,6 +1421,11 @@ function CustomerPanel({ ticket, canEdit }) {
             {c.spent ? ` · ${c.spent} spent` : ""}
           </span>
           {c.tags.length > 0 && <span style={small}>{c.tags.join(", ")}</span>}
+          {canEdit && (
+            <button type="button" style={{ ...btn, justifySelf: "start", fontSize: "12px", padding: "3px 10px" }} onClick={() => setFly({ kind: "address", id: c.id })}>
+              Change shipping address on open orders
+            </button>
+          )}
           {c.recent.length > 0 && (
             <div style={{ display: "grid", gap: "6px", marginTop: "4px" }}>
               <span style={{ ...small, fontWeight: 600 }}>Recent orders</span>
@@ -1178,6 +1436,7 @@ function CustomerPanel({ ticket, canEdit }) {
           )}
         </>
       )}
+      {fly?.kind === "address" && <AddressFlyout ticketId={ticket.id} customerId={fly.id} onClose={() => setFly(null)} />}
       {fly?.kind === "customer" && <CustomerFlyout id={fly.id} onClose={() => setFly(null)} onOrder={(id) => setFly({ kind: "order", id, back: fly })} />}
       {fly?.kind === "order" && (
         <OrderFlyout

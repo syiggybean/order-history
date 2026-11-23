@@ -420,10 +420,12 @@ export async function listTickets(shop, { status = "open", who = "all", q = "", 
     ];
   }
   const [rows, counts] = await Promise.all([
-    db.ticket.findMany({ where, orderBy: { lastMessageAt: "desc" }, take }),
+    // The latest ones (so new tickets never fall off a long Closed list)…
+    db.ticket.findMany({ where, orderBy: [{ lastMessageAt: "desc" }, { id: "desc" }], take }),
     db.ticket.groupBy({ by: ["status"], where: { shop }, _count: { _all: true } }),
   ]);
-  return { tickets: rows.map(view), counts: Object.fromEntries(counts.map((c) => [c.status, c._count._all])) };
+  // …shown oldest first: whoever has waited longest is at the top
+  return { tickets: rows.reverse().map(view), counts: Object.fromEntries(counts.map((c) => [c.status, c._count._all])) };
 }
 
 export async function getTicket(shop, id) {
