@@ -3,7 +3,7 @@ import { orderAudit } from "../order-audit.server";
 import { orderPanel } from "../order-panel.server";
 import { appUrl } from "../print.server";
 import { ReshipError, createReship, reshipInfo } from "../reship.server";
-import { ReturnsError, approveReturn, declineReturn, listReturns, returnableItems, startReturn, syncNow, verifyReturn } from "../returns.server";
+import { ReturnsError, markHandled, approveReturn, declineReturn, listReturns, returnableItems, startReturn, syncNow, verifyReturn } from "../returns.server";
 
 // The order flyout on any page, and returns:
 //   { intent: "panel", orderId }                  everything the order flyout shows
@@ -12,7 +12,7 @@ import { ReturnsError, approveReturn, declineReturn, listReturns, returnableItem
 //   { intent: "returnable" | "startReturn" | "approveReturn" | "declineReturn" | "verifyReturn" | "syncReturns", … }
 //                                                 Returns (needs "Process returns")
 const ORDER = /^gid:\/\/shopify\/Order\/\d+$/;
-const RETURN_INTENTS = ["returnable", "startReturn", "approveReturn", "declineReturn", "verifyReturn", "syncReturns"];
+const RETURN_INTENTS = ["returnable", "startReturn", "approveReturn", "declineReturn", "verifyReturn", "syncReturns", "handleReturns"];
 
 const parse = (v, fallback) => {
   try {
@@ -73,6 +73,8 @@ export const action = async ({ request }) => {
       if (intent === "declineReturn")
         return { intent, ok: true, ret: await declineReturn(shop, admin, id, user, { reason: form.get("reason"), note: form.get("note"), notifyCustomer: form.get("notify") !== "0" }) };
       if (intent === "verifyReturn") return { intent, ok: true, ret: await verifyReturn(shop, admin, id, { found: parse(form.get("found"), []), note: form.get("note") }, user) };
+      if (intent === "handleReturns")
+        return { intent, ok: true, ...(await markHandled(shop, admin, parse(form.get("ids"), []), { note: form.get("note"), close: form.get("close") === "1" }, user)) };
       if (intent === "syncReturns") {
         await syncNow(shop, admin);
         return { intent, ok: true, returns: await listReturns(shop, {}) };

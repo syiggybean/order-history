@@ -19,6 +19,7 @@ export const STAGE_PILL = {
   requested: ["#fff1d6", "#7a4f01"],
   awaiting: ["#e0f0ff", "#00427c"],
   verified: ["#d9f2df", "#1a5e20"],
+  handled: ["#f1f1f1", "#4a4a4a"],
   closed: ["#f1f1f1", "#4a4a4a"],
   declined: ["#fde2dd", "#8e1f0b"],
   cancelled: ["#f1f1f1", "#6b6b6b"],
@@ -36,11 +37,14 @@ export function ReturnCard({ r, canReturns, onChanged, showOrder = false, onOpen
   const [note, setNote] = useState("");
   const [notify, setNotify] = useState(true);
   const [verifying, setVerifying] = useState(false);
+  const [handling, setHandling] = useState(false);
+  const [closeToo, setCloseToo] = useState(false);
   const busy = f.state !== "idle";
   const done = f.data?.ok ? f.data : null;
   useEffect(() => {
     if (done) {
       setDeclining(false);
+      setHandling(false);
       onChanged?.();
     }
   }, [done]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -104,6 +108,13 @@ export function ReturnCard({ r, canReturns, onChanged, showOrder = false, onOpen
         </span>
       )}
       {r.stage === "verified" && <span style={small}>Refund it in Shopify if it hasn't been.</span>}
+      {r.handledAt && (
+        <span style={small}>
+          Marked already handled by {r.handledBy ?? "staff"} · {when(r.handledAt)} · stock not changed{r.closedInShopify ? " · closed in Shopify" : ""}
+          {r.handledNote ? ` · ${r.handledNote}` : ""}
+        </span>
+      )}
+      {f.data?.failed?.length > 0 && <span style={{ color: "#8e1f0b" }}>{f.data.failed[0].error}</span>}
       {f.data?.error && <span style={{ color: "#8e1f0b" }}>{f.data.error}</span>}
 
       {canReturns && r.stage === "requested" && !declining && (
@@ -145,11 +156,35 @@ export function ReturnCard({ r, canReturns, onChanged, showOrder = false, onOpen
           </span>
         </div>
       )}
-      {canReturns && r.stage === "awaiting" && (
-        <div>
+      {canReturns && r.stage === "awaiting" && !handling && (
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
           <button type="button" style={dark} onClick={() => setVerifying(true)}>
             Package arrived: verify items
           </button>
+          <button type="button" style={btn} onClick={() => setHandling(true)}>
+            Already handled…
+          </button>
+        </div>
+      )}
+      {canReturns && handling && (
+        <div style={{ display: "grid", gap: "6px", padding: "8px", border: "1px solid #e3e3e3", background: "#f6f6f7", borderRadius: "8px" }}>
+          <span>For a return dealt with outside MonkeyBean: it leaves Awaiting arrival and stock isn't changed.</span>
+          <label style={{ display: "grid", gap: "3px" }}>
+            <span style={small}>Note (optional)</span>
+            <input value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} placeholder="e.g. Restocked by hand in October" style={field} />
+          </label>
+          <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <input type="checkbox" checked={closeToo} onChange={(e) => setCloseToo(e.target.checked)} />
+            Also close it in Shopify (only if any refund is already done)
+          </label>
+          <span style={{ display: "flex", gap: "8px" }}>
+            <button type="button" style={dark} disabled={busy} onClick={() => f.submit({ intent: "handleReturns", ids: JSON.stringify([r.id]), note, close: closeToo ? "1" : "0" }, { method: "post", action: RETURNS_ACTION })}>
+              {busy ? "Saving…" : "Mark already handled"}
+            </button>
+            <button type="button" style={btn} disabled={busy} onClick={() => setHandling(false)}>
+              Cancel
+            </button>
+          </span>
         </div>
       )}
       {verifying && <VerifyFlyout r={r} onClose={() => setVerifying(false)} onDone={() => onChanged?.()} />}

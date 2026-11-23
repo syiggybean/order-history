@@ -1939,6 +1939,12 @@ model ReturnCase {
   conditions      String?
   restockedUnits  Int       @default(0)
   restockLocation String?
+  // Cleared without verifying (dealt with before MonkeyBean tracked returns):
+  // stock untouched; closedInShopify if the return was closed there too
+  handledAt       DateTime?
+  handledBy       String?
+  handledNote     String?
+  closedInShopify Boolean   @default(false)
   syncedAt        DateTime  @default(now())
   createdAt       DateTime  @default(now())
 

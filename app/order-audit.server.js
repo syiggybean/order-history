@@ -64,6 +64,7 @@ export const EVENT_LABELS = {
   return_approved: "Return request approved",
   return_declined: "Return request declined",
   return_verified: "Return verified (package arrived)",
+  return_handled: "Return marked already handled",
   hold_mode: "Hold mode changed",
 };
 // Batch-wide events worth showing on each of its orders

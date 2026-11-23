@@ -28,6 +28,63 @@ const chip = (on) => ({
 const input = { font: "inherit", fontSize: "13px", padding: "6px 8px", border: "1px solid #8a8a8a", borderRadius: "8px" };
 const when = (iso) => (iso ? new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" }) : "never");
 
+// Clearing old returns that were dealt with before MonkeyBean tracked them
+function BulkHandled({ list, onDone }) {
+  const f = useFetcher();
+  const [days, setDays] = useState(30);
+  const [note, setNote] = useState("");
+  const [closeToo, setCloseToo] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const cutoff = Date.now() - days * 86400e3;
+  const old = list.filter((r) => r.stage === "awaiting" && r.requestedAt && new Date(r.requestedAt).getTime() < cutoff);
+  useEffect(() => {
+    if (f.data?.ok) {
+      setConfirming(false);
+      onDone?.();
+    }
+  }, [f.data]); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <div style={{ display: "grid", gap: "8px", padding: "10px 12px", border: "1px solid #e3e3e3", borderRadius: "8px", background: "#fafafa" }}>
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+        <strong>Old returns</strong>
+        <span>Mark everything started more than</span>
+        <input type="number" min={1} max={3650} value={days} onChange={(e) => (setDays(Math.max(1, Number(e.target.value) || 1)), setConfirming(false))} aria-label="Days" style={{ ...input, width: "70px" }} />
+        <span>days ago as already handled</span>
+        <strong>({old.length})</strong>
+      </div>
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+        <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note, e.g. Handled before MonkeyBean tracked returns" maxLength={500} style={{ ...input, flexGrow: 1, minWidth: "220px" }} />
+        <label style={{ display: "flex", gap: "6px", alignItems: "center", ...small }}>
+          <input type="checkbox" checked={closeToo} onChange={(e) => (setCloseToo(e.target.checked), setConfirming(false))} /> Also close them in Shopify
+        </label>
+        {!confirming ? (
+          <button type="button" style={chip(false)} disabled={!old.length} onClick={() => setConfirming(true)}>
+            Mark {old.length} already handled
+          </button>
+        ) : (
+          <span style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <span>
+              {old.length} return{old.length === 1 ? "" : "s"} leave Awaiting arrival; stock isn't changed{closeToo ? " and they're closed in Shopify" : ""}.
+            </span>
+            <button type="button" style={chip(true)} disabled={f.state !== "idle"} onClick={() => f.submit({ intent: "handleReturns", ids: JSON.stringify(old.map((r) => r.id)), note, close: closeToo ? "1" : "0" }, { method: "post", action: RETURNS_ACTION })}>
+              {f.state !== "idle" ? "Saving…" : "Yes, mark them"}
+            </button>
+            <button type="button" style={chip(false)} disabled={f.state !== "idle"} onClick={() => setConfirming(false)}>
+              Cancel
+            </button>
+          </span>
+        )}
+      </div>
+      {f.data?.ok && (
+        <span style={small}>
+          Marked {f.data.handled}.{f.data.failed?.length ? ` ${f.data.failed.length} not changed: ${f.data.failed.map((x) => `${x.name}: ${x.error}`).join("; ")}` : ""}
+        </span>
+      )}
+      {f.data?.error && <span style={{ color: "#8e1f0b" }}>{f.data.error}</span>}
+    </div>
+  );
+}
+
 export function ReturnsTab({ data, canReturns }) {
   const go = useParamSetter();
   const revalidator = useRevalidator();
@@ -105,6 +162,8 @@ export function ReturnsTab({ data, canReturns }) {
         </button>
       </div>
       {sync.data?.error && <span style={{ color: "#8e1f0b" }}>{sync.data.error}</span>}
+
+      {canReturns && data.stage === "awaiting" && data.list.length > 0 && <BulkHandled list={data.list} onDone={refresh} />}
 
       {data.list.length === 0 ? (
         <s-paragraph>

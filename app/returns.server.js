@@ -204,7 +204,7 @@ export async function syncNow(shop, admin) {
 
 // What staff see: requested → awaiting arrival → verified, or closed/declined/cancelled
 export const stageOf = (c) =>
-  c.status === "requested" ? "requested" : c.status === "declined" ? "declined" : c.status === "canceled" || c.status === "cancelled" ? "cancelled" : c.verifiedAt ? "verified" : c.status === "closed" ? "closed" : "awaiting";
+  c.status === "requested" ? "requested" : c.status === "declined" ? "declined" : c.status === "canceled" || c.status === "cancelled" ? "cancelled" : c.verifiedAt ? "verified" : c.handledAt ? "handled" : c.status === "closed" ? "closed" : "awaiting";
 export const returnView = (c) => {
   const items = json(c.items, []);
   const found = json(c.conditions, []);
@@ -232,6 +232,10 @@ export const returnView = (c) => {
     verifiedBy: c.verifiedBy,
     verifyNote: c.verifyNote,
     restocked: c.restockedUnits ?? 0,
+    handledAt: iso(c.handledAt),
+    handledBy: c.handledBy,
+    handledNote: c.handledNote,
+    closedInShopify: Boolean(c.closedInShopify),
     closedAt: iso(c.closedAt),
   };
 };
@@ -243,14 +247,14 @@ export async function listReturns(shop, { stage = null, q = "", orderId = null, 
   if (t) where.OR = [{ orderName: { contains: t, mode: "insensitive" } }, { customerName: { contains: t, mode: "insensitive" } }, { name: { contains: t, mode: "insensitive" } }];
   const rows = await db.returnCase.findMany({ where, orderBy: { id: "desc" }, take: stage ? 500 : take });
   const list = rows.map(returnView);
-  return stage ? list.filter((r) => (stage === "done" ? ["verified", "closed", "declined", "cancelled"].includes(r.stage) : r.stage === stage)).slice(0, take) : list;
+  return stage ? list.filter((r) => (stage === "done" ? ["verified", "handled", "closed", "declined", "cancelled"].includes(r.stage) : r.stage === stage)).slice(0, take) : list;
 }
 
 export async function returnCounts(shop) {
-  const rows = await db.returnCase.findMany({ where: { shop, status: { in: ["requested", "open"] } }, select: { status: true, verifiedAt: true } });
+  const rows = await db.returnCase.findMany({ where: { shop, status: { in: ["requested", "open"] } }, select: { status: true, verifiedAt: true, handledAt: true } });
   return {
     requested: rows.filter((r) => r.status === "requested").length,
-    awaiting: rows.filter((r) => r.status === "open" && !r.verifiedAt).length,
+    awaiting: rows.filter((r) => r.status === "open" && !r.verifiedAt && !r.handledAt).length,
   };
 }
 
@@ -386,6 +390,7 @@ export async function verifyReturn(shop, admin, id, { found, note = "" }, user) 
   if (c.status === "requested") throw new ReturnsError("Approve the request first.");
   if (["declined", "canceled", "cancelled"].includes(c.status)) throw new ReturnsError("This return was declined or cancelled.");
   if (c.verifiedAt) throw new ReturnsError(`Already verified by ${c.verifiedBy ?? "staff"}.`);
+  if (c.handledAt) throw new ReturnsError(`Marked already handled by ${c.handledBy ?? "staff"}.`);
   // Read it fresh: what's still waiting for a decision in Shopify
   const r = (await gql(admin, RETURN_ONE, { id: c.shopifyReturnId }))?.return;
   if (!r) throw new ReturnsError("Shopify can't find this return.");
@@ -441,6 +446,50 @@ export async function verifyReturn(shop, admin, id, { found, note = "" }, user) 
   const summary = plan.map((p) => `${p.quantity} × ${p.it.title}: ${CONDITIONS[p.condition].label.toLowerCase()}`).join(", ");
   await logEvent(shop, { orderName: c.orderName, type: "return_verified", detail: `${c.name ?? "Return"}: ${summary}${restocked ? ` · ${restocked} restocked${location?.name ? ` at ${location.name}` : ""}` : ""}${extra ? ` · ${extra}` : ""}`, user });
   return refresh(shop, admin, c);
+}
+
+// Returns dealt with before MonkeyBean tracked them (the items were put back by
+// hand, or never came back): out of "Awaiting arrival" without touching stock.
+// close: also close them in Shopify (only once any refund is done there).
+export async function markHandled(shop, admin, ids, { note = "", close = false } = {}, user) {
+  const list = [...new Set((ids ?? []).map(Number).filter(Boolean))];
+  if (!list.length) throw new ReturnsError("Choose at least one return.");
+  if (list.length > 200) throw new ReturnsError("Up to 200 at a time.");
+  const extra = String(note ?? "").trim().slice(0, 500);
+  const done = [];
+  const failed = [];
+  for (const id of list) {
+    const c = await db.returnCase.findFirst({ where: { shop, id } });
+    if (!c) continue;
+    if (c.status !== "open" || c.verifiedAt || c.handledAt) {
+      failed.push({ id, name: c.name ?? c.orderName, error: "Not awaiting arrival anymore." });
+      continue;
+    }
+    let closed = false;
+    if (close) {
+      try {
+        const data = await gql(admin, `#graphql
+          mutation MonkeyBeanCloseReturn($id: ID!) { returnClose(id: $id) { return { id status } userErrors { field message } } }`, { id: c.shopifyReturnId });
+        userErrors(data?.returnClose);
+        closed = true;
+      } catch (e) {
+        failed.push({ id, name: c.name ?? c.orderName, error: `Shopify didn't close it: ${e.message}` });
+        continue;
+      }
+    }
+    await db.returnCase.update({
+      where: { id: c.id },
+      data: { handledAt: new Date(), handledBy: user?.name ?? null, handledNote: extra || null, closedInShopify: closed, ...(closed ? { status: "closed", closedAt: new Date() } : {}) },
+    });
+    await logEvent(shop, {
+      orderName: c.orderName,
+      type: "return_handled",
+      detail: `${c.name ?? "Return"} marked already handled (stock not changed${closed ? "; closed in Shopify" : ""})${extra ? ` · ${extra}` : ""}`,
+      user,
+    });
+    done.push(c.id);
+  }
+  return { handled: done.length, failed };
 }
 
 // ---------------------------------------------------------------------------

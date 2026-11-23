@@ -17,6 +17,7 @@ export const STAGES = {
   requested: "Requested",
   awaiting: "Awaiting arrival",
   verified: "Verified",
+  handled: "Already handled",
   closed: "Closed",
   declined: "Declined",
   cancelled: "Cancelled",
