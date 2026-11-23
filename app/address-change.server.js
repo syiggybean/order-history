@@ -4,7 +4,7 @@
 // Open = not cancelled and not fully shipped. Orders whose label was already
 // bought in MonkeyBean are locked: the label would still carry the old address.
 import db from "./db.server";
-import { refreshNotices } from "./shipping.server";
+import { logEvent, refreshNotices } from "./shipping.server";
 
 export class AddressError extends Error {}
 
@@ -151,6 +151,12 @@ export async function changeAddresses(shop, admin, { ticketId, customerId, order
     }
   }
   const changed = results.filter((r) => r.ok);
+  // In each order's history too
+  const newLine = oneLine({ ...input, countryCodeV2: input.countryCode });
+  for (const r of changed) {
+    const s = await db.shipment.findFirst({ where: { shop, orderId: r.id }, orderBy: { id: "desc" }, select: { id: true } });
+    await logEvent(shop, { shipmentId: s?.id ?? null, orderName: r.name, type: "address_changed", detail: `From ticket: ${r.before ?? "(none)"} → ${newLine}`, user }).catch(() => {});
+  }
   // Shipping's address check (Shopify's "may be invalid" warning) reads them again
   if (changed.length) await refreshNotices(shop, admin, { orderIds: changed.map((r) => r.id) }).catch((e) => console.error("[tickets] address recheck:", e?.message ?? e));
   // What was done, on the ticket

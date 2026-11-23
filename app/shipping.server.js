@@ -1740,12 +1740,12 @@ export async function lookupOrder(shop, admin, text) {
 }
 
 // Re-read one order from Shopify now, then look it up again
-export async function resyncOrderByName(shop, admin, text) {
+export async function resyncOrderByName(shop, admin, text, user = null) {
   if (isSandboxShop(shop)) throw new ShippingError("Reading from Shopify is off in sandbox.");
   const first = await lookupOrder(shop, admin, text);
   if (!first.found) return first;
   await syncOrder(shop, admin, first.orderId);
   await refreshNow(shop).catch(() => {});
-  await logEvent(shop, { orderName: first.name, type: "order_resync", detail: "Re-read from Shopify (order lookup)" });
+  await logEvent(shop, { orderName: first.name, type: "order_resync", detail: "Re-read from Shopify (order lookup)", user });
   return lookupOrder(shop, admin, text);
 }

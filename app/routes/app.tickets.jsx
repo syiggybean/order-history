@@ -36,6 +36,7 @@ import {
 } from "../helpdesk.server";
 import { STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
 import { emailDocument, sanitizeHtml } from "../email-html";
+import { OrderAudit } from "../components/OrderAudit";
 import { AddressError, changeAddresses, openOrders } from "../address-change.server";
 
 // Tickets: emails to help@ as tickets, answered from here
@@ -1188,7 +1189,9 @@ function AddressFlyout({ ticketId, customerId, onClose }) {
   const submit = useRef(load.submit);
   submit.current = load.submit;
   const reload = () => submit.current({ intent: "openOrders", customerId }, { method: "post" });
-  useEffect(reload, [customerId]);
+  useEffect(() => {
+    reload();
+  }, [customerId]); // eslint-disable-line react-hooks/exhaustive-deps
   const data = load.data?.intent === "openOrders" ? load.data : null;
   useEffect(() => {
     if (!data?.orders) return;
@@ -1621,6 +1624,9 @@ function OrderFlyout({ id, onClose, onBack, onCustomer }) {
               ))}
             </div>
           )}
+          <div style={section}>
+            <OrderAudit orderId={o.id} />
+          </div>
           <div style={section}>
             <span style={heading}>Shipping</span>
             {o.shipTo.length > 0 ? <span style={{ whiteSpace: "pre-line" }}>{o.shipTo.join("\n")}</span> : <span style={muted}>No shipping address.</span>}

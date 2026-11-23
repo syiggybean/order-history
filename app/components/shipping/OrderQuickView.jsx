@@ -4,6 +4,7 @@ import { useFetcher } from "react-router";
 import { FlagForm, ResolveFlag } from "./Review";
 import { ProductName, fmtDate, muted, pill, small, ProductThumb } from "./ui";
 import { Flyout } from "../Flyout";
+import { OrderAudit } from "../OrderAudit";
 
 const linkBtn = {
   appearance: "none",
@@ -170,6 +171,10 @@ export function OrderQuickView({ orderId, onClose, onOpenBatch, canReview = fals
                   </div>
                 </Section>
               )}
+
+              <div style={{ marginBottom: "18px" }}>
+                <OrderAudit orderId={o.id} refreshKey={fetcher.data} />
+              </div>
 
               <Section title="Items">
                 <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>

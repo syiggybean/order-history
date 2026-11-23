@@ -455,7 +455,7 @@ const shippingAction = async ({ request }) => {
     if (intent === "lookupOrder") return { intent, ...(await lookupOrder(shop, admin, form.get("q"))) };
     if (intent === "resyncOrder") {
       if (sandboxOn) return { intent, error: "Reading from Shopify is off in sandbox. Leave sandbox to re-sync an order." };
-      return { intent, resynced: true, ...(await resyncOrderByName(shop, realAdmin, form.get("q"))) };
+      return { intent, resynced: true, ...(await resyncOrderByName(shop, realAdmin, form.get("q"), user)) };
     }
     if (intent === "recheckOrder") return { intent, ok: true, ...(await recheckOrder(shop, admin, id)) };
     if (intent === "keepAddress") return { intent, ok: true, ...(await keepAddress(shop, id, user)) };

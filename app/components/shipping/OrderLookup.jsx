@@ -3,6 +3,7 @@ import { useFetcher } from "react-router";
 import { Flyout } from "../Flyout";
 import { ShopAdminContext } from "./Notice";
 import { STORE_TZ, muted, pill, small } from "./ui";
+import { OrderAudit } from "../OrderAudit";
 
 // "Find an order": type an order number, see where it is in Shipping or why it isn't listed.
 
@@ -173,19 +174,7 @@ export function LookupResult({ data, busy, onResync, onGo }) {
         </div>
       </div>
 
-      {data.events.length > 0 && (
-        <div>
-          <h3 style={{ fontSize: "13px", margin: "0 0 6px" }}>Activity in Shipping</h3>
-          <ul style={{ ...small, margin: 0, paddingLeft: "18px" }}>
-            {data.events.map((e) => (
-              <li key={e.id}>
-                {when(e.at)} · {e.detail ?? words(e.type)}
-                {e.userName ? ` · ${e.userName}` : ""}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+      <OrderAudit orderId={data.orderId} refreshKey={data.resynced ? 1 : 0} />
     </div>
   );
 }

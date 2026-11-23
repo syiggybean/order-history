@@ -583,7 +583,8 @@ export async function shipMergedBoxes(shop, admin, { groupIds = null } = {}) {
           orderName: r.orderName,
           type: "merged_shipped",
           detail: `${r.lines.reduce((n, l) => n + l.quantity, 0)} item(s) shipped in ${g.mainOrderName}'s box${tracking?.number ? ` · tracking ${tracking.number}` : ""}`,
-          user: { name: null },
+          // Sent automatically once the main box shipped: credit whoever shipped it
+          user: { name: main.labelBoughtBy ?? main.packedBy ?? null },
         });
       } catch (e) {
         errors.push(`${r.orderName}: ${e.message}`);
