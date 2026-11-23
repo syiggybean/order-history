@@ -159,6 +159,23 @@ export function parseAddress(s) {
   return { name: null, email: e ? e[0].toLowerCase() : null };
 }
 
+// Contact-form emails (Shopify's "New customer message", sent by
+// mailer@shopify.com) name the real customer in the body:
+//   Name:\n Hannah Truong\n\n Email:\n hannah@example.com
+// The ticket belongs to that person, so lookups and replies go to them.
+const FORM_SENDERS = /^(mailer@shopify\.com)$/i;
+export function formCustomer(fromEmail, text, replyTo = null) {
+  const body = String(text ?? "");
+  const fromForm = FORM_SENDERS.test(fromEmail ?? "");
+  if (!fromForm && !/contact form/i.test(body)) return null;
+  const field = (label) => body.match(new RegExp(`^[ \\t]*${label}[ \\t]*:[ \\t]*(?:\\r?\\n[ \\t]*)?([^\\r\\n]+)`, "im"))?.[1]?.trim() ?? null;
+  let email = parseAddress(field("E-?mail(?: address)?") ?? "").email;
+  if (!email && fromForm && replyTo) email = parseAddress(replyTo).email;
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || FORM_SENDERS.test(email) || email === mailbox()) return null;
+  const name = field("Name");
+  return { email, name: name && !/@/.test(name) ? name.slice(0, 200) : null };
+}
+
 export function readMessage(msg) {
   const headers = {};
   for (const h of msg.payload?.headers ?? []) headers[h.name.toLowerCase()] = h.value;
@@ -179,6 +196,7 @@ export function readMessage(msg) {
   walk(msg.payload);
   const text = (plain.trim() ? plain : htmlToText(html)).replace(/\r\n/g, "\n").slice(0, BODY_LIMIT);
   const from = parseAddress(headers.from);
+  const formFrom = formCustomer(from.email, text, headers["reply-to"]);
   return {
     gmailId: msg.id,
     threadId: msg.threadId,
@@ -192,10 +210,15 @@ export function readMessage(msg) {
     sentAt: msg.internalDate ? new Date(Number(msg.internalDate)) : headers.date ? new Date(headers.date) : new Date(),
     text,
     attachments,
-    autoReply: /auto-replied|auto-generated/i.test(headers["auto-submitted"] ?? "") || /^(mailer-daemon|postmaster)@/i.test(from.email ?? ""),
-    // Mail that must never get an auto-reply back (other robots, lists, newsletters)
-    noAutoReply:
-      /^(?!no$)./i.test(headers["auto-submitted"] ?? "") ||
+    // A contact form is always a real person writing in, even if sent by a robot
+    autoReply: !formFrom && /auto-replied|auto-generated/i.test(headers["auto-submitted"] ?? "") || /^(mailer-daemon|postmaster)@/i.test(from.email ?? ""),
+    // Who the ticket is for: the sender, or the person who filled in a contact form
+    customer: formFrom ?? from,
+    // Mail that must never get an auto-reply back (other robots, lists,
+    // newsletters). A contact form's auto-reply goes to the person who wrote it.
+    noAutoReply: formFrom
+      ? /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?|bounces?)[@+._-]/i.test(formFrom.email)
+      : /^(?!no$)./i.test(headers["auto-submitted"] ?? "") ||
       /bulk|list|junk/i.test(headers.precedence ?? "") ||
       Boolean(headers["list-id"] || headers["list-unsubscribe"] || headers["x-autoreply"] || headers["x-autorespond"]) ||
       /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?|bounces?)[@+._-]/i.test(from.email ?? ""),
@@ -249,10 +272,26 @@ async function list(q, max) {
   return ids;
 }
 
+// Tickets that came in from a contact form before MonkeyBean read the form:
+// move them to the customer named in it (once; cheap when there are none)
+export async function fixFormTickets(shop) {
+  const tickets = await db.ticket.findMany({ where: { shop, customerEmail: { in: ["mailer@shopify.com"] } } });
+  let fixed = 0;
+  for (const t of tickets) {
+    const first = await db.ticketMessage.findFirst({ where: { shop, ticketId: t.id, kind: "email" }, orderBy: { sentAt: "asc" } });
+    const c = first ? formCustomer(first.fromEmail, first.body) : null;
+    if (!c) continue;
+    await db.ticket.update({ where: { id: t.id }, data: { customerEmail: c.email, customerName: c.name ?? t.customerName } });
+    fixed++;
+  }
+  return fixed;
+}
+
 async function syncNow(shop) {
   const s = await getSync(shop);
   if (!s?.enabledAt || s.pausedAt) return { skipped: true };
   try {
+    await fixFormTickets(shop);
     const label = s.labelId ?? (await labelId());
     const after = Math.floor(s.enabledAt.getTime() / 1000);
     // New mail in the inbox
@@ -304,8 +343,8 @@ export async function importMessage(shop, m, { outgoing = false } = {}) {
         number: (last?.number ?? 1000) + 1,
         subject: m.subject.slice(0, 500),
         status: "open",
-        customerEmail: m.from.email,
-        customerName: m.from.name,
+        customerEmail: (m.customer ?? m.from).email,
+        customerName: (m.customer ?? m.from).name,
         gmailThreadId: m.threadId,
         lastMessageAt: m.sentAt,
         lastInboundAt: m.sentAt,
@@ -403,7 +442,7 @@ export async function getTicket(shop, id) {
       cc: m.ccLine,
       body: m.body,
       // Our replies are HTML (cleaned again on the way out, to be safe)
-      html: m.bodyHtml ? sanitizeHtml(m.bodyHtml) : null,
+      html: m.bodyHtml ? sanitizeHtml(m.bodyHtml, { email: m.kind === "auto" }) : null,
       staffName: m.staffName,
       staffId: m.staffId,
       editedAt: m.editedAt?.toISOString() ?? null,
@@ -548,7 +587,10 @@ async function sendInThread(shop, t, { html, subject = null, kind, user = null, 
 // Email templates (designed on the Tickets page; see tickets.js)
 // ---------------------------------------------------------------------------
 
-const AUTO_REPLY_GAP_MS = 12 * 3600 * 1000; // one auto-reply per customer this often, at most
+// Every new ticket gets one auto-reply. The cap only stops a mail loop with a
+// robot that keeps opening new tickets (no real customer gets near it).
+const AUTO_REPLY_LOOP_MAX = 10;
+const AUTO_REPLY_LOOP_WINDOW_MS = 3600 * 1000;
 const shopName = () => process.env.HELPDESK_SHOP_NAME || "Yiggybean";
 
 export async function getTemplates(shop) {
@@ -561,7 +603,7 @@ export async function getTemplates(shop) {
       description: d.description,
       live: d.live,
       subject: r?.subject ?? d.subject,
-      html: r?.html ? sanitizeHtml(r.html) : d.html,
+      html: r?.html ? sanitizeHtml(r.html, { email: true }) : d.html,
       enabled: Boolean(r?.enabled),
       updatedAt: r?.updatedAt?.toISOString() ?? null,
       updatedBy: r?.updatedBy ?? null,
@@ -577,7 +619,7 @@ async function template(shop, key) {
 export async function saveTemplate(shop, key, { subject, html, enabled }, user) {
   const def = templateDef(key);
   if (!def) throw new HelpdeskError("Unknown template.");
-  const clean = sanitizeHtml(html, { maxLength: 50_000 });
+  const clean = sanitizeHtml(html, { maxLength: 100_000, email: true });
   if (isBlank(clean)) throw new HelpdeskError("The email needs some text.");
   const subj = String(subject ?? "").trim().slice(0, 300) || def.subject;
   const data = { subject: subj, html: clean, enabled: def.live ? Boolean(enabled) : false, updatedBy: user?.name ?? null };
@@ -592,7 +634,7 @@ export async function resetTemplate(shop, key) {
 // What a template looks like for a ticket (or the sample customer)
 export function renderFor(tpl, ticket, { agentName } = {}) {
   const values = ticketValues({ ticket, agentName, shopName: shopName() });
-  return { subject: renderTemplate(tpl.subject, values).replace(/\s+/g, " ").trim(), html: sanitizeHtml(renderTemplate(tpl.html, values, { html: true })) };
+  return { subject: renderTemplate(tpl.subject, values).replace(/\s+/g, " ").trim(), html: sanitizeHtml(renderTemplate(tpl.html, values, { html: true }), { email: true }) };
 }
 
 // The auto-reply for a brand-new ticket
@@ -602,11 +644,15 @@ async function autoReply(shop, m) {
   if (!tpl?.enabled) return false;
   const t = await db.ticket.findFirst({ where: { shop, gmailThreadId: m.threadId } });
   if (!t) return false;
-  // Several emails in a row from one person get one auto-reply
-  const recent = await db.ticketMessage.findFirst({
-    where: { shop, kind: "auto", toLine: t.customerEmail, sentAt: { gte: new Date(Date.now() - AUTO_REPLY_GAP_MS) } },
+  // One per ticket
+  if (await db.ticketMessage.findFirst({ where: { shop, ticketId: t.id, kind: "auto" } })) return false;
+  const lastHour = await db.ticketMessage.count({
+    where: { shop, kind: "auto", toLine: t.customerEmail, sentAt: { gte: new Date(Date.now() - AUTO_REPLY_LOOP_WINDOW_MS) } },
   });
-  if (recent) return false;
+  if (lastHour >= AUTO_REPLY_LOOP_MAX) {
+    console.warn(`[helpdesk] auto-reply skipped for ticket #${t.number}: ${lastHour} sent to ${t.customerEmail} in the last hour (mail loop?)`);
+    return false;
+  }
   const { subject, html } = renderFor(tpl, t);
   await sendInThread(shop, t, { html, subject, kind: "auto", auto: true });
   return true;
@@ -618,7 +664,7 @@ export async function sendTest(shop, { subject, html }, user) {
   const s = await getSync(shop);
   if (!s?.enabledAt) throw new HelpdeskError("Connect the mailbox first: tests are sent from it.");
   const sample = { number: 1042, subject: "Where is my order?", status: "open", customerName: "Jane Doe", customerEmail: "jane@example.com" };
-  const r = renderFor({ subject, html: sanitizeHtml(html) }, sample, { agentName: user.name });
+  const r = renderFor({ subject, html: sanitizeHtml(html, { email: true }) }, sample, { agentName: user.name });
   const { message: raw } = await composer.sendMail({
     from: fromLine(),
     to: user.email,

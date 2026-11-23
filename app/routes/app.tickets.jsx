@@ -33,6 +33,7 @@ import {
   sync,
 } from "../helpdesk.server";
 import { STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
+import { emailDocument, sanitizeHtml } from "../email-html";
 
 // Tickets: emails to help@ as tickets, answered from here
 
@@ -866,7 +867,10 @@ function TemplateEditor({ tpl, data }) {
   const [html, setHtml] = useState(tpl.html);
   const [enabled, setEnabled] = useState(tpl.enabled);
   const [target, setTarget] = useState("body"); // where Insert puts a variable
+  const [mode, setMode] = useState(() => (/<(table|td|center|font)\b|style="/i.test(tpl.html) ? "html" : "visual"));
+  const [visualKey, setVisualKey] = useState(0); // remount the visual editor with the code's latest
   const editor = useRef(null);
+  const codeRef = useRef(null);
   const subjectRef = useRef(null);
   const canEdit = data.isAdmin;
   const dirty = subject !== tpl.subject || html !== tpl.html || enabled !== tpl.enabled;
@@ -884,8 +888,22 @@ function TemplateEditor({ tpl, data }) {
         el.focus();
         el.setSelectionRange(start + token.length, start + token.length);
       });
+    } else if (mode === "html" && codeRef.current) {
+      const el = codeRef.current;
+      const start = el.selectionStart ?? html.length;
+      const end = el.selectionEnd ?? html.length;
+      setHtml(html.slice(0, start) + token + html.slice(end));
+      requestAnimationFrame(() => {
+        el.focus();
+        el.setSelectionRange(start + token.length, start + token.length);
+      });
     } else editor.current?.insert(token);
   };
+  const switchTo = (m) => {
+    if (m === "visual") setVisualKey((k) => k + 1);
+    setMode(m);
+  };
+  const tab = (on) => ({ ...btn, padding: "2px 10px", fontSize: "12px", ...(on ? { background: "#303030", color: "#fff", border: "1px solid #303030" } : { border: "1px solid #c9c9c9" }) });
   return (
     <div style={{ display: "grid", gap: "12px" }}>
       <div style={{ border: "1px solid #e3e3e3", borderRadius: "12px", background: "#fff", padding: "14px", display: "grid", gap: "10px" }}>
@@ -899,7 +917,7 @@ function TemplateEditor({ tpl, data }) {
           <label style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "13px" }}>
             <input type="checkbox" checked={enabled} disabled={!canEdit} onChange={(e) => setEnabled(e.target.checked)} />
             Send this automatically
-            <span style={small}>(once per customer every 12 hours; never to mailing lists, no-reply addresses or other auto-replies)</span>
+            <span style={small}>(one per new ticket; never to mailing lists, no-reply addresses or other auto-replies)</span>
           </label>
         )}
         <label style={{ display: "grid", gap: "4px", fontSize: "13px" }}>
@@ -914,9 +932,36 @@ function TemplateEditor({ tpl, data }) {
           />
         </label>
         <div style={{ display: "grid", gap: "4px", fontSize: "13px" }} onFocusCapture={(e) => e.target !== subjectRef.current && setTarget("body")}>
-          <span style={muted}>Email</span>
-          {canEdit ? (
-            <RichEditor initial={tpl.html} onChange={setHtml} label="Email body" apiRef={editor} minHeight="180px" />
+          <span style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <span style={muted}>Email</span>
+            {canEdit && (
+              <span style={{ display: "flex", gap: "4px", marginLeft: "auto" }}>
+                <button type="button" style={tab(mode === "visual")} onClick={() => switchTo("visual")}>
+                  Visual
+                </button>
+                <button type="button" style={tab(mode === "html")} onClick={() => switchTo("html")}>
+                  HTML
+                </button>
+              </span>
+            )}
+          </span>
+          {canEdit && mode === "html" ? (
+            <>
+              <textarea
+                ref={codeRef}
+                aria-label="Email HTML"
+                value={html}
+                spellCheck={false}
+                onChange={(e) => setHtml(e.target.value)}
+                style={{ ...field, minHeight: "260px", fontFamily: "ui-monospace, Menlo, Consolas, monospace", fontSize: "12px", lineHeight: 1.45, whiteSpace: "pre", overflow: "auto", resize: "vertical" }}
+              />
+              <span style={small}>
+                Tables, inline styles (style="…"), colors and images from https addresses work. &lt;style&gt; blocks, scripts and forms are removed when saved, as most email apps
+                ignore them anyway. The preview shows exactly what will be sent.
+              </span>
+            </>
+          ) : canEdit ? (
+            <RichEditor key={visualKey} initial={html} onChange={setHtml} label="Email body" apiRef={editor} minHeight="180px" />
           ) : (
             <div className="tk-html" style={{ border: "1px solid #eee", borderRadius: "8px", padding: "10px" }} dangerouslySetInnerHTML={{ __html: tpl.html }} />
           )}
@@ -984,14 +1029,23 @@ function TemplateEditor({ tpl, data }) {
             <span style={muted}>Subject:</span> <strong>{renderTemplate(subject, samples)}</strong>
           </span>
         </div>
-        <div
-          className="tk-html"
-          style={{ padding: "14px", fontFamily: "Arial, Helvetica, sans-serif", fontSize: "14px", lineHeight: 1.5 }}
-          dangerouslySetInnerHTML={{ __html: renderTemplate(html, samples, { html: true }) }}
-        />
+        <EmailFrame html={sanitizeHtml(renderTemplate(html, samples, { html: true }), { email: true })} />
       </div>
     </div>
   );
+}
+
+// The email as the customer sees it, in a frame of its own (no scripts; its
+// styles can't touch the page)
+function EmailFrame({ html }) {
+  const ref = useRef(null);
+  const [height, setHeight] = useState(200);
+  const fit = () => {
+    const d = ref.current?.contentDocument;
+    if (d?.documentElement) setHeight(Math.min(Math.max(d.documentElement.scrollHeight, 120), 2000));
+  };
+  const doc = emailDocument(html).replace("<body>", '<head><base target="_blank"></head><body style="margin:0;padding:14px">');
+  return <iframe ref={ref} title="Email preview" sandbox="allow-same-origin allow-popups" srcDoc={doc} onLoad={fit} style={{ width: "100%", height: `${height}px`, border: 0, display: "block" }} />;
 }
 
 function CustomerPanel({ ticket }) {
