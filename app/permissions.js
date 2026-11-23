@@ -94,6 +94,7 @@ export const CAPABILITY_FEATURES = {
       pickEarly: "Pick and pack pre-release batches early (stock arrived before the release date)",
       understock: "See understocked badges (more on order than in stock)",
       merge: "Merge orders (ship a customer's orders in one box)",
+      reship: "Create reship orders (free replacement orders in Shopify)",
       settings: "Manage shipping settings",
     },
   },

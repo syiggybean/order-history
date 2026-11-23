@@ -1866,3 +1866,25 @@ model HelpdeskSync {
   lastSentScanAt DateTime?
   lastError      String?
 }
+
+// A free replacement order made from an order flyout (Reship). Its reason shows
+// in Inventory history next to the stock it took out.
+model Reship {
+  id              Int      @id @default(autoincrement())
+  shop            String
+  orderId         String   // the new $0 order (Shopify GID)
+  orderName       String
+  originalOrderId String
+  originalName    String
+  reason          String
+  note            String?
+  // false: made without touching inventory (the first one was never sent)
+  takesStock      Boolean  @default(true)
+  // [{lineItemId, variantId, title, variantTitle, quantity}]
+  items           String
+  createdBy       String?
+  createdAt       DateTime @default(now())
+
+  @@index([shop, orderId])
+  @@index([shop, originalOrderId])
+}

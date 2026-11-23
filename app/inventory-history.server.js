@@ -193,7 +193,23 @@ export async function itemNames(shop, itemIds) {
   );
 }
 
-const NO_UNDOS = { byKey: new Map(), byId: new Map() };
+const NO_UNDOS = { byKey: new Map(), byId: new Map(), reships: new Map() };
+
+// Reship orders (made in MonkeyBean): order number → why, from which order, by whom
+async function loadReships(shop, rowLists) {
+  const ids = [
+    ...new Set(
+      rowLists
+        .map((rows) => rows.find((r) => r.referenceType === "Order"))
+        .filter(Boolean)
+        .map((r) => r.referenceId ?? r.referenceUri?.match(/(\d+)$/)?.[1])
+        .filter(Boolean),
+    ),
+  ];
+  if (!ids.length) return new Map();
+  const list = await db.reship.findMany({ where: { shop, orderId: { in: ids.map((id) => `gid://shopify/Order/${id}`) } } });
+  return new Map(list.map((r) => [r.orderId.split("/").pop(), r]));
+}
 
 function buildChange(key, rows, names, undos = NO_UNDOS) {
   const first = rows[0];
@@ -205,6 +221,7 @@ function buildChange(key, rows, names, undos = NO_UNDOS) {
   const orderId =
     ref.referenceType === "Order" ? ref.referenceId ?? ref.referenceUri?.match(/(\d+)$/)?.[1] ?? null : null;
   const n = names.get(first.inventoryItemId);
+  const reship = orderId ? undos.reships?.get(String(orderId)) : null;
 
   return {
     key,
@@ -226,6 +243,14 @@ function buildChange(key, rows, names, undos = NO_UNDOS) {
     order: orderId ? { id: orderId } : null,
     adjustmentIds: rows.map((r) => r.adjustmentId),
     ...undoInfo(key, rows, first, orderId, parts, undos),
+    // Stock taken by a reship order: who sent it again, and why
+    ...(reship
+      ? {
+          who: `${reship.createdBy ?? "Staff member"} · Reship`,
+          reasonLabel: `Reship ${reship.orderName} of ${reship.originalName}: ${reship.reason}${reship.note ? ` (${reship.note})` : ""}`,
+          reship: { orderName: reship.orderName, originalName: reship.originalName, reason: reship.reason, note: reship.note, by: reship.createdBy },
+        }
+      : {}),
   };
 }
 
@@ -428,6 +453,7 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
   }
   const names = await itemNames(shop, rows.map((r) => r.inventoryItemId));
   const undos = await loadUndos(shop, [...byKey.keys()], [...byKey.values()]);
+  undos.reships = await loadReships(shop, [...byKey.values()]);
   let changes = entries
     .map((e) => {
       if (e.c) return catalogChange(e.c);
@@ -457,6 +483,7 @@ export async function getChange(shop, key) {
   if (!rows.length) return null;
   const names = await itemNames(shop, [inventoryItemId]);
   const undos = await loadUndos(shop, [key], [rows]);
+  undos.reships = await loadReships(shop, [rows]);
   return buildChange(key, rows, names, undos);
 }
 

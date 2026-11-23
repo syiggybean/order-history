@@ -5,6 +5,8 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 // system for less motion get a quick fade instead.
 
 const MS = 220;
+// Open panels, oldest first
+const OPEN = [];
 const CSS = `
 @keyframes mbFlyBackIn { from { opacity: 0 } to { opacity: 1 } }
 @keyframes mbFlyBackOut { from { opacity: 1 } to { opacity: 0 } }
@@ -33,8 +35,19 @@ export function Flyout({ onClose, label, title, width = 440, zIndex = 1000, chil
     timer.current = setTimeout(() => onClose(), MS);
   }, [closing, onClose]);
   useEffect(() => () => clearTimeout(timer.current), []);
+  // Escape closes only the top panel when panels are stacked
+  const me = useRef(null);
+  if (!me.current) me.current = {};
   useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && close();
+    const token = me.current;
+    OPEN.push(token);
+    return () => {
+      const i = OPEN.lastIndexOf(token);
+      if (i >= 0) OPEN.splice(i, 1);
+    };
+  }, []);
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && OPEN[OPEN.length - 1] === me.current && close();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [close]);

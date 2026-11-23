@@ -58,6 +58,8 @@ export const EVENT_LABELS = {
   flag_reopened: "Review flag reopened",
   order_resync: "Re-read from Shopify",
   pack_clip: "Customer video clip",
+  reship_created: "Reship order created",
+  reship_of: "This is a reship",
   hold_mode: "Hold mode changed",
 };
 // Batch-wide events worth showing on each of its orders
@@ -66,6 +68,38 @@ const BATCH_EVENTS = ["batch_created", "batch_assigned", "batch_priority", "batc
 const OVERRIDE_EVENTS = new Set(["packed_override", "pack_visual", "ship_outside_batch", "ready_before_release", "bulk_labels_override", "address_kept"]);
 
 const PRIORITY = ["Low", "Normal", "High", "Urgent"];
+const itemKey = (l) => l.variantId ?? `title:${l.title}|${l.variantTitle ?? ""}`;
+const itemName = (l) => `${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""}`;
+
+// Each item in a box and whether it was scanned. Scans are counted per product
+// across the whole box (its own items, other orders' items it carried, freebies),
+// so an item counts as scanned when every unit of that product in the box was.
+function scanned(box, lines) {
+  const counts = json(box.packed, {});
+  const all = [...json(box.lines, []), ...json(box.mergedLines, []), ...json(box.freebieLines, [])];
+  const need = {};
+  for (const l of all) need[itemKey(l)] = (need[itemKey(l)] ?? 0) + (l.quantity ?? 0);
+  const packed = box.state === "packed" || box.state === "labeling" || box.state === "shipped" || Boolean(box.packedAt);
+  return lines.map((l) => {
+    const k = itemKey(l);
+    const got = Math.min(counts[k] ?? 0, need[k] ?? 0);
+    return {
+      name: itemName(l),
+      quantity: l.quantity,
+      scan: !packed && !got ? null : got >= (need[k] ?? 0) && got > 0 ? "scanned" : got > 0 ? "partly" : packed ? "not_scanned" : null,
+    };
+  });
+}
+
+// The box a part went out in when it was combined with another order's
+async function carrierOf(shop, s) {
+  const groups = await db.mergeGroup.findMany({ where: { shop, riders: { contains: `"shipmentId":${s.id}` } }, orderBy: { id: "desc" } });
+  for (const g of groups) {
+    const r = json(g.riders, []).find((x) => Number(x.shipmentId) === s.id);
+    if (r && g.status !== "undone" && g.status !== "cancelled") return { g, r };
+  }
+  return null;
+}
 
 // The link a staff member can watch a packing video with (2 hours)
 const videoUrl = (v, shop, appOrigin) => (appOrigin ? `${String(appOrigin).replace(/\/+$/, "")}/packcam/media?t=${signLink({ k: "rec", id: v.id, shop }, 2 * 60 * 60_000)}` : null);
@@ -102,10 +136,9 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
   const seen = new Set();
   const evs = events.filter((e) => (seen.has(e.id) ? false : seen.add(e.id)));
 
-  const parts = shipments.map((s) => {
-    const b = s.batchId ? batchOf.get(s.batchId) : null;
-    const mine = evs.filter((e) => e.shipmentId === s.id);
-    const lastOf = (...types) => mine.find((e) => types.includes(e.type));
+  // Who did what to one box: its batch, pick, pack, ship, overrides, videos
+  const describe = (box, boxEvents, b, boxVideos, boxClips) => {
+    const lastOf = (...types) => boxEvents.find((e) => types.includes(e.type));
     // Picked: the batch's pick list, or this package in flow mode
     const flow = lastOf("flow_picked");
     const picked = flow
@@ -113,28 +146,33 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
       : b?.pickedAt
         ? { by: b.pickedBy, at: iso(b.pickedAt), how: "batch" }
         : null;
-    const packed = s.packedAt || s.packedBy ? { by: s.packedBy, at: iso(s.packedAt) } : null;
+    const packed = box.packedAt || box.packedBy ? { by: box.packedBy, at: iso(box.packedAt) } : null;
     const labelEv = lastOf("label_bought");
-    const merged = lastOf("merged_shipped");
     const shipped =
-      s.labelStatus === "bought"
-        ? { by: s.labelBoughtBy ?? labelEv?.userName ?? null, at: iso(s.labelBoughtAt ?? labelEv?.createdAt), how: "label", detail: labelEv?.detail ?? null }
-        : merged
-          ? { by: merged.userName, at: iso(merged.createdAt), how: "merged", detail: merged.detail }
-          : s.state === "shipped" || s.state === "closed"
-            ? { by: null, at: iso(s.closedAt), how: "shopify", detail: "Fulfilled in Shopify (not through MonkeyBean)" }
-            : null;
+      box.labelStatus === "bought"
+        ? { by: box.labelBoughtBy ?? labelEv?.userName ?? null, at: iso(box.labelBoughtAt ?? labelEv?.createdAt), how: "label", detail: labelEv?.detail ?? null }
+        : box.state === "shipped" || box.state === "closed"
+          ? { by: null, at: iso(box.closedAt), how: "shopify", detail: "Fulfilled in Shopify (not through MonkeyBean)" }
+          : null;
     const overrides = [];
-    if (s.packOverride) {
-      const i = s.packOverride.indexOf(":");
-      overrides.push({ kind: "Packed without a full scan", by: i > 0 ? s.packOverride.slice(0, i).trim() : null, reason: i > 0 ? s.packOverride.slice(i + 1).trim() : s.packOverride, at: iso(s.packedAt) });
+    if (box.packOverride) {
+      const i = box.packOverride.indexOf(":");
+      overrides.push({ kind: "Packed without a full scan", by: i > 0 ? box.packOverride.slice(0, i).trim() : null, reason: i > 0 ? box.packOverride.slice(i + 1).trim() : box.packOverride, at: iso(box.packedAt) });
     }
-    if (s.overrideBy || s.overrideReason) overrides.push({ kind: "Let through outside a batch", by: s.overrideBy, reason: s.overrideReason, at: iso(s.overrideAt) });
-    for (const e of mine.filter((e) => OVERRIDE_EVENTS.has(e.type) && e.type !== "packed_override" && e.type !== "ship_outside_batch"))
+    if (box.overrideBy || box.overrideReason) overrides.push({ kind: "Let through outside a batch", by: box.overrideBy, reason: box.overrideReason, at: iso(box.overrideAt) });
+    for (const e of boxEvents.filter((e) => OVERRIDE_EVENTS.has(e.type) && e.type !== "packed_override" && e.type !== "ship_outside_batch"))
       overrides.push({ kind: EVENT_LABELS[e.type] ?? e.type, by: e.userName, reason: e.detail, at: iso(e.createdAt) });
-    const vids = videos
-      .filter((v) => v.shipmentId === s.id)
-      .map((v) => ({
+    return {
+      batch: b
+        ? { id: b.id, title: batchTitle(b), status: b.status, createdBy: b.createdBy, createdAt: iso(b.createdAt), priority: PRIORITY[b.priority] ?? null }
+        : box.batchTag
+          ? { id: null, title: box.batchTag, status: null }
+          : null,
+      picked,
+      packed,
+      shipped,
+      overrides,
+      videos: boxVideos.map((v) => ({
         id: v.id,
         status: v.status,
         by: v.userName,
@@ -142,26 +180,67 @@ export async function orderAudit(shop, { orderId = null, orderName = null } = {}
         seconds: v.seconds,
         error: v.status === "failed" ? v.error : null,
         url: canVideo && v.status === "done" && v.driveFileId ? videoUrl(v, shop, appOrigin) : null,
-        clips: clips
+        clips: boxClips
           .filter((c) => c.packVideoId === v.id)
           .map((c) => ({ id: c.id, status: c.status, at: iso(c.createdAt), seconds: Math.round((c.endSeconds - c.startSeconds) * 10) / 10 })),
-      }));
-    return {
+      })),
+    };
+  };
+
+  const parts = [];
+  for (const s of shipments) {
+    const mine = evs.filter((e) => e.shipmentId === s.id);
+    const own = describe(s, mine, s.batchId ? batchOf.get(s.batchId) : null, videos.filter((v) => v.shipmentId === s.id), clips);
+    // Went out in another order's box: that box's people, this part's items
+    const merged = mine.find((e) => e.type === "merged_shipped");
+    const carrier = !s.mergedLines && (merged || s.mergedInto || s.mergeGroupId) ? await carrierOf(shop, s) : null;
+    if (carrier) {
+      const main = await db.shipment.findFirst({ where: { shop, id: carrier.g.mainShipmentId } });
+      if (main) {
+        const [mainEvents, mainBatch, mainVideos] = await Promise.all([
+          db.shippingEvent.findMany({ where: { shop, shipmentId: main.id }, orderBy: { id: "desc" }, take: 100 }),
+          main.batchId ? db.batch.findFirst({ where: { shop, id: main.batchId } }) : null,
+          db.packVideo.findMany({ where: { shop, shipmentId: main.id }, orderBy: { id: "desc" } }),
+        ]);
+        const mainClips = mainVideos.length ? await db.packClip.findMany({ where: { shop, packVideoId: { in: mainVideos.map((v) => v.id) } } }) : [];
+        const box = describe(main, mainEvents, mainBatch, mainVideos, mainClips);
+        parts.push({
+          id: s.id,
+          part: s.partIndex,
+          state: s.state,
+          ...box,
+          // Sent automatically when the main box shipped
+          shipped: box.shipped ?? (merged ? { by: merged.userName, at: iso(merged.createdAt), how: "merged", detail: null } : null),
+          inBox: { orderName: main.orderName, orderId: main.orderId, done: s.state === "shipped" || s.state === "closed" },
+          items: scanned(main, carrier.r.lines ?? json(s.lines, [])),
+          carried: [],
+        });
+        continue;
+      }
+    }
+    // Other orders' items this box carried
+    const carriedLines = json(s.mergedLines, []);
+    const carried = [...new Set(carriedLines.map((l) => l.fromOrderName))].map((name) => {
+      const ls = carriedLines.filter((l) => l.fromOrderName === name);
+      return { orderName: name, orderId: null, shipmentId: ls[0]?.fromShipmentId ?? null, items: scanned(s, ls) };
+    });
+    for (const c of carried) {
+      if (!c.shipmentId) continue;
+      const r = await db.shipment.findFirst({ where: { shop, id: c.shipmentId }, select: { orderId: true } });
+      c.orderId = r?.orderId ?? null;
+    }
+    parts.push({
       id: s.id,
       part: s.partIndex,
       state: s.state,
-      batch: b
-        ? { id: b.id, title: batchTitle(b), status: b.status, createdBy: b.createdBy, createdAt: iso(b.createdAt), priority: PRIORITY[b.priority] ?? null }
-        : s.batchTag
-          ? { id: null, title: s.batchTag, status: null }
-          : null,
-      picked,
-      packed,
-      shipped,
-      overrides,
-      videos: vids,
-    };
-  });
+      ...own,
+      shipped:
+        own.shipped?.how === "label" || !merged ? own.shipped : { by: merged.userName, at: iso(merged.createdAt), how: "merged", detail: merged.detail },
+      inBox: null,
+      items: [...scanned(s, json(s.lines, [])), ...scanned(s, json(s.freebieLines, [])).map((it) => ({ ...it, name: `${it.name} (free gift)` }))],
+      carried,
+    });
+  }
 
   const history = evs.map((e) => ({
     id: e.id,
