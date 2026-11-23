@@ -53,7 +53,7 @@ const userErrors = (r) => {
 const RETURN_FIELDS = `
   id name status createdAt requestApprovedAt closedAt totalQuantity
   decline { reason note }
-  returnLineItems(first: 50) {
+  returnLineItems(first: 25) {
     nodes {
       id quantity
       ... on ReturnLineItem {
@@ -63,26 +63,25 @@ const RETURN_FIELDS = `
       }
     }
   }
-  reverseFulfillmentOrders(first: 5) {
+  reverseFulfillmentOrders(first: 3) {
     nodes {
       id status
-      lineItems(first: 50) { nodes { id totalQuantity dispositions { type quantity } fulfillmentLineItem { id } } }
+      lineItems(first: 25) { nodes { id totalQuantity dispositions { type quantity } fulfillmentLineItem { id } } }
     }
   }`;
 
+// Shopify limits what one request may cost (1000), so lists only carry return
+// IDs and each return's details are read on their own (about 230 each)
 const ORDER_RETURNS = `#graphql
   query MonkeyBeanOrderReturns($id: ID!) {
-    order(id: $id) {
-      id name customer { displayName }
-      returns(first: 20) { nodes { ${RETURN_FIELDS} } }
-    }
+    order(id: $id) { id returns(first: 10) { nodes { id } } }
   }`;
 
 const ACTIVE = `#graphql
   query MonkeyBeanActiveReturns($q: String!, $after: String) {
-    orders(first: 50, after: $after, query: $q, sortKey: UPDATED_AT, reverse: true) {
+    orders(first: 25, after: $after, query: $q, sortKey: UPDATED_AT, reverse: true) {
       pageInfo { hasNextPage endCursor }
-      nodes { id name customer { displayName } returns(first: 10) { nodes { ${RETURN_FIELDS} } } }
+      nodes { id returns(first: 5) { nodes { id status } } }
     }
   }`;
 
@@ -149,8 +148,15 @@ async function upsert(shop, order, r) {
 export async function syncOrderReturns(shop, admin, orderId) {
   const o = (await gql(admin, ORDER_RETURNS, { id: orderId }))?.order;
   if (!o) return [];
-  for (const r of o.returns?.nodes ?? []) await upsert(shop, o, r);
+  for (const { id } of o.returns?.nodes ?? []) await readOne(shop, admin, id);
   return listReturns(shop, { orderId });
+}
+
+// One return's details, saved
+async function readOne(shop, admin, id) {
+  const r = (await gql(admin, RETURN_ONE, { id }))?.return;
+  if (r) await upsert(shop, r.order, r);
+  return r;
 }
 
 // Every active return (requested, in progress, being inspected), plus any we
@@ -162,8 +168,12 @@ export async function syncReturns(shop, admin) {
     const data = await gql(admin, ACTIVE, { q: "return_status:return_requested OR return_status:in_progress OR return_status:inspection_complete", after });
     for (const o of data?.orders?.nodes ?? []) {
       for (const r of o.returns?.nodes ?? []) {
-        await upsert(shop, o, r);
+        if (seen.has(r.id)) continue;
         seen.add(r.id);
+        // Finished ones already saved as finished don't need reading again
+        const done = ["CLOSED", "DECLINED", "CANCELED"].includes(r.status);
+        if (done && (await db.returnCase.findFirst({ where: { shop, shopifyReturnId: r.id, status: String(r.status).toLowerCase() } }))) continue;
+        await readOne(shop, admin, r.id);
       }
     }
     if (!data?.orders?.pageInfo?.hasNextPage) break;
@@ -172,8 +182,7 @@ export async function syncReturns(shop, admin) {
   const stale = await db.returnCase.findMany({ where: { shop, status: { in: ["requested", "open"] } } });
   for (const c of stale) {
     if (seen.has(c.shopifyReturnId)) continue;
-    const r = (await gql(admin, RETURN_ONE, { id: c.shopifyReturnId }).catch(() => null))?.return;
-    if (r) await upsert(shop, r.order, r);
+    await readOne(shop, admin, c.shopifyReturnId).catch(() => null);
   }
   await db.returnSync.upsert({ where: { shop }, create: { shop, lastRunAt: new Date(), lastError: null }, update: { lastRunAt: new Date(), lastError: null } });
 }
