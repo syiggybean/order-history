@@ -1,0 +1,12 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "product-notes"
+uid = "ca31a52d-0efd-45d8-8748-a9bab72b9e7642ad1026"
+type = "ui_extension"
+
+# Internal notes card on the product page
+[[extensions.targeting]]
+module = "./src/NotesBlock.jsx"
+target = "admin.product-details.block.render"

@@ -1,0 +1,13 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "order-history-card"
+uid = "0062d44a-408e-4782-ab60-d64e81a25f3e57f99db7"
+type = "ui_extension"
+
+# MonkeyBean card on the order page: who picked, packed and shipped, scan
+# overrides, packing video, history, and a Reship button
+[[extensions.targeting]]
+module = "./src/HistoryBlock.jsx"
+target = "admin.order-details.block.render"

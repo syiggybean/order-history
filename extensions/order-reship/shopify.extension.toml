@@ -1,0 +1,17 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "order-reship"
+uid = "89ae34c7-bece-4c12-b7e8-7c629697f8c326a2414b"
+type = "ui_extension"
+
+# "Reship items" in the order page's More actions menu (also opened from the
+# MonkeyBean card on the order page)
+[[extensions.targeting]]
+module = "./src/ReshipAction.jsx"
+target = "admin.order-details.action.render"
+
+# Hides the menu item for staff without the "Create reship orders" permission
+[extensions.targeting.should_render]
+module = "./src/condition/shouldRender.js"

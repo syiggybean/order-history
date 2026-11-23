@@ -1888,3 +1888,19 @@ model Reship {
   @@index([shop, orderId])
   @@index([shop, originalOrderId])
 }
+
+// Internal notes on a product (staff only), shown on the product's page in
+// Shopify admin. Anyone with Stock access can write them.
+model ProductNote {
+  id          Int       @id @default(autoincrement())
+  shop        String
+  productId   String    // Shopify product GID
+  body        String
+  createdBy   String?
+  createdById Int?
+  editedAt    DateTime?
+  editedBy    String?
+  createdAt   DateTime  @default(now())
+
+  @@index([shop, productId])
+}
