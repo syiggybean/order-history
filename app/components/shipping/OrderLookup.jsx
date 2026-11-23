@@ -98,7 +98,7 @@ export function LookupResult({ data, busy, onResync, onGo }) {
       </div>
 
       <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-        {listedTab && <s-button onClick={() => onGo(listedTab, listed.shipment.batchId)}>Show on {listedTab === "ready" ? "Ready to ship" : listedTab === "waiting" ? "Waiting" : `batch ${listed.shipment.batchId}`}</s-button>}
+        {listedTab && <s-button onClick={() => onGo(listedTab, listed.shipment.batchId)}>Show on {listedTab === "ready" ? "Ready to ship" : listedTab === "waiting" ? "Waiting" : listed.shipment.batchTitle ?? `batch ${listed.shipment.batchId}`}</s-button>}
         {onResync && (
           <s-button variant={anyProblem ? "primary" : "secondary"} onClick={onResync} disabled={busy || undefined} loading={busy || undefined}>
             Re-sync from Shopify

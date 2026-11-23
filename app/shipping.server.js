@@ -1639,6 +1639,13 @@ export async function lookupOrder(shop, admin, text) {
   ]);
   const byFo = new Map(shipments.map((s) => [s.fulfillmentOrderId, s]));
   const fos = o.fulfillmentOrders.nodes;
+  // Batches by their names (as on the Batches tab), not their numbers
+  const batchIds = [...new Set(shipments.map((s) => s.batchId).filter(Boolean))];
+  const batches = new Map((batchIds.length ? await db.batch.findMany({ where: { shop, id: { in: batchIds } } }) : []).map((b) => [b.id, b]));
+  const batchTitleOf = (id) => {
+    const b = batches.get(id);
+    return b ? (b.name ? `${b.tag} · ${b.name}` : b.tag) : id ? `batch ${id}` : "a batch";
+  };
 
   // Each fulfillment order Shopify shows us, and what the app made of it
   const parts = fos.map((fo) => {
@@ -1652,7 +1659,7 @@ export async function lookupOrder(shop, admin, text) {
       holds: (fo.fulfillmentHolds ?? []).map((h) => h.displayReason).filter(Boolean),
       lines: remaining.map((li) => ({ name: lineName({ title: li.productTitle, variantTitle: li.variantTitle }), quantity: li.remainingQuantity, requiresShipping: li.requiresShipping })),
       shipment: s
-        ? { id: s.id, state: s.state, waitingReason: s.waitingReason, flag: s.flag, batchId: s.batchId, closedAt: s.closedAt?.toISOString() ?? null, syncedAt: s.syncedAt?.toISOString() ?? null }
+        ? { id: s.id, state: s.state, waitingReason: s.waitingReason, flag: s.flag, batchId: s.batchId, batchTitle: s.batchId ? batchTitleOf(s.batchId) : null, closedAt: s.closedAt?.toISOString() ?? null, syncedAt: s.syncedAt?.toISOString() ?? null }
         : null,
     };
     let verdict;
@@ -1679,7 +1686,7 @@ export async function lookupOrder(shop, admin, text) {
           ? `On the Waiting tab: ${s.waitingReason ?? "waiting"}.`
           : s.state === "ready"
             ? "On the Ready to ship tab."
-            : `In batch ${s.batchId ?? "?"} (${s.state}) on the Batches tab.`;
+            : `In ${batchTitleOf(s.batchId)} (${s.state}) on the Batches tab.`;
     } else {
       problem = true;
       const when = s.closedAt ? ` on ${new Date(s.closedAt).toLocaleString("en-US", { timeZone: STORE_TZ_SERVER, dateStyle: "medium", timeStyle: "short" })}` : "";

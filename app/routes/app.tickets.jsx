@@ -1206,6 +1206,23 @@ function OrderFlyout({ id, onClose, onBack, onCustomer }) {
             {line("Total", o.totals.total, true)}
             {line("Refunded", o.totals.refunded && `−${o.totals.refunded}`)}
           </div>
+          {o.packing?.length > 0 && (
+            <div style={section}>
+              <span style={heading}>In Shipping (not sent yet)</span>
+              {o.packing.map((p, i) => (
+                <div key={i} style={{ display: "grid", gap: "3px", padding: "6px 8px", border: "1px solid #eee", borderRadius: "8px" }}>
+                  <span style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+                    {o.packing.length > 1 && <strong>Part {p.part}</strong>}
+                    <Pill tone={p.batch ? "blue" : p.state === "ready" ? "green" : "yellow"}>{p.batch ? "Batched" : p.label}</Pill>
+                    {p.batch && <span style={{ fontWeight: 600 }}>{p.batch.title}</span>}
+                    {p.batch && p.state !== "batched" && <span style={muted}>({p.label.toLowerCase()})</span>}
+                  </span>
+                  {p.waitingReason && <span style={muted}>{p.waitingReason}</span>}
+                  {p.items.length > 0 && <span style={small}>{p.items.map((it) => `${it.quantity} × ${it.name}`).join(" · ")}</span>}
+                </div>
+              ))}
+            </div>
+          )}
           <div style={section}>
             <span style={heading}>Shipping</span>
             {o.shipTo.length > 0 ? <span style={{ whiteSpace: "pre-line" }}>{o.shipTo.join("\n")}</span> : <span style={muted}>No shipping address.</span>}
@@ -1248,7 +1265,7 @@ function OrderFlyout({ id, onClose, onBack, onCustomer }) {
   );
 }
 
-const PILL = { green: ["#d9f2df", "#1a5e20"], yellow: ["#fff1d6", "#7a4f01"], red: ["#fde2dd", "#8e1f0b"] };
+const PILL = { green: ["#d9f2df", "#1a5e20"], yellow: ["#fff1d6", "#7a4f01"], red: ["#fde2dd", "#8e1f0b"], blue: ["#e0f0ff", "#00427c"] };
 function Pill({ tone, children }) {
   const [bg, fg] = PILL[tone] ?? PILL.yellow;
   return <span style={{ background: bg, color: fg, padding: "1px 8px", borderRadius: "8px", fontSize: "12px", fontWeight: 600 }}>{children}</span>;

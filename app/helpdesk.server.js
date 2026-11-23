@@ -851,7 +851,35 @@ export async function orderDetail(shop, admin, id) {
       tracking: (f.trackingInfo ?? []).map((t) => ({ number: t.number, url: t.url, company: t.company })),
     })),
     url: adminUrl(shop, "orders", o.id),
+    packing: await packingStatus(shop, o.id),
   };
+}
+
+// Where the order's unshipped parts are in MonkeyBean's Shipping: waiting,
+// ready, or in which batch (by name)
+const PACKING_LABELS = { waiting: "Waiting", ready: "Ready to ship", batched: "In a batch", packed: "Packed", labeling: "Getting a label" };
+export async function packingStatus(shop, orderId) {
+  const parts = await db.shipment.findMany({ where: { shop, orderId, state: { in: Object.keys(PACKING_LABELS) } }, orderBy: [{ partIndex: "asc" }, { id: "asc" }] });
+  if (!parts.length) return [];
+  const ids = [...new Set(parts.map((p) => p.batchId).filter(Boolean))];
+  const batches = new Map((ids.length ? await db.batch.findMany({ where: { shop, id: { in: ids } } }) : []).map((b) => [b.id, b]));
+  return parts.map((p) => {
+    const b = p.batchId ? batches.get(p.batchId) : null;
+    let lines = [];
+    try {
+      lines = JSON.parse(p.lines || "[]");
+    } catch {
+      lines = [];
+    }
+    return {
+      part: p.partIndex,
+      state: p.state,
+      label: PACKING_LABELS[p.state] ?? p.state,
+      waitingReason: p.state === "waiting" ? p.waitingReason : null,
+      batch: b ? { id: b.id, tag: b.tag, name: b.name, title: b.name ? `${b.tag} · ${b.name}` : b.tag } : p.batchId ? { id: p.batchId, title: `Batch ${p.batchId}` } : null,
+      items: lines.map((l) => ({ name: `${l.title}${l.variantTitle ? ` (${l.variantTitle})` : ""}`, quantity: l.quantity })),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
