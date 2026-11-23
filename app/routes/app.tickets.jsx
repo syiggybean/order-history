@@ -14,6 +14,8 @@ import {
   customerDetail,
   customerFor,
   editNote,
+  linkCustomer,
+  searchCustomers,
   getTemplates,
   resetTemplate,
   saveTemplate,
@@ -89,7 +91,8 @@ export const action = async ({ request }) => {
   const shop = session.shop;
   const id = form.get("id");
   try {
-    if (intent === "customer") return { intent, customer: await customerFor(shop, admin, String(form.get("email") ?? "")) };
+    if (intent === "customer") return { intent, customer: await customerFor(shop, admin, String(form.get("email") ?? ""), form.get("linkedId") || null) };
+    if (intent === "searchCustomers") return { intent, results: await searchCustomers(admin, form.get("q")) };
     if (intent === "customerDetail") return { intent, customer: await customerDetail(shop, admin, String(form.get("customerId") ?? "")) };
     if (intent === "orderDetail") return { intent, order: await orderDetail(shop, admin, String(form.get("orderId") ?? "")) };
     if (intent === "attachment") return { intent, file: await attachment(shop, form.get("messageId"), form.get("index")) };
@@ -112,6 +115,11 @@ export const action = async ({ request }) => {
       if (!user?.isAdmin) return { intent, error: "Only app admins can change email templates." };
       if (intent === "resetTemplate") return (await resetTemplate(shop, String(form.get("key") ?? "")), { intent, ok: true });
       await saveTemplate(shop, String(form.get("key") ?? ""), { subject: form.get("subject"), html: form.get("html"), enabled: form.get("enabled") === "true" }, user);
+      return { intent, ok: true };
+    }
+    if (intent === "linkCustomer") {
+      const cid = form.get("customerId");
+      await linkCustomer(shop, id, cid ? { id: cid, name: form.get("name") || null, email: form.get("email") || null } : null, user);
       return { intent, ok: true };
     }
     if (intent === "note") return (await addNote(shop, id, form.get("text"), user), { intent, ok: true });
@@ -468,7 +476,7 @@ function TicketView({ ticket, data }) {
         )}
         {error && <div style={{ color: "#8e1f0b" }}>{error}</div>}
       </div>
-      <CustomerPanel ticket={ticket} />
+      <CustomerPanel ticket={ticket} canEdit={data.canReply} />
     </div>
   );
 }
@@ -1035,6 +1043,53 @@ function TemplateEditor({ tpl, data }) {
   );
 }
 
+// Search Shopify customers (name, email, phone or an order number) and pick one
+function CustomerFinder({ busy, onPick, onCancel }) {
+  const f = useFetcher();
+  const [q, setQ] = useState("");
+  const submit = useRef(f.submit);
+  submit.current = f.submit;
+  useEffect(() => {
+    const text = q.trim();
+    if (text.length < 2) return;
+    const timer = setTimeout(() => submit.current({ intent: "searchCustomers", q: text }, { method: "post" }), 300);
+    return () => clearTimeout(timer);
+  }, [q]);
+  const results = f.data?.intent === "searchCustomers" ? f.data.results : null;
+  return (
+    <div style={{ display: "grid", gap: "6px", border: "1px solid #eee", borderRadius: "8px", padding: "8px" }}>
+      <input
+        autoFocus
+        aria-label="Find a customer"
+        placeholder="Name, email, phone or order #"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        onKeyDown={(e) => e.key === "Escape" && onCancel()}
+        style={{ ...field, fontSize: "13px" }}
+      />
+      {f.state !== "idle" && <span style={small}>Searching…</span>}
+      {f.data?.error && <span style={{ color: "#8e1f0b" }}>{f.data.error}</span>}
+      {results && q.trim().length >= 2 && results.length === 0 && f.state === "idle" && <span style={small}>No customers found.</span>}
+      {results?.map((r) => (
+        <div key={r.id} style={{ display: "flex", gap: "6px", alignItems: "center", justifyContent: "space-between", borderTop: "1px solid #f1f1f1", paddingTop: "6px" }}>
+          <span style={{ display: "grid", minWidth: 0, overflowWrap: "anywhere" }}>
+            <strong style={{ fontWeight: 600 }}>{r.name || r.email || "Customer"}</strong>
+            <span style={small}>
+              {[r.email, r.phone, r.orders != null ? `${r.orders} order${r.orders === 1 ? "" : "s"}` : null, r.order ? `placed ${r.order}` : null].filter(Boolean).join(" · ")}
+            </span>
+          </span>
+          <button type="button" style={{ ...btn, padding: "2px 10px", fontSize: "12px", flexShrink: 0 }} disabled={busy} onClick={() => onPick(r)}>
+            Associate
+          </button>
+        </div>
+      ))}
+      <button type="button" style={{ ...linkStyle, fontSize: "12px", justifySelf: "start" }} onClick={onCancel}>
+        Cancel
+      </button>
+    </div>
+  );
+}
+
 // The email as the customer sees it, in a frame of its own (no scripts; its
 // styles can't touch the page)
 function EmailFrame({ html }) {
@@ -1048,16 +1103,23 @@ function EmailFrame({ html }) {
   return <iframe ref={ref} title="Email preview" sandbox="allow-same-origin allow-popups" srcDoc={doc} onLoad={fit} style={{ width: "100%", height: `${height}px`, border: 0, display: "block" }} />;
 }
 
-function CustomerPanel({ ticket }) {
+function CustomerPanel({ ticket, canEdit }) {
   const f = useFetcher();
+  const link = useFetcher();
   const email = ticket.customerEmail;
+  const linkedId = ticket.shopifyCustomerId ?? "";
   const submit = useRef(f.submit);
   submit.current = f.submit;
   const [fly, setFly] = useState(null); // { kind: "customer" | "order", id }
+  const [finding, setFinding] = useState(false);
   useEffect(() => {
-    if (email) submit.current({ intent: "customer", email }, { method: "post" });
-  }, [email]);
-  const c = f.data?.intent === "customer" ? f.data.customer : undefined;
+    if (email || linkedId) submit.current({ intent: "customer", email: email ?? "", linkedId }, { method: "post" });
+  }, [email, linkedId]);
+  useEffect(() => {
+    if (link.state === "idle" && link.data?.ok) setFinding(false);
+  }, [link.state, link.data]);
+  const c = f.data?.intent === "customer" ? f.data.customer : !email && !linkedId ? null : undefined;
+  const choose = (r) => link.submit({ intent: "linkCustomer", id: ticket.id, customerId: r?.id ?? "", name: r?.name ?? "", email: r?.email ?? "" }, { method: "post" });
   return (
     <div style={{ border: "1px solid #e3e3e3", borderRadius: "12px", background: "#fff", padding: "12px 14px", display: "grid", gap: "8px", fontSize: "13px" }}>
       <strong>Customer</strong>
@@ -1072,7 +1134,30 @@ function CustomerPanel({ ticket }) {
       </span>
       {f.state !== "idle" && c === undefined && <span style={muted}>Looking them up…</span>}
       {f.data?.error && <span style={{ color: "#8e1f0b" }}>{f.data.error}</span>}
-      {c === null && <span style={muted}>No Shopify customer with this email.</span>}
+      {c === null && <span style={muted}>{email ? "No Shopify customer with this email." : "No email address on this ticket."}</span>}
+      {link.data?.error && <span style={{ color: "#8e1f0b" }}>{link.data.error}</span>}
+      {canEdit && c === null && !finding && (
+        <button type="button" style={{ ...btn, justifySelf: "start" }} onClick={() => setFinding(true)}>
+          Associate customer
+        </button>
+      )}
+      {canEdit && finding && <CustomerFinder busy={link.state !== "idle"} onPick={choose} onCancel={() => setFinding(false)} />}
+      {c?.linked && !finding && (
+        <span style={small}>
+          Associated by hand.{" "}
+          {canEdit && (
+            <>
+              <button type="button" style={{ ...linkStyle, fontSize: "12px" }} onClick={() => setFinding(true)}>
+                Change
+              </button>
+              {" · "}
+              <button type="button" style={{ ...linkStyle, fontSize: "12px" }} disabled={link.state !== "idle"} onClick={() => choose(null)}>
+                Remove
+              </button>
+            </>
+          )}
+        </span>
+      )}
       {c && (
         <>
           <button type="button" style={{ ...linkStyle, textAlign: "left" }} onClick={() => setFly({ kind: "customer", id: c.id })}>

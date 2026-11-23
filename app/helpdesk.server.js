@@ -744,9 +744,12 @@ const CUSTOMER = `#graphql
     }
   }`;
 
-export async function customerFor(shop, admin, email) {
-  if (!email) return null;
-  const res = await admin.graphql(CUSTOMER, { variables: { q: `email:"${String(email).replace(/"/g, "")}"` } });
+// The ticket's Shopify customer: the one staff linked, else by email
+export async function customerFor(shop, admin, email, linkedId = null) {
+  const linked = /^gid:\/\/shopify\/Customer\/\d+$/.test(String(linkedId ?? "")) ? String(linkedId) : null;
+  if (!email && !linked) return null;
+  const q = linked ? `id:${linked.split("/").pop()}` : `email:"${String(email).replace(/"/g, "")}"`;
+  const res = await admin.graphql(CUSTOMER, { variables: { q } });
   const body = await res.json();
   const c = body?.data?.customers?.nodes?.[0];
   if (!c) return null;
@@ -754,6 +757,7 @@ export async function customerFor(shop, admin, email) {
   const num = (gid) => String(gid).split("/").pop();
   return {
     id: c.id,
+    linked: Boolean(linked),
     name: c.displayName,
     email: c.email,
     orders: c.numberOfOrders != null ? Number(c.numberOfOrders) : null,
@@ -771,6 +775,58 @@ export async function customerFor(shop, admin, email) {
       url: `https://admin.shopify.com/store/${store}/orders/${num(o.id)}`,
     })),
   };
+}
+
+// Finding a customer to link: by name, email or phone, or by an order number
+const CUSTOMER_SEARCH = `#graphql
+  query TicketCustomerSearch($q: String!, $order: String!, $byOrder: Boolean!) {
+    customers(first: 8, query: $q) {
+      nodes { id displayName email phone numberOfOrders }
+    }
+    orders(first: 3, query: $order) @include(if: $byOrder) {
+      nodes { name customer { id displayName email phone numberOfOrders } }
+    }
+  }`;
+
+export async function searchCustomers(admin, text) {
+  const t = String(text ?? "").trim().slice(0, 100);
+  if (t.length < 2) return [];
+  const orderNo = t.match(/^#?(\d{3,})$/)?.[1];
+  const res = await admin.graphql(CUSTOMER_SEARCH, { variables: { q: t.replace(/["\\]/g, " "), order: orderNo ? `name:#${orderNo}` : "", byOrder: Boolean(orderNo) } });
+  const body = await res.json();
+  if (body?.errors?.length) throw new HelpdeskError(`Shopify couldn't search customers: ${body.errors[0].message}`);
+  const out = new Map();
+  const add = (c, order = null) => {
+    if (!c || out.has(c.id)) return;
+    out.set(c.id, { id: c.id, name: c.displayName, email: c.email ?? null, phone: c.phone ?? null, orders: c.numberOfOrders != null ? Number(c.numberOfOrders) : null, order });
+  };
+  for (const o of body?.data?.orders?.nodes ?? []) add(o.customer, o.name);
+  for (const c of body?.data?.customers?.nodes ?? []) add(c);
+  return [...out.values()];
+}
+
+// Link a ticket to a Shopify customer by hand (null unlinks: back to the email).
+// Replies still go to the ticket's email address. A note records who did it.
+export async function linkCustomer(shop, id, customer, user) {
+  const t = await ticketOr404(shop, id);
+  const cid = customer?.id ? String(customer.id) : null;
+  if (cid && !/^gid:\/\/shopify\/Customer\/\d+$/.test(cid)) throw new HelpdeskError("That customer can't be linked.");
+  const data = { shopifyCustomerId: cid };
+  if (cid && !t.customerName && customer.name) data.customerName = String(customer.name).slice(0, 200);
+  if (cid && !t.customerEmail && customer.email) data.customerEmail = String(customer.email).toLowerCase();
+  await db.ticket.update({ where: { id: t.id }, data });
+  const who = customer?.name || customer?.email || "a customer";
+  await db.ticketMessage.create({
+    data: {
+      shop,
+      ticketId: t.id,
+      kind: "note",
+      body: cid ? `Linked this ticket to Shopify customer ${who}${customer?.email && customer.name ? ` (${customer.email})` : ""}.` : "Unlinked the Shopify customer.",
+      staffName: user?.name ?? null,
+      staffId: user?.id ?? null,
+      sentAt: new Date(),
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
