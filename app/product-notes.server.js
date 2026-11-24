@@ -1,7 +1,7 @@
 // Internal notes on products: what staff should know about an item (fragile,
 // ships separately, supplier quirks…). Shown on the product's page in Shopify
-// admin. Anyone with Stock access writes them; authors and admins can edit or
-// delete a note.
+// admin. Needs the Product notes permission (read, or read + write); authors and
+// admins can edit or delete a note.
 import db from "./db.server";
 
 export class NoteError extends Error {}

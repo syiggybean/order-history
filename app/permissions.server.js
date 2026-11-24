@@ -31,11 +31,28 @@ function parseAccess(json) {
       const ship = base.shipping ?? [];
       base.stock = ship.length ? ["view", ...(ship.includes("settings") ? ["bins"] : [])] : [];
     }
+    // Product notes (its own permission now): until someone sets it, everyone
+    // can read them and anyone with Stock access can write them, as before
+    if (!FEATURES.productNotes.levels.includes(saved.productNotes)) base.productNotes = (base.stock ?? []).length ? "manage" : "view";
   } catch {
     // fall back to Hidden everywhere
   }
   return base;
 }
+
+// Super admins: full access always, like the store owner. Listed by email in
+// the SUPER_ADMIN_EMAILS setting (Railway variable, comma-separated), so no
+// email address lives in the code.
+const superAdmins = () =>
+  new Set(
+    String(process.env.SUPER_ADMIN_EMAILS ?? "")
+      .split(/[,;\s]+/)
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean),
+  );
+export const isSuperAdmin = (member) => Boolean(member?.email) && superAdmins().has(String(member.email).toLowerCase());
+// The store owner and super admins: everything, always, and can't be edited
+const alwaysAll = (member) => Boolean(member?.accountOwner) || isSuperAdmin(member);
 
 function identity(session, sessionToken) {
   const u = session?.onlineAccessInfo?.associated_user;
@@ -89,14 +106,16 @@ async function resolveUser(shop, who) {
   }
 
   const owner = member.accountOwner;
+  const all = alwaysAll(member);
   return {
     id: member.id,
     userId: member.userId,
     name: member.name ?? member.email ?? "Staff member",
     email: member.email,
     isOwner: owner,
-    isAdmin: owner || member.isAdmin,
-    access: owner ? fullAccess() : parseAccess(member.access),
+    isSuperAdmin: !owner && all,
+    isAdmin: all || member.isAdmin,
+    access: all ? fullAccess() : parseAccess(member.access),
     views: parseViews(member.views),
   };
 }
@@ -107,14 +126,16 @@ export async function staffById(shop, id) {
   const member = await db.staffMember.findFirst({ where: { shop, id: Number(id) } });
   if (!member) return null;
   const owner = member.accountOwner;
+  const all = alwaysAll(member);
   return {
     id: member.id,
     userId: member.userId,
     name: member.name ?? member.email ?? "Staff member",
     email: member.email,
     isOwner: owner,
-    isAdmin: owner || member.isAdmin,
-    access: owner ? fullAccess() : parseAccess(member.access),
+    isSuperAdmin: !owner && all,
+    isAdmin: all || member.isAdmin,
+    access: all ? fullAccess() : parseAccess(member.access),
     views: parseViews(member.views),
   };
 }
@@ -153,7 +174,7 @@ export async function getStaff(request) {
 
 // What the browser needs to show or hide things
 export const publicUser = (user) =>
-  user ? { name: user.name, isAdmin: user.isAdmin, isOwner: user.isOwner, access: user.access, views: user.views ?? [] } : null;
+  user ? { name: user.name, isAdmin: user.isAdmin, isOwner: user.isOwner, isSuperAdmin: Boolean(user.isSuperAdmin), access: user.access, views: user.views ?? [] } : null;
 
 // For loaders: returns ctx, or ctx with noAccess set (render <NoAccess />)
 export async function loadWithAccess(request, feature, level = "view") {
@@ -184,8 +205,9 @@ export async function listStaff(shop) {
       name: m.name,
       email: m.email,
       isOwner: m.accountOwner,
-      isAdmin: m.accountOwner || m.isAdmin,
-      access: m.accountOwner ? fullAccess() : parseAccess(m.access),
+      isSuperAdmin: !m.accountOwner && isSuperAdmin(m),
+      isAdmin: alwaysAll(m) || m.isAdmin,
+      access: alwaysAll(m) ? fullAccess() : parseAccess(m.access),
       lastSeenAt: m.lastSeenAt.toISOString(),
     })),
     invites: invites.map((i) => ({ id: i.id, email: i.email, isAdmin: i.isAdmin, access: parseAccess(i.access) })),
@@ -205,6 +227,7 @@ export async function saveMember(shop, actor, memberId, { access, isAdmin }) {
   const member = await db.staffMember.findFirst({ where: { shop, id: memberId } });
   if (!member) throw new Error("Staff member not found.");
   if (member.accountOwner) throw new Error("The store owner always has full access.");
+  if (isSuperAdmin(member)) throw new Error("Super admins always have full access (set in the SUPER_ADMIN_EMAILS setting).");
   if (member.id === actor.id && !isAdmin) throw new Error("You can't remove your own admin access.");
   return db.staffMember.update({
     where: { id: member.id },
@@ -221,6 +244,7 @@ export async function saveInvite(shop, { email, access, isAdmin }) {
   const member = await db.staffMember.findFirst({ where: { shop, email: e } });
   if (member) {
     if (member.accountOwner) throw new Error("The store owner always has full access.");
+    if (isSuperAdmin(member)) throw new Error("Super admins always have full access (set in the SUPER_ADMIN_EMAILS setting).");
     await db.staffMember.update({ where: { id: member.id }, data });
     return { updatedExisting: true };
   }

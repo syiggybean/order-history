@@ -237,14 +237,16 @@ function MemberRow({ m, me, open, onToggle }) {
       title={m.name ?? m.email ?? "Staff member"}
       subtitle={
         <>
-          {(m.isOwner || m.id === me) && <span style={{ ...small, marginLeft: "6px" }}>{[m.isOwner && "Store owner", m.id === me && "You"].filter(Boolean).join(" · ")}</span>}
+          {(m.isOwner || m.isSuperAdmin || m.id === me) && (
+            <span style={{ ...small, marginLeft: "6px" }}>{[m.isOwner && "Store owner", m.isSuperAdmin && "Super admin", m.id === me && "You"].filter(Boolean).join(" · ")}</span>
+          )}
           {m.email && m.name && <div style={small}>{m.email}</div>}
           <div style={small}>Last seen {new Date(m.lastSeenAt).toLocaleDateString()}</div>
         </>
       }
       access={m.access}
       isAdmin={m.isAdmin}
-      locked={m.isOwner}
+      locked={m.isOwner || m.isSuperAdmin}
       isMe={m.id === me}
       open={open}
       onToggle={onToggle}

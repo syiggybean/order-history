@@ -4,15 +4,15 @@ import { NoteError, addNote, deleteNote, editNote, listNotes } from "../product-
 // Internal notes card on product pages in Shopify admin.
 //   GET ?productId=gid://shopify/Product/1        the notes
 //   POST { intent: "add", productId, body } | { intent: "edit", id, body } | { intent: "delete", id }
-// Any staff member can read them; anyone with Stock access can write them.
+// Its own permission, "Product notes": Read notes, or Read + write notes.
 
 export const loader = async ({ request }) => {
   const { session, user, cors } = await getStaff(request);
   const respond = (data) => cors(Response.json(data));
-  if (!user) return respond({ hidden: true });
+  if (!user || !can(user, "productNotes", "view")) return respond({ hidden: true });
   try {
     const productId = new URL(request.url).searchParams.get("productId");
-    return respond({ notes: await listNotes(session.shop, productId, user), canWrite: can(user, "stock", "view") });
+    return respond({ notes: await listNotes(session.shop, productId, user), canWrite: can(user, "productNotes", "manage") });
   } catch (e) {
     if (e instanceof NoteError) return respond({ error: e.message });
     console.error("[product-notes]", e);
@@ -23,7 +23,7 @@ export const loader = async ({ request }) => {
 export const action = async ({ request }) => {
   const { session, user, cors } = await getStaff(request);
   const respond = (data, status = 200) => cors(Response.json(data, { status }));
-  if (!can(user, "stock", "view")) return respond({ error: "You need Stock access to write product notes. Ask an admin." }, 403);
+  if (!can(user, "productNotes", "manage")) return respond({ error: "You need the Product notes \"Read + write notes\" permission. Ask an admin." }, 403);
   let body;
   try {
     body = await request.json();
