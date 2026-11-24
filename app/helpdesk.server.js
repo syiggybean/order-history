@@ -37,7 +37,7 @@ const SYNC_EVERY_MS = 60_000;
 const MAX_PER_RUN = 100;
 const BODY_LIMIT = 200_000; // characters of text kept per email
 
-import { STATUSES, TEMPLATES, renderTemplate, templateDef, ticketValues } from "./tickets";
+import { STATUSES, TEMPLATES, attachmentProblem, renderTemplate, templateDef, ticketValues } from "./tickets";
 
 export { STATUSES };
 
@@ -107,6 +107,30 @@ async function gmail(path, { method = "GET", body } = {}) {
   });
   if (res.status === 401) cached = null;
   if (res.status === 204) return {};
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new HelpdeskError(`Gmail: ${data?.error?.message ?? `HTTP ${res.status}`}`);
+  return data;
+}
+
+// Sending a finished email. Gmail's plain send takes about 5 MB at most, so
+// bigger ones (attachments) go through its upload route, which takes 35 MB.
+const PLAIN_SEND_MAX = 4_500_000;
+async function sendRaw(raw, threadId) {
+  const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  if (bytes.length <= PLAIN_SEND_MAX) return gmail("/messages/send", { method: "POST", body: { raw: b64url(bytes), threadId } });
+  if (gmailFetch) return gmailFetch("/upload/messages/send", { method: "POST", body: { raw: b64url(bytes), threadId } });
+  const boundary = `monkeybean-${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ threadId })}\r\n--${boundary}\r\nContent-Type: message/rfc822\r\n\r\n`),
+    bytes,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const res = await fetch(`${GMAIL.replace("/gmail/v1/", "/upload/gmail/v1/")}/messages/send?uploadType=multipart`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${await token()}`, "Content-Type": `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  if (res.status === 401) cached = null;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new HelpdeskError(`Gmail: ${data?.error?.message ?? `HTTP ${res.status}`}`);
   return data;
@@ -528,13 +552,16 @@ const composer = nodemailer.createTransport({ streamTransport: true, buffer: tru
 const reSubject = (s) => (/^re:/i.test(s) ? s : `Re: ${s}`);
 
 // html: what staff wrote (cleaned here); their signature is added unless signature is false
-export async function reply(shop, id, html, user, { status = "waiting", signature = true } = {}) {
+// files: [{ name, type, content: Buffer }] attached to the email
+export async function reply(shop, id, html, user, { status = "waiting", signature = true, files = [] } = {}) {
   const message = sanitizeHtml(html);
-  if (isBlank(message)) throw new HelpdeskError("Write a reply first.");
+  if (isBlank(message) && !files.length) throw new HelpdeskError("Write a reply first.");
+  const problem = attachmentProblem(files.map((f) => ({ name: f.name, size: f.content?.length ?? 0 })));
+  if (problem) throw new HelpdeskError(problem);
   const t = await ticketOr404(shop, id);
   const sig = signature && user?.id ? await getSignature(shop, user.id) : null;
   const full = sig && !isBlank(sig) ? `${message}<br><div class="signature">${sig}</div>` : message;
-  const now = await sendInThread(shop, t, { html: full, kind: "reply", user });
+  const now = await sendInThread(shop, t, { html: full, kind: "reply", user, files });
   await db.ticket.update({
     where: { id: t.id },
     data: { lastMessageAt: now, needsReply: false, status: STATUSES.includes(status) ? status : "waiting", closedAt: status === "closed" ? now : null },
@@ -542,7 +569,7 @@ export async function reply(shop, id, html, user, { status = "waiting", signatur
 }
 
 // An email from the help mailbox in the ticket's conversation, recorded on the ticket
-async function sendInThread(shop, t, { html, subject = null, kind, user = null, auto = false }) {
+async function sendInThread(shop, t, { html, subject = null, kind, user = null, auto = false, files = [] }) {
   if (!t.customerEmail) throw new HelpdeskError("This ticket has no customer email address to reply to.");
   const s = await getSync(shop);
   if (!s?.enabledAt) throw new HelpdeskError("Tickets aren't connected to the mailbox yet.");
@@ -561,8 +588,16 @@ async function sendInThread(shop, t, { html, subject = null, kind, user = null, 
     references: refs,
     // Robots on the other end shouldn't answer an automatic email
     headers: auto ? { "Auto-Submitted": "auto-replied", "X-Auto-Response-Suppress": "All" } : undefined,
+    attachments: files.length ? files.map((f) => ({ filename: f.name, content: f.content, contentType: f.type || undefined })) : undefined,
   });
-  const sent = await gmail("/messages/send", { method: "POST", body: { raw: b64url(raw), threadId: t.gmailThreadId } });
+  const sent = await sendRaw(raw, t.gmailThreadId);
+  // What was attached, as Gmail stored it, so the ticket can show and open it
+  let attached = null;
+  if (files.length && sent.id) {
+    const full = await gmail(`/messages/${sent.id}?format=full`).catch(() => null);
+    const found = full ? readMessage(full).attachments : [];
+    attached = found.length ? found : files.map((f) => ({ name: f.name, mime: f.type || null, size: f.content.length, id: null }));
+  }
   const now = new Date();
   await db.ticketMessage.create({
     data: {
@@ -576,6 +611,7 @@ async function sendInThread(shop, t, { html, subject = null, kind, user = null, 
       subject: subj.slice(0, 500),
       body: text,
       bodyHtml: html,
+      attachments: attached ? JSON.stringify(attached) : null,
       staffName: user?.name ?? null,
       staffId: user?.id ?? null,
       sentAt: now,

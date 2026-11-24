@@ -34,7 +34,7 @@ import {
   updateTicket,
   sync,
 } from "../helpdesk.server";
-import { STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
+import { ATTACH_MAX_BYTES, ATTACH_MAX_FILES, attachmentProblem, fileSize, STATUS_LABELS, VARIABLES, renderTemplate, sampleValues, unknownVariables } from "../tickets";
 import { emailDocument, sanitizeHtml } from "../email-html";
 import { OrderFlyout as SharedOrderFlyout } from "../components/OrderPanel";
 import { AddressError, changeAddresses, openOrders } from "../address-change.server";
@@ -107,8 +107,14 @@ export const action = async ({ request }) => {
     if (intent === "syncNow") return { intent, ok: true, ...(await sync(shop)) };
     if (!can(user, "tickets", "reply")) return denied("tickets", "reply");
     if (intent === "reply") {
-      await reply(shop, id, form.get("html"), user, { status: String(form.get("status") || "waiting"), signature: form.get("signature") !== "false" });
-      return { intent, ok: true };
+      // Attached files (return labels, photos…), sent with the email
+      const files = [];
+      for (const f of form.getAll("files")) {
+        if (!f || typeof f === "string" || !f.size) continue;
+        files.push({ name: String(f.name || "attachment").slice(0, 200), type: f.type || "", content: Buffer.from(await f.arrayBuffer()) });
+      }
+      await reply(shop, id, form.get("html"), user, { status: String(form.get("status") || "waiting"), signature: form.get("signature") !== "false", files });
+      return { intent, ok: true, attached: files.length };
     }
     if (intent === "signature") return { intent, ok: true, signature: await saveSignature(shop, user?.id, form.get("html")) };
     if (intent === "editNote") return (await editNote(shop, form.get("messageId"), form.get("text"), user), { intent, ok: true });
@@ -722,22 +728,63 @@ function Composer({ ticket, signature }) {
   const [editorKey, setEditorKey] = useState(0);
   const [sig, setSig] = useState(signature);
   useEffect(() => setSig(signature), [signature]);
+  // Files to send with the reply
+  const [files, setFiles] = useState([]);
+  const [dragging, setDragging] = useState(false);
+  const picker = useRef(null);
+  const addFiles = (list) => {
+    const incoming = [...(list ?? [])].filter((x) => x && x.size !== undefined);
+    if (!incoming.length) return;
+    // The same file twice is attached once
+    setFiles((cur) => [...cur, ...incoming.filter((x) => !cur.some((c) => c.name === x.name && c.size === x.size))]);
+  };
+  const fileProblem = attachmentProblem(files);
   const busy = f.state !== "idle";
   useEffect(() => {
     if (f.state === "idle" && f.data?.ok && (f.data.intent === "reply" || f.data.intent === "note")) {
       setText("");
       setHtml("");
+      setFiles([]);
       setEditorKey((k) => k + 1);
     }
   }, [f.state, f.data]);
-  const empty = mode === "note" ? !text.trim() : !htmlHasText(html);
+  const empty = mode === "note" ? !text.trim() : !htmlHasText(html) && !files.length;
   const send = () => {
     if (empty) return;
-    if (mode === "note") f.submit({ intent: "note", id: String(ticket.id), text }, { method: "post" });
-    else f.submit({ intent: "reply", id: String(ticket.id), html, status: after, signature: withSig && sig ? "true" : "false" }, { method: "post" });
+    if (mode === "note") return f.submit({ intent: "note", id: String(ticket.id), text }, { method: "post" });
+    if (fileProblem) return;
+    const fields = { intent: "reply", id: String(ticket.id), html, status: after, signature: withSig && sig ? "true" : "false" };
+    if (!files.length) return f.submit(fields, { method: "post" });
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    for (const file of files) form.append("files", file, file.name);
+    f.submit(form, { method: "post", encType: "multipart/form-data" });
   };
   return (
-    <div style={{ border: `1px solid ${mode === "note" ? "#ecd58f" : "#c9c9c9"}`, background: mode === "note" ? "#fffbea" : "#fff", borderRadius: "12px", padding: "10px 12px", display: "grid", gap: "8px" }}>
+    <div
+      onDragOver={(e) => {
+        if (mode !== "reply" || ![...(e.dataTransfer?.types ?? [])].includes("Files")) return;
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) setDragging(false);
+      }}
+      onDrop={(e) => {
+        if (mode !== "reply" || !e.dataTransfer?.files?.length) return;
+        e.preventDefault();
+        setDragging(false);
+        addFiles(e.dataTransfer.files);
+      }}
+      style={{
+        border: `1px ${dragging ? "dashed" : "solid"} ${dragging ? "#005bd3" : mode === "note" ? "#ecd58f" : "#c9c9c9"}`,
+        background: dragging ? "#f0f6ff" : mode === "note" ? "#fffbea" : "#fff",
+        borderRadius: "12px",
+        padding: "10px 12px",
+        display: "grid",
+        gap: "8px",
+      }}
+    >
       <div style={{ display: "flex", gap: "4px" }}>
         {[
           ["reply", `Reply to ${ticket.customerName || ticket.customerEmail}`],
@@ -766,10 +813,49 @@ function Composer({ ticket, signature }) {
             </div>
           )}
           {editingSig && <SignatureEditor value={sig} onDone={(v) => (setSig(v ?? sig), setEditingSig(false))} />}
+          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
+            <input
+              ref={picker}
+              type="file"
+              multiple
+              hidden
+              aria-label="Attach files"
+              onChange={(e) => {
+                addFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <button type="button" style={{ ...btn, padding: "3px 10px", fontSize: "12px" }} disabled={busy} onClick={() => picker.current?.click()}>
+              📎 Attach files
+            </button>
+            {!files.length && (
+              <span style={{ fontSize: "12px", color: "#616161" }}>
+                or drop them here. Return labels, photos, PDFs; up to {ATTACH_MAX_FILES} files, {fileSize(ATTACH_MAX_BYTES)} in all.
+              </span>
+            )}
+            {files.map((file, i) => (
+              <span
+                key={`${file.name}-${i}`}
+                style={{ display: "inline-flex", gap: "6px", alignItems: "center", padding: "2px 4px 2px 10px", border: "1px solid #ddd", borderRadius: "999px", fontSize: "12px", background: "#f6f6f7" }}
+              >
+                {/^image\//.test(file.type) ? "🖼" : "📄"} {file.name} <span style={{ color: "#616161" }}>{fileSize(file.size)}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${file.name}`}
+                  disabled={busy}
+                  onClick={() => setFiles(files.filter((_, j) => j !== i))}
+                  style={{ appearance: "none", border: 0, background: "none", cursor: "pointer", fontSize: "14px", lineHeight: 1, padding: "0 4px", color: "#616161" }}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+          {fileProblem && <span style={{ color: "#8e1f0b", fontSize: "13px" }}>{fileProblem}</span>}
         </>
       )}
       <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
-        <button type="button" style={dark} disabled={busy || empty} onClick={send}>
+        <button type="button" style={dark} disabled={busy || empty || (mode === "reply" && Boolean(fileProblem))} onClick={send}>
           {busy && (f.formData?.get("intent") === "reply" || f.formData?.get("intent") === "note") ? (mode === "note" ? "Saving…" : "Sending…") : mode === "note" ? "Add note" : "Send reply"}
         </button>
         {mode === "reply" && (

@@ -93,3 +93,29 @@ export function unknownVariables(...texts) {
   for (const t of texts) for (const m of String(t ?? "").matchAll(TOKEN)) if (!known.has(m[1])) bad.add(m[1]);
   return [...bad];
 }
+
+// ---------------------------------------------------------------------------
+// Files attached to replies (return labels, photos, PDFs…)
+// ---------------------------------------------------------------------------
+
+// Most email services refuse messages over about 25 MB once encoded, so files
+// together stay under 20 MB. Programs and scripts are refused (Gmail blocks
+// them anyway).
+export const ATTACH_MAX_FILES = 10;
+export const ATTACH_MAX_BYTES = 20 * 1024 * 1024;
+const BLOCKED = /\.(exe|bat|cmd|com|scr|pif|js|jse|vbs|vbe|wsf|wsh|msi|msp|ps1|psm1|jar|dll|cpl|lnk|reg|hta|scf|app|apk|iso|img|vhd)$/i;
+
+export const fileSize = (n) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+
+// What's wrong with a set of files ({ name, size }), or null
+export function attachmentProblem(files) {
+  const list = files ?? [];
+  if (list.length > ATTACH_MAX_FILES) return `Attach up to ${ATTACH_MAX_FILES} files.`;
+  const bad = list.find((f) => BLOCKED.test(f.name ?? ""));
+  if (bad) return `${bad.name} can't be emailed (programs and scripts are blocked).`;
+  const empty = list.find((f) => !(f.size > 0));
+  if (empty) return `${empty.name} is empty.`;
+  const total = list.reduce((n, f) => n + (f.size ?? 0), 0);
+  if (total > ATTACH_MAX_BYTES) return `Files add up to ${fileSize(total)}; the most an email can carry is ${fileSize(ATTACH_MAX_BYTES)}.`;
+  return null;
+}
