@@ -3,6 +3,7 @@ api_version = "2026-07"
 [[extensions]]
 name = "t:name"
 handle = "early-access"
+uid = "2c81085e-2271-35de-b6d0-8141e4d1f01a54c2f25d"
 type = "function"
 description = "t:description"
 

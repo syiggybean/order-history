@@ -3,6 +3,7 @@ api_version = "2026-07"
 [[extensions]]
 name = "t:name"
 handle = "monkeybean-sales"
+uid = "9ee02b80-31d3-729b-f06c-88c5a1e245f7aaf79f01"
 type = "function"
 description = "t:description"
 

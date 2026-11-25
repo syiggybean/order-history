@@ -7,15 +7,15 @@
 //                time; everyone else from the end time (before the start, nobody)
 //
 // Audience: everyone, or only loyalty members of chosen tiers ("secret sales").
-// Members are recognised at checkout by their tier, which Loyalty keeps on the
-// customer as the oh_loyalty.tier_tag metafield (the same text as their tier
-// tag, e.g. "VIP Gold"). A member has to be signed in.
+// Members are recognised at checkout by their tier tag (e.g. "VIP Gold"), which
+// Loyalty keeps on the customer. A member has to be signed in.
 //
 // How it reaches Shopify
-//   items / order  an automatic discount using MonkeyBean's discount function
-//                  ("monkeybean-sales"), with the sale's start and end times;
-//                  Shopify starts and stops it. Its settings go on the discount
-//                  as metafields the function reads.
+//   items / order  a Shopify automatic discount (Shopify's own kind, so it works
+//                  on any plan) with the sale's start and end times; Shopify
+//                  starts and stops it. Members-only sales are limited to a
+//                  customer segment per tier ("MonkeyBean: VIP Gold" = customers
+//                  tagged VIP Gold), made the first time it's needed.
 //   earlyAccess    a checkout rule (the "early-access" function, turned on once
 //                  under Settings → Checkout → Checkout rules) that reads each
 //                  product's oh_sales.early_access metafield. MonkeyBean sets
@@ -33,8 +33,6 @@ import { getProgram, tierTagOf } from "./loyalty.server";
 export class SaleError extends Error {}
 
 export const KINDS = { items: "% or $ off items", order: "Order discount", earlyAccess: "Early access" };
-const FUNCTION_HANDLE = "monkeybean-sales";
-const FN_NS = "$app:monkeybean-sales";
 const EA_NS = "oh_sales";
 const EA_KEY = "early_access";
 const TABS_KEY = "tabs";
@@ -211,16 +209,22 @@ export async function deleteSale(shop, admin, id) {
 // ---------------------------------------------------------------------------
 
 const CREATE = `#graphql
-  mutation SaleCreate($d: DiscountAutomaticAppInput!) {
-    discountAutomaticAppCreate(automaticAppDiscount: $d) { automaticAppDiscount { discountId } userErrors { field message } }
+  mutation SaleCreate($d: DiscountAutomaticBasicInput!) {
+    discountAutomaticBasicCreate(automaticBasicDiscount: $d) { automaticDiscountNode { id } userErrors { field message } }
   }`;
 const UPDATE = `#graphql
-  mutation SaleUpdate($id: ID!, $d: DiscountAutomaticAppInput!) {
-    discountAutomaticAppUpdate(id: $id, automaticAppDiscount: $d) { automaticAppDiscount { discountId } userErrors { field message } }
+  mutation SaleUpdate($id: ID!, $d: DiscountAutomaticBasicInput!) {
+    discountAutomaticBasicUpdate(id: $id, automaticBasicDiscount: $d) { automaticDiscountNode { id } userErrors { field message } }
   }`;
 const DELETE = `#graphql
   mutation SaleDelete($id: ID!) {
     discountAutomaticDelete(id: $id) { deletedAutomaticDiscountId userErrors { field message } }
+  }`;
+const SEGMENT_FIND = `#graphql
+  query SaleSegment($q: String!) { segments(first: 5, query: $q) { nodes { id name query } } }`;
+const SEGMENT_CREATE = `#graphql
+  mutation SaleSegmentCreate($name: String!, $query: String!) {
+    segmentCreate(name: $name, query: $query) { segment { id } userErrors { field message } }
   }`;
 const MF_SET = `#graphql
   mutation SaleMetafields($metafields: [MetafieldsSetInput!]!) {
@@ -247,18 +251,44 @@ async function deleteDiscount(admin, id) {
   }
 }
 
-// What the discount function is told about the sale
-export function functionConfig(sale, tags) {
+// A customer segment per loyalty tier ("MonkeyBean: VIP Gold" = customers
+// tagged VIP Gold; Loyalty keeps the tags up to date). Made once, then reused.
+const segmentName = (tag) => `MonkeyBean: ${tag}`;
+const segmentQuery = (tag) => `customer_tags CONTAINS '${tag.replace(/'/g, "\\'")}'`;
+async function segmentFor(admin, tag) {
+  const name = segmentName(tag);
+  const found = await gql(admin, SEGMENT_FIND, { q: `name:'${name.replace(/'/g, "\\'")}'` });
+  const hit = (found?.segments?.nodes ?? []).find((n) => n.name === name);
+  if (hit) return hit.id;
+  const r = await gql(admin, SEGMENT_CREATE, { name, query: segmentQuery(tag) });
+  errs(r?.segmentCreate);
+  const id = r?.segmentCreate?.segment?.id;
+  if (!id) throw new SaleError(`Shopify didn't make the customer segment for ${tag}.`);
+  return id;
+}
+
+// The sale as a Shopify automatic discount (Shopify's own kind, so it works
+// on any plan)
+export function discountInput(sale, segmentIds, { previousSegmentIds = [], update = false } = {}) {
+  const fixed = sale.valueType === "fixed";
+  const value = fixed
+    ? { discountAmount: { amount: String(sale.value), appliesOnEachItem: sale.kind === "items" } }
+    : { percentage: Math.min(sale.value, 100) / 100 };
+  const items =
+    sale.kind === "order" || sale.scope === "all"
+      ? { all: true }
+      : sale.scope === "collections"
+        ? { collections: { add: json(sale.collections, []).map((c) => c.id) } }
+        : { products: { productsToAdd: json(sale.products, []).map((p) => p.id) } };
+  const remove = previousSegmentIds.filter((id) => !segmentIds.includes(id));
   return {
-    kind: sale.kind,
-    membersOnly: sale.audience === "tiers",
-    tags,
-    valueType: sale.valueType,
-    value: sale.value,
-    scope: sale.scope,
-    productIds: json(sale.products, []).map((p) => p.id),
-    minSubtotal: sale.minSubtotal ?? 0,
-    message: sale.name,
+    title: sale.name,
+    startsAt: sale.startsAt.toISOString(),
+    endsAt: sale.endsAt.toISOString(),
+    combinesWith: sale.combine ? { productDiscounts: true, orderDiscounts: true, shippingDiscounts: true } : { productDiscounts: false, orderDiscounts: false, shippingDiscounts: true },
+    context: sale.audience === "tiers" ? { customerSegments: { add: segmentIds, ...(update && remove.length ? { remove } : {}) } } : { all: "ALL" },
+    customerGets: { value, items },
+    minimumRequirement: sale.kind === "order" && sale.minSubtotal ? { subtotal: { greaterThanOrEqualToSubtotal: String(sale.minSubtotal) } } : null,
   };
 }
 
@@ -273,37 +303,26 @@ export async function syncSale(shop, admin, sale, program = null) {
       if (sale.discountId) await deleteDiscount(admin, sale.discountId);
       await db.sale.update({ where: { id: sale.id }, data: { discountId: null } });
     } else {
-      const d = {
-        title: sale.name,
-        functionHandle: FUNCTION_HANDLE,
-        discountClasses: [sale.kind === "order" ? "ORDER" : "PRODUCT"],
-        startsAt: sale.startsAt.toISOString(),
-        endsAt: sale.endsAt.toISOString(),
-        combinesWith: sale.combine ? { productDiscounts: true, orderDiscounts: true, shippingDiscounts: true } : { productDiscounts: false, orderDiscounts: false, shippingDiscounts: true },
-      };
+      const segmentIds = [];
+      for (const tag of tags) segmentIds.push(await segmentFor(admin, tag));
+      const before = [];
+      for (const tag of json(sale.syncedTags, [])) if (!tags.includes(tag)) before.push(await segmentFor(admin, tag));
       let discountId = sale.discountId;
       if (discountId) {
-        const r = await gql(admin, UPDATE, { id: discountId, d });
-        const e = r?.discountAutomaticAppUpdate?.userErrors ?? [];
-        // Deleted in Shopify meanwhile: make it again
-        if (e.some((x) => /not found|does not exist/i.test(x.message))) discountId = null;
-        else errs(r?.discountAutomaticAppUpdate);
+        const r = await gql(admin, UPDATE, { id: discountId, d: discountInput(sale, segmentIds, { previousSegmentIds: before, update: true }) });
+        const e = r?.discountAutomaticBasicUpdate?.userErrors ?? [];
+        // Deleted in Shopify meanwhile (or made the old way): make it again
+        if (e.some((x) => /not found|does not exist|invalid id/i.test(x.message))) {
+          await deleteDiscount(admin, discountId);
+          discountId = null;
+        } else errs(r?.discountAutomaticBasicUpdate);
       }
       if (!discountId) {
-        const r = await gql(admin, CREATE, { d });
-        errs(r?.discountAutomaticAppCreate);
-        discountId = r?.discountAutomaticAppCreate?.automaticAppDiscount?.discountId;
+        const r = await gql(admin, CREATE, { d: discountInput(sale, segmentIds) });
+        errs(r?.discountAutomaticBasicCreate);
+        discountId = r?.discountAutomaticBasicCreate?.automaticDiscountNode?.id;
         if (!discountId) throw new SaleError("Shopify didn't make the discount.");
       }
-      const collectionIds = sale.scope === "collections" ? json(sale.collections, []).map((c) => c.id) : [];
-      const m = await gql(admin, MF_SET, {
-        metafields: [
-          { ownerId: discountId, namespace: FN_NS, key: "config", type: "json", value: JSON.stringify(functionConfig(sale, tags)) },
-          // The function's input variables (collections it checks lines against)
-          { ownerId: discountId, namespace: FN_NS, key: "function-configuration", type: "json", value: JSON.stringify({ collectionIds }) },
-        ],
-      });
-      errs(m?.metafieldsSet);
       await db.sale.update({ where: { id: sale.id }, data: { discountId } });
     }
     await db.sale.update({ where: { id: sale.id }, data: { syncedTags: JSON.stringify(tags), syncError: null, syncedAt: new Date() } });
