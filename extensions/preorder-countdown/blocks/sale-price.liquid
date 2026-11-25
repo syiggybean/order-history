@@ -159,8 +159,8 @@
     { "type": "checkbox", "id": "countdown", "label": "Show a countdown to when the sale ends", "default": true },
     { "type": "text", "id": "ends_label", "label": "Countdown label", "default": "Sale ends in" },
     { "type": "text", "id": "everyone_label", "label": "Label for sales for everyone", "default": "Sale" },
-    { "type": "text", "id": "member_label", "label": "Label for members' prices ([tier] = their tier tag)", "default": "[tier] price" },
-    { "type": "text", "id": "hide_selector", "label": "Hide the theme's own price while a sale applies (CSS selector, optional)", "info": "For example .price or .product__price. Leave empty to keep it." },
+    { "type": "text", "id": "member_label", "label": "Label for members' prices", "info": "[tier] is replaced by their tier, e.g. VIP Gold.", "default": "[tier] price" },
+    { "type": "text", "id": "hide_selector", "label": "Hide the theme's price during a sale (CSS selector)", "info": "Optional. For example .price or .product__price. Leave empty to keep the theme's price showing." },
     { "type": "color", "id": "accent", "label": "Sale colour", "default": "#C8102E" }
   ]
 }
