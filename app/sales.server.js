@@ -156,6 +156,8 @@ export async function saveSale(shop, admin, input, user) {
   const name = clean(input.name, 120);
   if (!name) throw new SaleError("Give the sale a name (members see it at checkout).");
   if (!KINDS[input.kind]) throw new SaleError("Choose what kind of sale it is.");
+  const sameName = await db.sale.findFirst({ where: { shop, name, endsAt: { gt: new Date() }, active: true, ...(input.id ? { id: { not: Number(input.id) } } : {}) } });
+  if (sameName) throw new SaleError(`Another sale that hasn't finished is already called “${name}”. Shopify needs each sale's name to be different; pick another, or wait for that one to finish.`);
   const startsAt = fromStoreInput(input.starts);
   const endsAt = fromStoreInput(input.ends);
   if (!startsAt || !endsAt) throw new SaleError(input.kind === "earlyAccess" ? "Set when members can buy, and when everyone can." : "Set when the sale starts and ends.");
@@ -340,7 +342,15 @@ export function groupsOf(sale, program) {
       groups.push({ ...base, key: `${r.col}:${r.value}:${shape}`, value: r.value, items: shape === "collections" ? json(sale.collections, []).map((c) => c.id) : [] });
     }
   }
+  for (const g of groups) g.several = groups.filter((x) => x.col === g.col).length > 1;
   return groups;
+}
+
+// Shopify wants every automatic discount's title to be different: tier and,
+// when an audience has more than one amount, the amount go in the title
+export function titleOf(sale, g) {
+  const parts = [g.tierName ? `${g.tierName} members` : null, g.several ? `${sale.valueType === "fixed" ? `$${g.value}` : `${g.value}%`} off` : null].filter(Boolean);
+  return parts.length ? `${sale.name} (${parts.join(", ")})` : sale.name;
 }
 
 export const discountIdsOf = (sale) => [...new Set([...Object.values(json(sale.discounts, {})).map((d) => d.id), ...(sale.discountId ? [sale.discountId] : [])])];
@@ -359,7 +369,7 @@ export function discountInput(sale, g, segmentIds, { was = null, removeSegments 
         ? { collections: { add: addItems, ...(removeItems.length ? { remove: removeItems } : {}) } }
         : { products: { productsToAdd: addItems, ...(removeItems.length ? { productsToRemove: removeItems } : {}) } };
   return {
-    title: g.tierName ? `${sale.name} (${g.tierName} members)` : sale.name,
+    title: g.title ?? titleOf(sale, g),
     startsAt: sale.startsAt.toISOString(),
     endsAt: sale.endsAt.toISOString(),
     // The sale's own discounts always work together (one per item at most:
@@ -393,6 +403,7 @@ export async function syncSale(shop, admin, sale, program = null) {
         had[groups[0].key] = { id: sale.discountId, tag: json(sale.syncedTags, [])[0] ?? null, items: null };
       const now = {};
       const segCache = new Map();
+      let cleared = false;
       const seg = async (tag) => {
         if (!segCache.has(tag)) segCache.set(tag, await segmentFor(admin, tag));
         return segCache.get(tag);
@@ -412,6 +423,7 @@ export async function syncSale(shop, admin, sale, program = null) {
       for (const g of groups) {
         const segmentIds = g.tag ? [await seg(g.tag)] : [];
         const prev = prevFor(g);
+        if (prev?.title && prev.title.replace(/ #\d+$/, "") === titleOf(sale, g)) g.title = prev.title;
         let id = prev?.id ?? null;
         if (id) {
           // Tier renamed in Loyalty: swap the segment; items: add and take away
@@ -425,12 +437,25 @@ export async function syncSale(shop, admin, sale, program = null) {
           }
         }
         if (!id) {
-          const r = await gql(admin, CREATE, { d: discountInput(sale, g, segmentIds, { several: groups.length > 1 }) });
-          errs(r?.discountAutomaticBasicCreate);
-          id = r?.discountAutomaticBasicCreate?.automaticDiscountNode?.id;
+          // Finished sales' discounts still sit in Shopify (expired) until
+          // they're cleared, and hold their titles: clear them first
+          if (!cleared) {
+            cleared = true;
+            await clearFinished(shop, admin);
+          }
+          // Still taken (a discount made in Shopify itself): number it
+          const base = titleOf(sale, g);
+          for (let n = 1; n <= 9 && !id; n++) {
+            g.title = n === 1 ? base : `${base} #${n}`;
+            const r = await gql(admin, CREATE, { d: discountInput(sale, g, segmentIds, { several: groups.length > 1 }) });
+            const e = r?.discountAutomaticBasicCreate?.userErrors ?? [];
+            if (e.length && e.every((x) => /title/i.test(x.message) && /unique/i.test(x.message)) && n < 9) continue;
+            errs(r?.discountAutomaticBasicCreate);
+            id = r?.discountAutomaticBasicCreate?.automaticDiscountNode?.id;
+          }
           if (!id) throw new SaleError("Shopify didn't make the discount.");
         }
-        now[g.key] = { id, tag: g.tag, items: g.items };
+        now[g.key] = { id, tag: g.tag, items: g.items, title: g.title ?? titleOf(sale, g) };
         // Saved as it goes, so a failure part way doesn't leave strays
         await db.sale.update({ where: { id: sale.id }, data: { discounts: JSON.stringify({ ...had, ...now }), discountId: null } });
       }
@@ -442,8 +467,10 @@ export async function syncSale(shop, admin, sale, program = null) {
   } catch (e) {
     await db.sale.update({ where: { id: sale.id }, data: { syncError: errorMessage(e).slice(0, 500), syncedAt: new Date() } });
     throw e instanceof SaleError ? e : new SaleError(errorMessage(e));
+  } finally {
+    // Product-page prices and front-page tabs
+    await syncTabs(shop, admin).catch((e) => console.error(`[sales] ${shop}: tabs:`, errorMessage(e)));
   }
-  await syncTabs(shop, admin).catch((e) => console.error(`[sales] ${shop}: tabs:`, errorMessage(e)));
 }
 
 // ---------------------------------------------------------------------------
@@ -599,20 +626,25 @@ export async function offersFor(shop, program) {
 // Pickers
 // ---------------------------------------------------------------------------
 
-const FIND = `#graphql
-  query SaleFind($q: String!) {
+const FIND_PRODUCTS = `#graphql
+  query SaleFindProducts($q: String!) {
     products(first: 10, query: $q) {
-      nodes { id title featuredImage { url(transform: { maxWidth: 160 }) } priceRangeV2 { minVariantPrice { amount } maxVariantPrice { amount } } }
+      nodes { id title status featuredImage { url(transform: { maxWidth: 160 }) } priceRangeV2 { minVariantPrice { amount } maxVariantPrice { amount } } }
     }
+  }`;
+const FIND_COLLECTIONS = `#graphql
+  query SaleFindCollections($q: String!) {
     collections(first: 8, query: $q) { nodes { id title image { url(transform: { maxWidth: 160 }) } } }
   }`;
 
 export async function findTargets(admin, q) {
   const t = String(q ?? "").trim().slice(0, 80).replace(/["\\]/g, " ");
   if (t.length < 2) return { products: [], collections: [] };
-  const d = await gql(admin, FIND, { q: `title:*${t}*` });
+  // Archived products can't be sold, so they're left out
+  const [products, collections] = await Promise.all([gql(admin, FIND_PRODUCTS, { q: `title:*${t}* -status:archived` }), gql(admin, FIND_COLLECTIONS, { q: `title:*${t}*` })]);
+  const d = { products: products?.products, collections: collections?.collections };
   return {
-    products: (d?.products?.nodes ?? []).map((p) => ({
+    products: (d?.products?.nodes ?? []).filter((p) => p.status !== "ARCHIVED").map((p) => ({
       id: p.id,
       title: p.title,
       image: p.featuredImage?.url ?? null,
@@ -628,6 +660,20 @@ export async function findTargets(admin, q) {
 // whose tiers changed (renamed in Loyalty) are re-sent
 // ---------------------------------------------------------------------------
 
+// Finished sales' discounts come out of Shopify (expired ones stay listed
+// there otherwise, and keep their titles taken)
+async function clearFinished(shop, admin) {
+  const finished = (await db.sale.findMany({ where: { shop, kind: { in: ["items", "order"] }, OR: [{ endsAt: { lte: new Date() } }, { active: false }] } })).filter((s) => s.discounts || s.discountId);
+  for (const s of finished) {
+    try {
+      for (const id of discountIdsOf(s)) await deleteDiscount(admin, id);
+      await db.sale.update({ where: { id: s.id }, data: { discounts: null, discountId: null, syncedAt: new Date() } });
+    } catch (e) {
+      console.error(`[sales] ${shop} ${s.name}: clearing finished sale:`, errorMessage(e));
+    }
+  }
+}
+
 export async function tick(shop, admin) {
   const program = await getProgram(shop);
   const early = await db.sale.findMany({ where: { shop, kind: "earlyAccess", active: true, endsAt: { gt: new Date() } } });
@@ -639,6 +685,9 @@ export async function tick(shop, admin) {
     const missing = !s.discountId && (!s.syncError || !s.syncedAt || Date.now() - s.syncedAt.getTime() > 15 * 60_000);
     if (JSON.stringify(tagsFor(s, program)) !== (s.syncedTags ?? "[]") || missing) await syncSale(shop, admin, s, program).catch((e) => console.error(`[sales] ${shop} ${s.name}:`, errorMessage(e)));
   }
+  // Finished sales: their discounts come out of Shopify (the sale stays in
+  // MonkeyBean, on the Finished tab)
+  await clearFinished(shop, admin);
   // Ended sales' tabs and product-page prices drop off
   const lastTab = await db.sale.findFirst({ where: { shop, OR: [{ tabEnabled: true }, { kind: "items" }], endsAt: { lte: new Date(), gt: new Date(Date.now() - 2 * 60_000) } } });
   if (lastTab) await syncTabs(shop, admin).catch(() => {});

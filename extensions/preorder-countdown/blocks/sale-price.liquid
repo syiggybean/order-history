@@ -42,10 +42,29 @@
   {%- endcapture -%}
   {%- if cands != blank -%}
     <div class="ohsp" hidden {{ block.shopify_attributes }} style="--ohsp-accent: {{ block.settings.accent }};">
-      <span class="ohsp__was"></span>
-      <span class="ohsp__now"></span>
-      <span class="ohsp__badge"></span>
-      {%- if block.settings.countdown -%}<span class="ohsp__timer"></span>{%- endif -%}
+      <div class="ohsp__row">
+        <span class="ohsp__was"></span>
+        <span class="ohsp__now"></span>
+        <span class="ohsp__badge"></span>
+      </div>
+      {%- if block.settings.countdown -%}
+        {%- comment -%} The same flip clock as the pre-order countdown {%- endcomment -%}
+        <script src="{{ 'preorder-countdown-lib.js' | asset_url }}" defer></script>
+        <div class="ohpc ohsp__clock" style="--ohpc-bg: {{ block.settings.panel_color }}; --ohpc-card: {{ block.settings.card_color }}; --ohpc-ink: {{ block.settings.digit_color }}; --ohpc-text: {{ block.settings.label_color }};">
+          {%- if block.settings.ends_label != blank -%}<p class="ohpc__heading">{{ block.settings.ends_label | escape }}</p>{%- endif -%}
+          <div class="ohpc__clock" aria-hidden="true">
+            <div class="ohpc__unit" data-unit="days"><div class="ohpc__digits"></div><span class="ohpc__label">Days</span></div>
+            <span class="ohpc__sep"></span>
+            <div class="ohpc__unit" data-unit="hours"><div class="ohpc__digits"></div><span class="ohpc__label">Hours</span></div>
+            <span class="ohpc__sep"></span>
+            <div class="ohpc__unit" data-unit="minutes"><div class="ohpc__digits"></div><span class="ohpc__label">Minutes</span></div>
+            <span class="ohpc__sep"></span>
+            <div class="ohpc__unit" data-unit="seconds"><div class="ohpc__digits"></div><span class="ohpc__label">Seconds</span></div>
+          </div>
+          {%- if block.settings.show_date -%}<p class="ohpc__when" data-ohsp-when></p>{%- endif -%}
+          <p class="ohpc__sr" data-ohpc-sr role="status"></p>
+        </div>
+      {%- endif -%}
     </div>
     <script type="application/json" class="ohsp-data">
       {
@@ -55,7 +74,6 @@
         "format": {{ shop.money_format | json }},
         "everyone": {{ block.settings.everyone_label | json }},
         "member": {{ block.settings.member_label | json }},
-        "ends": {{ block.settings.ends_label | json }},
         "hide": {{ block.settings.hide_selector | json }}
       }
     </script>
@@ -120,32 +138,39 @@
           if (!hidden.length) showTheme(false);
           tickTimer();
         };
-        var timer = box.querySelector('.ohsp__timer');
+        // The pre-order countdown's flip clock (preorder-countdown-lib.js, loaded above)
+        var panel = box.querySelector('.ohsp__clock');
+        var whenEl = box.querySelector('[data-ohsp-when]');
+        var clock = null;
         var tickTimer = function () {
-          if (!timer || !best) return;
-          var left = Math.max(0, Math.floor(best.o.e - Date.now() / 1000));
-          if (left === 0) return render();
-          var dd = Math.floor(left / 86400), h = Math.floor(left % 86400 / 3600), m = Math.floor(left % 3600 / 60), s = left % 60;
-          var pad = function (x) { return (x < 10 ? '0' : '') + x; };
-          timer.textContent = d.ends + ' ' + (dd ? dd + 'd ' : '') + pad(h) + ':' + pad(m) + ':' + pad(s);
+          if (!panel || !best) return;
+          var left = best.o.e * 1000 - Date.now();
+          if (left <= 0) return render();
+          if (!clock && window.OHPCLib) clock = new window.OHPCLib.Clock(panel, 'until the sale ends');
+          if (clock) clock.draw(left);
+          if (whenEl && whenEl._e !== best.o.e) {
+            whenEl._e = best.o.e;
+            whenEl.textContent = 'Ends ' + new Date(best.o.e * 1000).toLocaleString(undefined, { month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+          }
         };
         var last = null;
         setInterval(function () {
           var v = current();
           if (v !== last) { last = v; render(); } else tickTimer();
-        }, 1000);
+        }, 250);
         document.addEventListener('change', function () { setTimeout(render, 0); });
         last = current();
         render();
       })();
     </script>
     <style>
-      .ohsp { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin: 8px 0; font: inherit; }
+      .ohsp { margin: 8px 0; font: inherit; }
       .ohsp[hidden] { display: none; }
+      .ohsp__row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+      .ohsp__clock { margin-top: 12px; }
       .ohsp__was { text-decoration: line-through; opacity: .6; }
       .ohsp__now { font-weight: 700; font-size: 1.25em; color: var(--ohsp-accent); }
       .ohsp__badge { font-size: .8em; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--ohsp-accent); }
-      .ohsp__timer { flex-basis: 100%; font-size: .9em; font-variant-numeric: tabular-nums; opacity: .85; }
     </style>
   {%- endif -%}
 {%- endif -%}
@@ -155,9 +180,17 @@
   "name": "Sale price",
   "target": "section",
   "enabled_on": { "templates": ["product"] },
+  "stylesheet": "preorder-countdown.css",
   "settings": [
+    { "type": "header", "content": "Countdown" },
     { "type": "checkbox", "id": "countdown", "label": "Show a countdown to when the sale ends", "default": true },
-    { "type": "text", "id": "ends_label", "label": "Countdown label", "default": "Sale ends in" },
+    { "type": "text", "id": "ends_label", "label": "Heading", "default": "Sale ends in" },
+    { "type": "checkbox", "id": "show_date", "label": "Show the end date under the clock", "default": true },
+    { "type": "color", "id": "panel_color", "label": "Background", "default": "#FBACBB" },
+    { "type": "color", "id": "label_color", "label": "Heading and labels", "default": "#FFFFFF" },
+    { "type": "color", "id": "card_color", "label": "Digit cards", "default": "#FFFFFF" },
+    { "type": "color", "id": "digit_color", "label": "Digits", "default": "#FBACBB" },
+    { "type": "header", "content": "Price" },
     { "type": "text", "id": "everyone_label", "label": "Label for sales for everyone", "default": "Sale" },
     { "type": "text", "id": "member_label", "label": "Label for members' prices", "info": "[tier] is replaced by their tier, e.g. VIP Gold.", "default": "[tier] price" },
     { "type": "text", "id": "hide_selector", "label": "Hide the theme's price during a sale (CSS selector)", "info": "Optional. For example .price or .product__price. Leave empty to keep the theme's price showing." },

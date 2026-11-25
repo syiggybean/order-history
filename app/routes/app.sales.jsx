@@ -107,7 +107,7 @@ const chip = (on) => ({
 const STATUS = {
   live: ["Live", "#cdfee1", "#0c5132"],
   scheduled: ["Scheduled", "#e0f0ff", "#00527c"],
-  ended: ["Ended", "#ebebeb", "#4a4a4a"],
+  ended: ["Finished", "#ebebeb", "#4a4a4a"],
   off: ["Off", "#ebebeb", "#4a4a4a"],
 };
 
@@ -150,10 +150,17 @@ export default function Sales() {
   const data = useLoaderData();
   const [openId, setOpenId] = useState(null); // a sale open for editing, or "new"
   const [show, setShow] = useState("current");
+  const [template, setTemplate] = useState(null); // "Run again": a finished sale's settings for a new one
   if (data.noAccess) return <NoAccess />;
   const { sales, tiers, canManage } = data;
-  const shown = sales.filter((s) => (show === "current" ? s.status === "live" || s.status === "scheduled" : show === "past" ? s.status === "ended" || s.status === "off" : true));
-  const live = sales.filter((s) => s.status === "live" || s.status === "scheduled").length;
+  const TABS = { current: ["live", "scheduled"], finished: ["ended"], off: ["off"] };
+  const shown = sales.filter((s) => TABS[show].includes(s.status));
+  const count = (tab) => sales.filter((s) => TABS[tab].includes(s.status)).length;
+  const runAgain = (s) => {
+    setTemplate({ ...s, id: undefined, status: undefined, startsInput: "", endsInput: "", syncError: null, syncedAt: null, createdBy: null, active: true });
+    setShow("current");
+    setOpenId("new");
+  };
   const toggle = (id) => setOpenId((o) => (o === id ? null : id));
   const cols = 6;
 
@@ -167,9 +174,9 @@ export default function Sales() {
         </s-paragraph>
         <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "12px", alignItems: "center" }}>
           {[
-            ["current", `Live and scheduled (${live})`],
-            ["past", "Ended and off"],
-            ["all", "All"],
+            ["current", `Live and scheduled (${count("current")})`],
+            ["finished", `Finished (${count("finished")})`],
+            ...(count("off") ? [["off", `Off (${count("off")})`]] : []),
           ].map(([id, text]) => (
             <button key={id} type="button" onClick={() => setShow(id)} style={chip(show === id)}>
               {text}
@@ -177,7 +184,13 @@ export default function Sales() {
           ))}
           {canManage && (
             <span style={{ marginLeft: "auto" }}>
-              <s-button variant="primary" onClick={() => setOpenId(openId === "new" ? null : "new")}>
+              <s-button
+                variant="primary"
+                onClick={() => {
+                  setTemplate(null);
+                  setOpenId(openId === "new" ? null : "new");
+                }}
+              >
                 New sale
               </s-button>
             </span>
@@ -202,14 +215,20 @@ export default function Sales() {
               {openId === "new" && (
                 <tr>
                   <td colSpan={cols} style={{ padding: 0, borderBottom: "1px solid #ebebeb", background: "#fbfbfb" }}>
-                    <Editor key="new" s={{}} tiers={tiers} canManage={canManage} onDone={() => setOpenId(null)} />
+                    <Editor key={template ? `again-${template.name}` : "new"} s={template ?? {}} tiers={tiers} canManage={canManage} onDone={() => (setOpenId(null), setTemplate(null))} />
                   </td>
                 </tr>
               )}
               {shown.length === 0 && openId !== "new" && (
                 <tr>
                   <td colSpan={cols} style={{ ...td, color: "#616161" }}>
-                    {show === "current" ? (canManage ? "Nothing live or coming up. Start one with New sale." : "Nothing live or coming up.") : "None."}
+                    {show === "current"
+                      ? canManage
+                        ? "Nothing live or coming up. Start one with New sale."
+                        : "Nothing live or coming up."
+                      : show === "finished"
+                        ? "No finished sales yet. Sales move here on their own when they end."
+                        : "None."}
                   </td>
                 </tr>
               )}
@@ -272,7 +291,7 @@ export default function Sales() {
                   open && (
                     <tr key={`${s.id}-edit`}>
                       <td colSpan={cols} style={{ padding: 0, borderBottom: "1px solid #d4d4d4", background: "#fbfbfb" }}>
-                        <Editor s={s} tiers={tiers} canManage={canManage} onDone={() => setOpenId(null)} />
+                        <Editor s={s} tiers={tiers} canManage={canManage} onDone={() => setOpenId(null)} onRunAgain={canManage ? () => runAgain(s) : null} />
                       </td>
                     </tr>
                   ),
@@ -358,17 +377,22 @@ function AddRow({ type, have, onAdd, disabled, colSpan }) {
 
 const num = (v) => (v === "" || v == null ? "" : String(v));
 
-function Editor({ s, tiers, canManage, onDone }) {
+function Editor({ s, tiers, canManage, onDone, onRunAgain }) {
   const save = useFetcher();
   const remove = useFetcher();
   const retry = useFetcher();
   const isNew = !s.id;
-  const dis = !canManage;
+  // A finished sale is a record: it can be run again or deleted
+  const finished = s.status === "ended";
+  const dis = !canManage || finished;
   const [name, setName] = useState(s.name ?? "");
   const [kind, setKind] = useState(s.kind ?? "items");
   const [valueType, setValueType] = useState(s.valueType ?? "percentage");
-  // Who gets what: { [col]: amount } for the chosen columns, in tier order
-  const [rates, setRates] = useState(() => Object.fromEntries((s.rates ?? [{ col: "everyone", value: "" }]).map((r) => [r.col, num(r.value)])));
+  // Who gets what: { [col]: amount } for everyone and every tier; empty = not in the sale
+  const [rates, setRates] = useState(() => {
+    const had = Object.fromEntries((s.rates ?? []).map((r) => [r.col, num(r.value)]));
+    return Object.fromEntries(["everyone", ...tiers.map((t) => t.id)].map((col) => [col, had[col] ?? ""]));
+  });
   const [eaTiers, setEaTiers] = useState(s.kind === "earlyAccess" ? s.tiers : []);
   const [scope, setScope] = useState(s.scope ?? "products");
   const [collections, setCollections] = useState(s.collections ?? []);
@@ -398,14 +422,9 @@ function Editor({ s, tiers, canManage, onDone }) {
   }, [early]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const allCols = [{ col: "everyone", name: "Everyone" }, ...tiers.map((t) => ({ col: t.id, name: t.name }))];
-  const cols = allCols.filter((c) => c.col in rates);
-  const toggleCol = (col) =>
-    setRates((r) => {
-      const next = { ...r };
-      if (col in next) delete next[col];
-      else next[col] = "";
-      return next;
-    });
+  const cols = allCols;
+  // An audience is in the sale with an amount, or a product amount for it
+  const used = (col) => rates[col] !== "" || (kind === "items" && scope === "products" && products.some((p) => (p.values?.[col] ?? "") !== ""));
   const setCell = (pid, col, v) => setProducts((ps) => ps.map((p) => (p.id === pid ? { ...p, values: { ...p.values, [col]: v } } : p)));
   const unit = valueType === "fixed" ? "$" : "%";
 
@@ -416,7 +435,7 @@ function Editor({ s, tiers, canManage, onDone }) {
         ...(s.id ? { id: String(s.id) } : {}),
         name,
         kind,
-        rates: JSON.stringify(cols.map((c) => ({ col: c.col, value: rates[c.col] }))),
+        rates: JSON.stringify(cols.filter((c) => used(c.col)).map((c) => ({ col: c.col, value: rates[c.col] }))),
         tiers: JSON.stringify(eaTiers),
         valueType,
         scope: kind === "order" ? "all" : scope,
@@ -443,7 +462,15 @@ function Editor({ s, tiers, canManage, onDone }) {
 
   return (
     <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "12px" }} onClick={(e) => e.stopPropagation()}>
-      {s.syncError && (
+      {finished && (
+        <div style={{ ...box, flexDirection: "row", alignItems: "center", flexWrap: "wrap", background: "#f7f7f7" }}>
+          <span style={{ fontSize: "13px", flex: 1 }}>
+            Finished {when(s.endsAt)}. Its discounts have been taken out of Shopify; this is the record of what it was.
+          </span>
+          {onRunAgain && <s-button onClick={onRunAgain}>Run again with new dates</s-button>}
+        </div>
+      )}
+      {s.syncError && !finished && (
         <div style={{ ...box, background: "#fff4f4", borderColor: "#f5c2c0", flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
           <span style={{ color: "#8e1f0b", fontSize: "13px", flex: 1 }}>Shopify didn't take the last change: {s.syncError}</span>
           {canManage && (
@@ -530,19 +557,14 @@ function Editor({ s, tiers, canManage, onDone }) {
                 <option value="percentage">% off</option>
                 <option value="fixed">{kind === "order" ? "$ off the order" : "$ off each item"}</option>
               </select>
-              <span style={small}>for</span>
-              {allCols.map((c) => (
-                <button key={c.col} type="button" aria-pressed={c.col in rates} disabled={dis} onClick={() => toggleCol(c.col)} style={chip(c.col in rates)}>
-                  {c.name}
-                </button>
-              ))}
+              <span style={small}>Fill in an amount for each audience that gets the sale; leave the rest empty.</span>
             </div>
             {cols.length > 0 && (
               <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
                 {cols.map((c) => (
                   <label key={c.col} style={field}>
                     {c.col === "everyone" ? "Everyone" : `${c.name} members`}
-                    {showProducts && <span style={small}>Default for products below</span>}
+                    {showProducts && <span style={small}>Default for products</span>}
                     <span style={{ display: "flex", alignItems: "center", gap: "4px" }}>
                       {unit === "$" && <span>$</span>}
                       <input
@@ -563,7 +585,7 @@ function Editor({ s, tiers, canManage, onDone }) {
             )}
             <span style={small}>
               A member gets the best amount they qualify for. Members' amounts are kept to signed-in customers in that tier.
-              {cols.length > 1 || showProducts ? " Each audience and amount is its own discount in Shopify (Shopify allows 25 automatic discounts at once)." : ""}
+              {cols.filter((c) => used(c.col)).length > 1 || showProducts ? " Each audience and amount is its own discount in Shopify (Shopify allows 25 automatic discounts at once)." : ""}
             </span>
             {kind === "order" && (
               <label style={field}>
@@ -623,7 +645,7 @@ function Editor({ s, tiers, canManage, onDone }) {
                                 min="0"
                                 step="0.01"
                                 value={own}
-                                placeholder={rates[c.col] !== "" ? String(rates[c.col]) : "0"}
+                                placeholder={rates[c.col] !== "" ? String(rates[c.col]) : "–"}
                                 onChange={(e) => setCell(p.id, c.col, e.target.value)}
                                 disabled={dis}
                                 aria-label={`${p.title}: ${c.name} amount off`}
@@ -711,9 +733,9 @@ function Editor({ s, tiers, canManage, onDone }) {
           {!isNew && s.syncedAt ? `Sent to Shopify ${when(s.syncedAt)}.` : ""}
         </span>
         <s-button variant="tertiary" onClick={onDone}>
-          {canManage ? "Cancel" : "Close"}
+          {canManage && !finished ? "Cancel" : "Close"}
         </s-button>
-        {canManage && (
+        {canManage && !finished && (
           <s-button variant="primary" onClick={submit} {...(save.state !== "idle" ? { loading: true } : {})}>
             {isNew ? "Create sale" : "Save"}
           </s-button>
