@@ -1,0 +1,35 @@
+query CartInput($collectionIds: [ID!]) {
+  cart {
+    buyerIdentity {
+      customer {
+        tierTag: metafield(namespace: "oh_loyalty", key: "tier_tag") {
+          value
+        }
+      }
+    }
+    lines {
+      id
+      quantity
+      cost {
+        subtotalAmount {
+          amount
+        }
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            id
+            inAnyCollection(ids: $collectionIds)
+          }
+        }
+      }
+    }
+  }
+  discount {
+    discountClasses
+    config: metafield(namespace: "$app:monkeybean-sales", key: "config") {
+      jsonValue
+    }
+  }
+}

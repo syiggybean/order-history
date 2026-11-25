@@ -939,6 +939,9 @@ model LoyaltyMember {
   tierSpend            Float     @default(0)
   // The tier tag currently on the customer in Shopify
   tierTag              String?
+  // The same, as the customer's oh_loyalty.tier_tag metafield (read at checkout
+  // by tier-only sales and early access)
+  tierMeta             String?
   points               Int       @default(0)
   pending              Int       @default(0)
   lifetime             Int       @default(0)
@@ -1650,6 +1653,16 @@ model Freebie {
   stock       Int      @default(0)
   given       Int      @default(0)
   active      Boolean  @default(true)
+  // product: one per unit of an attached product (the original kind)
+  // firstOrders: the first maxOrders orders in the window with an in-stock item
+  // minSpend: orders of minSubtotal or more in the window with an in-stock item
+  kind          String    @default("product")
+  startsAt      DateTime?
+  endsAt        DateTime?
+  maxOrders     Int?
+  minSubtotal   Float?
+  // firstOrders: how many orders have had one (a cancelled order frees its place)
+  ordersGranted Int       @default(0)
   createdBy   String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @default(now()) @updatedAt
@@ -1957,4 +1970,50 @@ model ReturnSync {
   shop      String    @id
   lastRunAt DateTime?
   lastError String?
+}
+
+// A scheduled sale (Sales page): % or $ off items, an order discount, or early
+// access to products. Everyone, or only loyalty members of chosen tiers.
+// Discounts run as an automatic discount in Shopify (the monkeybean-sales
+// function); early access is a checkout rule (the early-access function).
+model Sale {
+  id           Int       @id @default(autoincrement())
+  shop         String
+  name         String
+  // items | order | earlyAccess
+  kind         String
+  // everyone | tiers
+  audience     String    @default("everyone")
+  // Loyalty tier ids ([..]); their tags are worked out when it syncs
+  tiers        String?
+  // percentage | fixed
+  valueType    String    @default("percentage")
+  value        Float     @default(0)
+  // all | collections | products (items and early access)
+  scope        String    @default("all")
+  // [{ id, title }]
+  collections  String?
+  products     String?
+  minSubtotal  Float?
+  combine      Boolean   @default(false)
+  startsAt     DateTime
+  endsAt       DateTime
+  active       Boolean   @default(true)
+  // Early access: nobody can buy before members can
+  lockBefore   Boolean   @default(true)
+  // Front-page tab for the members who can use it
+  tabEnabled   Boolean   @default(false)
+  tabLabel     String?
+  tabUrl       String?
+  // In Shopify
+  discountId   String?
+  syncedTags   String?
+  phase        String?
+  syncError    String?
+  syncedAt     DateTime?
+  createdBy    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @default(now()) @updatedAt
+
+  @@index([shop])
 }

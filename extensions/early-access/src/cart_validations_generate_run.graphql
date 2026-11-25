@@ -1,0 +1,25 @@
+query CartValidationsGenerateRunInput {
+  cart {
+    buyerIdentity {
+      customer {
+        tierTag: metafield(namespace: "oh_loyalty", key: "tier_tag") {
+          value
+        }
+      }
+    }
+    lines {
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            id
+            title
+            earlyAccess: metafield(namespace: "oh_sales", key: "early_access") {
+              jsonValue
+            }
+          }
+        }
+      }
+    }
+  }
+}

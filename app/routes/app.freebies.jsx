@@ -39,6 +39,11 @@ export const action = async ({ request }) => {
           barcode: form.get("barcode"),
           stock: form.get("stock"),
           active: form.get("active") !== "false",
+          kind: form.get("kind") || undefined,
+          starts: form.get("starts"),
+          ends: form.get("ends"),
+          maxOrders: form.get("maxOrders"),
+          minSubtotal: form.get("minSubtotal"),
         },
         user,
       );
@@ -85,6 +90,14 @@ function Photo({ src, size = 56, alt = "" }) {
 function Status({ f }) {
   if (!f.active) return <span style={pill("#f1f1f1", "#616161")}>Off</span>;
   if (f.stock <= 0) return <span style={pill("#fff1e3", "#8a4b00")}>Out of stock</span>;
+  if (f.kind === "firstOrders" || f.kind === "minSpend") {
+    const when = (iso) => new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/Los_Angeles" });
+    const what = f.kind === "firstOrders" ? `First ${f.maxOrders} orders` : `Orders $${f.minSubtotal}+`;
+    if (f.phase === "upcoming") return <span style={pill("#eef3ff", "#1c4a9c")}>{what} · starts {when(f.startsAt)}</span>;
+    if (f.phase === "over") return <span style={pill("#f1f1f1", "#616161")}>{what} · ended</span>;
+    if (f.kind === "firstOrders" && f.ordersGranted >= f.maxOrders) return <span style={pill("#f1f1f1", "#616161")}>All {f.maxOrders} given</span>;
+    return <span style={pill("#e3f5e8", "#0c5132")}>{what} · until {when(f.endsAt)}{f.kind === "firstOrders" ? ` · ${f.ordersGranted} given` : ""}</span>;
+  }
   if (!f.products.length) return <span style={pill("#fff1e3", "#8a4b00")}>No products yet</span>;
   return <span style={pill("#e3f5e8", "#0c5132")}>Showing</span>;
 }
@@ -359,6 +372,13 @@ function Editor({ f, canManage, onCreated }) {
   const [sku, setSku] = useState(f.sku ?? "");
   const [barcode, setBarcode] = useState(f.barcode ?? "");
   const [active, setActive] = useState(f.active ?? true);
+  // Who gets it: with chosen products, the first N orders, or orders over $X
+  const [kind, setKind] = useState(f.kind ?? "product");
+  const [starts, setStarts] = useState(f.startsInput ?? "");
+  const [ends, setEnds] = useState(f.endsInput ?? "");
+  const [maxOrders, setMaxOrders] = useState(f.maxOrders != null ? String(f.maxOrders) : "");
+  const [minSubtotal, setMinSubtotal] = useState(f.minSubtotal != null ? String(f.minSubtotal) : "");
+  const perOrder = kind !== "product";
   const [q, setQ] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [preview, setPreview] = useState(null);
@@ -395,7 +415,10 @@ function Editor({ f, canManage, onCreated }) {
     image.submit(fd, { method: "post", encType: "multipart/form-data" });
   };
   const submit = () =>
-    save.submit({ intent: "save", ...(f.id ? { id: String(f.id) } : {}), title, description, stock, sku, barcode, active: String(active) }, { method: "post" });
+    save.submit(
+      { intent: "save", ...(f.id ? { id: String(f.id) } : {}), title, description, stock, sku, barcode, active: String(active), kind, starts, ends, maxOrders, minSubtotal },
+      { method: "post" },
+    );
   const error = save.data?.error ?? image.data?.error ?? link.data?.error ?? remove.data?.error ?? search.data?.error;
 
   return (
@@ -435,8 +458,58 @@ function Editor({ f, canManage, onCreated }) {
           </div>
           <label style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "13px" }}>
             <input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} disabled={!canManage} />
-            On (shown on product pages and given with orders while there's stock)
+            {perOrder ? "On (given with qualifying orders during the offer while there's stock)" : "On (shown on product pages and given with orders while there's stock)"}
           </label>
+        </div>
+
+        <div style={section}>
+          <p style={sectionTitle}>Who gets it</p>
+          {[
+            ["product", "With chosen products", "One for every unit bought of the products below."],
+            ["firstOrders", "The first orders during an offer", "The first orders placed in the window that include an in-stock item (not a pre-order) get one each."],
+            ["minSpend", "Orders over an amount during an offer", "Orders in the window with a subtotal of at least the amount (after discounts, before shipping and tax) that include an in-stock item get one each."],
+          ].map(([k, label, hint]) => (
+            <label key={k} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+              <input type="radio" name="freebie-kind" checked={kind === k} onChange={() => setKind(k)} disabled={!canManage} style={{ marginTop: "3px" }} />
+              <span>
+                <strong style={{ fontWeight: 600 }}>{label}</strong>
+                <span style={{ ...small, display: "block" }}>{hint}</span>
+              </span>
+            </label>
+          ))}
+          {perOrder && (
+            <>
+              <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
+                <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+                  Starts (store time)
+                  <input type="datetime-local" value={starts} onChange={(e) => setStarts(e.target.value)} style={{ ...input, width: "210px" }} disabled={!canManage} />
+                </label>
+                <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+                  Ends
+                  <input type="datetime-local" value={ends} onChange={(e) => setEnds(e.target.value)} style={{ ...input, width: "210px" }} disabled={!canManage} />
+                </label>
+              </div>
+              {kind === "firstOrders" ? (
+                <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+                  How many orders get one
+                  <input type="number" min="1" step="1" value={maxOrders} onChange={(e) => setMaxOrders(e.target.value)} style={{ ...input, width: "130px" }} disabled={!canManage} />
+                  {!isNew && f.kind === "firstOrders" && (
+                    <span style={small}>
+                      {f.ordersGranted.toLocaleString()} of {f.maxOrders?.toLocaleString()} given. A cancelled order frees its place for the next order.
+                    </span>
+                  )}
+                </label>
+              ) : (
+                <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+                  Order subtotal of at least ($)
+                  <input type="number" min="0.01" step="0.01" value={minSubtotal} onChange={(e) => setMinSubtotal(e.target.value)} style={{ ...input, width: "130px" }} disabled={!canManage} />
+                </label>
+              )}
+              <span style={small}>
+                One per order. Every offer an order qualifies for applies, so offers stack. It's packed with the in-stock item, and it still stops when the stock above runs out.
+              </span>
+            </>
+          )}
         </div>
 
         <div style={section}>
@@ -454,7 +527,7 @@ function Editor({ f, canManage, onCreated }) {
           <span style={small}>With a barcode or SKU it's scanned like any item. Without one, packers tap “Put one in the box”.</span>
         </div>
 
-        {!isNew && (
+        {!isNew && !perOrder && (
           <div style={section}>
             <p style={sectionTitle}>Comes with</p>
             {(f.products ?? []).length === 0 && <span style={small}>No products yet. Find one below.</span>}
@@ -542,7 +615,7 @@ function Editor({ f, canManage, onCreated }) {
           </s-button>
           {canManage && (
             <s-button variant="primary" onClick={submit} {...(save.state !== "idle" ? { loading: true } : {})}>
-              {isNew ? "Create, then add a photo and products" : "Save"}
+              {isNew ? (perOrder ? "Create, then add a photo" : "Create, then add a photo and products") : "Save"}
             </s-button>
           )}
         </div>

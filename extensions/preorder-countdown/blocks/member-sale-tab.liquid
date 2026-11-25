@@ -1,0 +1,71 @@
+{%- comment -%}
+  Member sale tab (from the MonkeyBean app)
+
+  An app embed: turn it on once under Online Store → Themes → Customize →
+  App embeds. While a sale made in MonkeyBean is on and has "Show a tab on the
+  front page" set, it shows a tab linking to the sale, only to the customers
+  the sale is for (signed-in members of its loyalty tiers, or everyone).
+  MonkeyBean keeps shop.metafields.oh_sales.tabs up to date:
+    [{ label, url, starts, ends (unix seconds), tags: [tier tags; empty = everyone] }]
+{%- endcomment -%}
+{%- assign tabs = shop.metafields.oh_sales.tabs.value -%}
+{%- assign show_here = true -%}
+{%- if block.settings.home_only and template.name != 'index' -%}{%- assign show_here = false -%}{%- endif -%}
+{%- if tabs != blank and show_here -%}
+  {%- assign now = 'now' | date: '%s' | plus: 0 -%}
+  {%- capture links -%}
+    {%- for tab in tabs -%}
+      {%- assign starts = tab.starts | plus: 0 -%}
+      {%- assign ends = tab.ends | plus: 0 -%}
+      {%- if now >= starts and now < ends -%}
+        {%- assign allowed = false -%}
+        {%- if tab.tags == blank or tab.tags.size == 0 -%}
+          {%- assign allowed = true -%}
+        {%- elsif customer -%}
+          {%- for t in tab.tags -%}
+            {%- if customer.tags contains t -%}{%- assign allowed = true -%}{%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+        {%- if allowed -%}
+          <a class="ohst__tab" href="{{ tab.url | default: '/' | escape }}">
+            {%- if tab.tags.size > 0 -%}<span class="ohst__badge">{{ block.settings.badge | escape }}</span>{%- endif -%}
+            <span>{{ tab.label | escape }}</span>
+          </a>
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endcapture -%}
+  {%- if links != blank -%}
+    <nav class="ohst ohst--{{ block.settings.position }}" aria-label="Sales for you" style="--ohst-bg: {{ block.settings.background }}; --ohst-fg: {{ block.settings.text }};">
+      {{ links }}
+    </nav>
+    <style>
+      .ohst { position: fixed; z-index: 60; display: flex; gap: 6px; font: inherit; }
+      .ohst--side { left: 0; top: 40%; flex-direction: column; }
+      .ohst--side .ohst__tab { border-radius: 0 10px 10px 0; writing-mode: vertical-rl; transform: rotate(180deg); padding: 14px 9px; }
+      .ohst--bottom { right: 16px; bottom: 16px; flex-direction: column; align-items: flex-end; }
+      .ohst--bottom .ohst__tab { border-radius: 999px; padding: 10px 16px; box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+      .ohst__tab { display: inline-flex; align-items: center; gap: 8px; background: var(--ohst-bg); color: var(--ohst-fg); text-decoration: none; font-weight: 600; font-size: 14px; line-height: 1.2; }
+      .ohst__tab:hover, .ohst__tab:focus-visible { filter: brightness(1.08); text-decoration: underline; }
+      .ohst__badge { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .85; }
+      @media (max-width: 600px) { .ohst--side { top: auto; bottom: 90px; } }
+    </style>
+  {%- endif -%}
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Member sale tab",
+  "target": "body",
+  "settings": [
+    { "type": "select", "id": "position", "label": "Where", "default": "side", "options": [
+      { "value": "side", "label": "Tab on the left edge" },
+      { "value": "bottom", "label": "Button at the bottom right" }
+    ] },
+    { "type": "checkbox", "id": "home_only", "label": "Only on the front page", "default": true },
+    { "type": "text", "id": "badge", "label": "Label on members-only tabs", "default": "Members" },
+    { "type": "color", "id": "background", "label": "Background", "default": "#1A1A1A" },
+    { "type": "color", "id": "text", "label": "Text", "default": "#FFFFFF" }
+  ]
+}
+{% endschema %}

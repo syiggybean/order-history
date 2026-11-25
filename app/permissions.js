@@ -51,6 +51,11 @@ export const FEATURES = {
     levels: ["hidden", "view", "print"],
     levelLabels: { hidden: "Hidden", view: "Search items", print: "Search + print labels" },
   },
+  sales: {
+    label: "Sales",
+    levels: ["hidden", "view", "manage"],
+    levelLabels: { hidden: "Hidden", view: "View", manage: "View + create and change sales" },
+  },
   freebies: {
     label: "Freebies",
     levels: ["hidden", "view", "manage"],

@@ -756,21 +756,47 @@ async function tagCall(admin, mutation, customerId, tag) {
   if (r?.userErrors?.length) throw new Error(r.userErrors.map((e) => e.message).join("; "));
 }
 
+// The tier tag also goes on the customer as a metafield (oh_loyalty.tier_tag):
+// checkout (tier-only sales, early access) reads that, since a checkout rule
+// can't be told which tags to look for
+const TIER_MF_SET = `#graphql
+  mutation LoyaltyTierMeta($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) { userErrors { field message } }
+  }`;
+const TIER_MF_DELETE = `#graphql
+  mutation LoyaltyTierMetaDelete($metafields: [MetafieldIdentifierInput!]!) {
+    metafieldsDelete(metafields: $metafields) { userErrors { field message } }
+  }`;
+async function tierMetaCall(admin, customerId, tag) {
+  const ownerId = customerGid(customerId);
+  const data = tag
+    ? await gql(admin, TIER_MF_SET, { metafields: [{ ownerId, namespace: "oh_loyalty", key: "tier_tag", type: "single_line_text_field", value: tag }] })
+    : await gql(admin, TIER_MF_DELETE, { metafields: [{ ownerId, namespace: "oh_loyalty", key: "tier_tag" }] });
+  const r = data?.metafieldsSet ?? data?.metafieldsDelete;
+  if (r?.userErrors?.length) throw new Error(r.userErrors.map((e) => e.message).join("; "));
+}
+
 // Puts each member's tier tag on (and old ones off). Removed members lose theirs.
 export async function syncTierTags(shop, admin, { limit = 200 } = {}) {
   const program = await getProgram(shop);
-  const rows = await db.loyaltyMember.findMany({ where: { shop, OR: [{ status: "active" }, { tierTag: { not: null } }] } });
+  const rows = await db.loyaltyMember.findMany({ where: { shop, OR: [{ status: "active" }, { tierTag: { not: null } }, { tierMeta: { not: null } }] } });
   let changes = 0;
   for (const m of rows) {
     if (changes >= limit) break;
     const tier = m.status === "active" ? program.tiers.find((t) => t.id === m.tier) ?? program.tiers[0] : null;
     const want = tierTagOf(program, tier);
-    if (want === m.tierTag) continue;
+    if (want === m.tierTag && want === (m.tierMeta ?? null)) continue;
     changes++;
     try {
-      if (m.tierTag) await tagCall(admin, TAGS_REMOVE, m.customerId, m.tierTag);
-      if (want) await tagCall(admin, TAGS_ADD, m.customerId, want);
-      await db.loyaltyMember.update({ where: { id: m.id }, data: { tierTag: want } });
+      if (want !== m.tierTag) {
+        if (m.tierTag) await tagCall(admin, TAGS_REMOVE, m.customerId, m.tierTag);
+        if (want) await tagCall(admin, TAGS_ADD, m.customerId, want);
+        await db.loyaltyMember.update({ where: { id: m.id }, data: { tierTag: want } });
+      }
+      if (want !== (m.tierMeta ?? null)) {
+        await tierMetaCall(admin, m.customerId, want);
+        await db.loyaltyMember.update({ where: { id: m.id }, data: { tierMeta: want } });
+      }
     } catch (e) {
       console.error(`[loyalty] ${shop}: tier tag for ${m.customerId}:`, errorMessage(e));
     }
@@ -813,6 +839,8 @@ async function birthdayRun() {
       const members = await db.loyaltyMember.findMany({ where: { shop, status: "active" }, select: { customerId: true } });
       for (const m of members) await recount(shop, m.customerId).catch(() => {});
     }
+    // Tier tags and their checkout copy (members from before it existed get theirs here)
+    kickTierTags(shop, 1000);
   }
 }
 if (!globalThis.__loyaltyTimer && process.env.NODE_ENV !== "test") {

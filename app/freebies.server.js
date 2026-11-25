@@ -1,6 +1,6 @@
 import db from "./db.server";
 import { unauthenticated } from "./shopify.server";
-import { errorMessage, gql } from "./preorders.server";
+import { dayInStore, errorMessage, gql } from "./preorders.server";
 
 // ---------------------------------------------------------------------------
 // Freebies: a free gift attached to one or more products.
@@ -13,9 +13,23 @@ import { errorMessage, gql } from "./preorders.server";
 // - The gift rides along with the order's box in the shipping hub
 //   (Shipment.freebieLines), so it's on the pick list, the packing screen and
 //   the packing slip. A cancelled order gives its freebies back to the stock.
+//
+// Two more kinds work per order instead of per product, during a time window,
+// and only for orders with at least one in-stock item (not a pre-order: no
+// future release date and no GT tag, the same rule Shipping uses):
+// - firstOrders: the first N such orders get one
+// - minSpend: such orders with a subtotal (after discounts, before shipping
+//   and tax) of $X or more get one
+// One gift per order per offer; every offer an order qualifies for applies, so
+// they stack with each other and with product freebies. It goes in the box with
+// the in-stock item.
 // ---------------------------------------------------------------------------
 
+import { fromStoreInput, toStoreInput } from "./preorder-windows.server";
+
 export class FreebieError extends Error {}
+export const KINDS = ["product", "firstOrders", "minSpend"];
+const ORDER_KINDS = ["firstOrders", "minSpend"];
 
 export const MF_NAMESPACE = "oh_freebie";
 export const MF_KEY = "offers";
@@ -60,7 +74,16 @@ const view = (f, products = [], recent = []) => ({
   stock: f.stock,
   given: f.given,
   active: f.active,
-  showing: f.active && f.stock > 0 && products.length > 0,
+  kind: f.kind ?? "product",
+  startsAt: f.startsAt ? f.startsAt.toISOString() : null,
+  endsAt: f.endsAt ? f.endsAt.toISOString() : null,
+  startsInput: f.startsAt ? toStoreInput(f.startsAt) : "",
+  endsInput: f.endsAt ? toStoreInput(f.endsAt) : "",
+  maxOrders: f.maxOrders ?? null,
+  minSubtotal: f.minSubtotal ?? null,
+  ordersGranted: f.ordersGranted ?? 0,
+  phase: phaseOf(f),
+  showing: ORDER_KINDS.includes(f.kind) ? f.active && f.stock > 0 && phaseOf(f) === "live" && !(f.kind === "firstOrders" && f.ordersGranted >= (f.maxOrders ?? 0)) : f.active && f.stock > 0 && products.length > 0,
   createdBy: f.createdBy,
   updatedAt: f.updatedAt.toISOString(),
   products: products.map((p) => ({ productId: p.productId, title: p.title, handle: p.handle, imageUrl: p.imageUrl })),
@@ -89,7 +112,15 @@ export async function listFreebies(shop) {
 // Changing
 // ---------------------------------------------------------------------------
 
-export async function saveFreebie(shop, admin, { id = null, title, description, sku, barcode, stock, active }, user) {
+// Where an order offer's window is: upcoming, live or over
+export function phaseOf(f, now = Date.now()) {
+  if (!ORDER_KINDS.includes(f.kind)) return null;
+  if (f.startsAt && now < new Date(f.startsAt).getTime()) return "upcoming";
+  if (f.endsAt && now >= new Date(f.endsAt).getTime()) return "over";
+  return "live";
+}
+
+export async function saveFreebie(shop, admin, { id = null, title, description, sku, barcode, stock, active, kind = undefined, starts, ends, maxOrders, minSubtotal }, user) {
   const t = clean(title, 200);
   if (!t) throw new FreebieError("Give the freebie a name.");
   const left = Number(stock);
@@ -102,13 +133,39 @@ export async function saveFreebie(shop, admin, { id = null, title, description, 
     stock: left,
     active: active !== false,
   };
+  // Who gets it
+  if (kind !== undefined) {
+    if (!KINDS.includes(kind)) throw new FreebieError("Choose who gets the freebie.");
+    data.kind = kind;
+    if (ORDER_KINDS.includes(kind)) {
+      const s = fromStoreInput(starts);
+      const e = fromStoreInput(ends);
+      if (!s || !e) throw new FreebieError("Set when the offer starts and ends.");
+      if (e <= s) throw new FreebieError("The offer has to end after it starts.");
+      data.startsAt = s;
+      data.endsAt = e;
+      if (kind === "firstOrders") {
+        const n = Number(maxOrders);
+        if (!Number.isInteger(n) || n < 1) throw new FreebieError("Set how many orders get one (1 or more).");
+        data.maxOrders = n;
+        data.minSubtotal = null;
+      } else {
+        const m = Math.round(Number(minSubtotal) * 100) / 100;
+        if (!(m > 0)) throw new FreebieError("Set the order amount (more than $0).");
+        data.minSubtotal = m;
+        data.maxOrders = null;
+      }
+    } else {
+      Object.assign(data, { startsAt: null, endsAt: null, maxOrders: null, minSubtotal: null });
+    }
+  }
   let f;
   if (id) {
     const was = await db.freebie.findFirst({ where: { shop, id: Number(id) } });
     if (!was) throw new FreebieError("That freebie isn't there anymore.");
     f = await db.freebie.update({ where: { id: was.id }, data });
   } else {
-    f = await db.freebie.create({ data: { shop, ...data, createdBy: user?.name ?? null } });
+    f = await db.freebie.create({ data: { shop, ...data, ordersGranted: 0, createdBy: user?.name ?? null } });
   }
   await syncOffersFor(shop, admin, { freebieId: f.id });
   return f;
@@ -230,7 +287,6 @@ export async function grantFreebies(shop, admin, payload) {
   const productIds = Object.keys(bought);
   if (!productIds.length) return [];
   const links = await db.freebieProduct.findMany({ where: { shop, productId: { in: productIds } } });
-  if (!links.length) return [];
   const already = await db.freebieGrant.findMany({ where: { shop, orderId } });
   const given = [];
   const emptied = new Set();
@@ -253,11 +309,80 @@ export async function grantFreebies(shop, admin, payload) {
   }
   // Ran out: off the product pages
   for (const id of emptied) await syncOffersFor(shop, admin, { freebieId: id }).catch((e) => console.error(`[freebies] offers ${id}:`, errorMessage(e)));
+  given.push(...(await grantOrderOffers(shop, admin, payload, orderId, already)));
   if (given.length) {
     await refreshFreebieLines(shop, orderId);
     await writeOrderGifts(shop, admin, orderId);
   }
   return given;
+}
+
+// Order offers (first N orders, spend over $X) live when the order was placed
+async function grantOrderOffers(shop, admin, payload, orderId, already) {
+  const at = new Date(payload.created_at ?? Date.now()).getTime();
+  const offers = (await db.freebie.findMany({ where: { shop, active: true, kind: { in: ORDER_KINDS }, stock: { gt: 0 } }, orderBy: { id: "asc" } })).filter(
+    (f) => phaseOf(f, at) === "live" && !already.some((g) => g.freebieId === f.id),
+  );
+  if (!offers.length) return [];
+  // The order's in-stock items: shipped products that aren't pre-orders
+  const shipped = [...new Set((payload.line_items ?? []).filter((li) => li?.product_id && li.quantity > 0 && li.requires_shipping !== false && !li.gift_card).map((li) => gid(li.product_id)))];
+  if (!shipped.length) return [];
+  let info;
+  try {
+    const { loadProductInfo } = await import("./shipping.server");
+    info = await loadProductInfo(admin, shipped);
+  } catch (e) {
+    // Can't tell what's a pre-order: no order offers rather than wrong ones
+    console.error(`[freebies] order offers for ${payload.name}:`, errorMessage(e));
+    return [];
+  }
+  const today = dayInStore(new Date(at));
+  const inStock = shipped.filter((pid) => !(info[pid]?.release && info[pid].release > today) && !info[pid]?.gtTag);
+  if (!inStock.length) return [];
+  const subtotal = Number(payload.current_subtotal_price ?? payload.subtotal_price ?? 0);
+  const given = [];
+  const emptied = new Set();
+  for (const f of offers) {
+    if (f.kind === "minSpend" && !(subtotal >= (f.minSubtotal ?? Infinity))) continue;
+    if (f.kind === "firstOrders" && !(await claimPlace(f.id))) continue;
+    const n = await takeStock(f.id, 1);
+    if (!n) {
+      if (f.kind === "firstOrders") await releasePlace(f.id);
+      continue;
+    }
+    try {
+      await db.freebieGrant.create({
+        data: { shop, freebieId: f.id, orderId, orderName: payload.name ?? null, customerId: payload.customer?.admin_graphql_api_id ?? null, productId: inStock[0], quantity: 1 },
+      });
+      given.push({ freebieId: f.id, productId: inStock[0], quantity: 1 });
+    } catch (e) {
+      await giveBack(f.id, 1);
+      if (f.kind === "firstOrders") await releasePlace(f.id);
+      if (!/unique/i.test(errorMessage(e))) throw e;
+    }
+    const after = await db.freebie.findUnique({ where: { id: f.id } });
+    if (after && after.stock <= 0) emptied.add(f.id);
+  }
+  return given;
+}
+
+// First N orders: take a place, safely when orders land at once
+async function claimPlace(freebieId) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const f = await db.freebie.findUnique({ where: { id: freebieId } });
+    if (!f || (f.ordersGranted ?? 0) >= (f.maxOrders ?? 0)) return false;
+    const r = await db.freebie.updateMany({ where: { id: f.id, ordersGranted: f.ordersGranted ?? 0 }, data: { ordersGranted: (f.ordersGranted ?? 0) + 1 } });
+    if (r.count) return true;
+  }
+  return false;
+}
+async function releasePlace(freebieId) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const f = await db.freebie.findUnique({ where: { id: freebieId } });
+    if (!f) return;
+    const r = await db.freebie.updateMany({ where: { id: f.id, ordersGranted: f.ordersGranted ?? 0 }, data: { ordersGranted: Math.max(0, (f.ordersGranted ?? 0) - 1) } });
+    if (r.count) return;
+  }
 }
 
 async function giveBack(freebieId, n) {
@@ -278,6 +403,9 @@ export async function returnFreebies(shop, admin, orderId) {
     const r = await db.freebieGrant.updateMany({ where: { id: g.id, returnedAt: null }, data: { returnedAt: new Date() } });
     if (!r.count) continue;
     await giveBack(g.freebieId, g.quantity);
+    // First N orders: a cancelled order frees its place for the next order
+    const f = await db.freebie.findUnique({ where: { id: g.freebieId } });
+    if (f?.kind === "firstOrders") await releasePlace(f.id);
     back.add(g.freebieId);
   }
   // Back in stock: on the product pages again
