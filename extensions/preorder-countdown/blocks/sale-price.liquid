@@ -1,0 +1,167 @@
+{%- comment -%}
+  Sale price (from the MonkeyBean app)
+
+  While a MonkeyBean sale takes money off this product, shows the original
+  price crossed out, the price this shopper gets, and a countdown to when the
+  sale ends. Members-only prices show only to signed-in members of the tier.
+  Place it in the product section, near the price.
+  MonkeyBean keeps shop.metafields.oh_sales.offers up to date:
+    [{ n, s, e (unix seconds), t ("p" % | "f" $ off each), scope ("all" | "c" | "p"),
+       c: [collection ids], r: [[tag or "*", amount]], p: { productId: [[tag or "*", amount]] } }]
+{%- endcomment -%}
+{%- assign offers = shop.metafields.oh_sales.offers.value -%}
+{%- if offers != blank -%}
+  {%- assign pid = product.id | append: '' -%}
+  {%- capture cands -%}
+    {%- for o in offers -%}
+      {%- assign applies = false -%}
+      {%- assign rates = o.r -%}
+      {%- if o.scope == 'all' -%}
+        {%- assign applies = true -%}
+      {%- elsif o.scope == 'c' -%}
+        {%- for col in product.collections -%}
+          {%- if o.c contains col.id -%}{%- assign applies = true -%}{%- endif -%}
+        {%- endfor -%}
+      {%- elsif o.scope == 'p' -%}
+        {%- assign rates = o.p[pid] -%}
+        {%- if rates != blank -%}{%- assign applies = true -%}{%- endif -%}
+      {%- endif -%}
+      {%- if applies -%}
+        {%- for pair in rates -%}
+          {%- assign key = pair[0] -%}
+          {%- assign ok = false -%}
+          {%- if key == '*' -%}
+            {%- assign ok = true -%}
+          {%- elsif customer -%}
+            {%- if customer.tags contains key -%}{%- assign ok = true -%}{%- endif -%}
+          {%- endif -%}
+          {%- if ok -%}{"n":{{ o.n | json }},"s":{{ o.s }},"e":{{ o.e }},"t":{{ o.t | json }},"v":{{ pair[1] }},"who":{{ key | json }}},{%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endcapture -%}
+  {%- if cands != blank -%}
+    <div class="ohsp" hidden {{ block.shopify_attributes }} style="--ohsp-accent: {{ block.settings.accent }};">
+      <span class="ohsp__was"></span>
+      <span class="ohsp__now"></span>
+      <span class="ohsp__badge"></span>
+      {%- if block.settings.countdown -%}<span class="ohsp__timer"></span>{%- endif -%}
+    </div>
+    <script type="application/json" class="ohsp-data">
+      {
+        "offers": [{{ cands }}null],
+        "variant": {{ product.selected_or_first_available_variant.id }},
+        "variants": { {%- for v in product.variants -%}"{{ v.id }}":[{{ v.price }},{{ v.compare_at_price | default: 0 }}]{%- unless forloop.last -%},{%- endunless -%}{%- endfor -%} },
+        "format": {{ shop.money_format | json }},
+        "everyone": {{ block.settings.everyone_label | json }},
+        "member": {{ block.settings.member_label | json }},
+        "ends": {{ block.settings.ends_label | json }},
+        "hide": {{ block.settings.hide_selector | json }}
+      }
+    </script>
+    <script>
+      (function () {
+        var data = document.currentScript.previousElementSibling;
+        var box = data.previousElementSibling;
+        try { var d = JSON.parse(data.textContent); } catch (e) { return; }
+        var offers = d.offers.filter(Boolean);
+        var section = box.closest('section, .shopify-section') || document;
+        var money = function (cents) {
+          var f = d.format || '${{amount}}';
+          var n = (cents / 100).toFixed(2);
+          var parts = n.split('.');
+          var comma = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+          var dot = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+          return f.replace(/\{\{\s*(\w+)\s*\}\}/, function (_, k) {
+            if (k === 'amount_no_decimals') return Math.round(cents / 100).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+            if (k === 'amount_with_comma_separator') return dot + ',' + parts[1];
+            if (k === 'amount_no_decimals_with_comma_separator') return Math.round(cents / 100).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+            return comma + '.' + parts[1];
+          });
+        };
+        var current = function () {
+          var input = section.querySelector('form[action*="/cart/add"] [name="id"]');
+          var v = input && input.value;
+          if (!v) v = new URLSearchParams(location.search).get('variant');
+          return d.variants[v] ? v : String(d.variant);
+        };
+        var hidden = [];
+        var showTheme = function (show) {
+          if (!d.hide) return;
+          try {
+            if (!show) {
+              hidden = Array.prototype.slice.call(section.querySelectorAll(d.hide)).filter(function (el) { return !box.contains(el); });
+              hidden.forEach(function (el) { el.style.display = 'none'; });
+            } else {
+              hidden.forEach(function (el) { el.style.display = ''; });
+              hidden = [];
+            }
+          } catch (e) {}
+        };
+        var best = null;
+        var render = function () {
+          var now = Date.now() / 1000;
+          var p = d.variants[current()];
+          best = null;
+          if (p) {
+            offers.forEach(function (o) {
+              if (now < o.s || now >= o.e) return;
+              var off = o.t === 'f' ? Math.round(o.v * 100) : Math.round(p[0] * o.v / 100);
+              off = Math.min(off, p[0]);
+              if (off > 0 && (!best || off > best.off)) best = { off: off, o: o };
+            });
+          }
+          if (!best) { box.hidden = true; showTheme(true); return; }
+          var was = Math.max(p[0], p[1] || 0);
+          box.querySelector('.ohsp__was').textContent = money(was);
+          box.querySelector('.ohsp__now').textContent = money(p[0] - best.off);
+          box.querySelector('.ohsp__badge').textContent = best.o.who === '*' ? d.everyone : d.member.replace('[tier]', best.o.who);
+          box.hidden = false;
+          if (!hidden.length) showTheme(false);
+          tickTimer();
+        };
+        var timer = box.querySelector('.ohsp__timer');
+        var tickTimer = function () {
+          if (!timer || !best) return;
+          var left = Math.max(0, Math.floor(best.o.e - Date.now() / 1000));
+          if (left === 0) return render();
+          var dd = Math.floor(left / 86400), h = Math.floor(left % 86400 / 3600), m = Math.floor(left % 3600 / 60), s = left % 60;
+          var pad = function (x) { return (x < 10 ? '0' : '') + x; };
+          timer.textContent = d.ends + ' ' + (dd ? dd + 'd ' : '') + pad(h) + ':' + pad(m) + ':' + pad(s);
+        };
+        var last = null;
+        setInterval(function () {
+          var v = current();
+          if (v !== last) { last = v; render(); } else tickTimer();
+        }, 1000);
+        document.addEventListener('change', function () { setTimeout(render, 0); });
+        last = current();
+        render();
+      })();
+    </script>
+    <style>
+      .ohsp { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin: 8px 0; font: inherit; }
+      .ohsp[hidden] { display: none; }
+      .ohsp__was { text-decoration: line-through; opacity: .6; }
+      .ohsp__now { font-weight: 700; font-size: 1.25em; color: var(--ohsp-accent); }
+      .ohsp__badge { font-size: .8em; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--ohsp-accent); }
+      .ohsp__timer { flex-basis: 100%; font-size: .9em; font-variant-numeric: tabular-nums; opacity: .85; }
+    </style>
+  {%- endif -%}
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Sale price",
+  "target": "section",
+  "enabled_on": { "templates": ["product"] },
+  "settings": [
+    { "type": "checkbox", "id": "countdown", "label": "Show a countdown to when the sale ends", "default": true },
+    { "type": "text", "id": "ends_label", "label": "Countdown label", "default": "Sale ends in" },
+    { "type": "text", "id": "everyone_label", "label": "Label for sales for everyone", "default": "Sale" },
+    { "type": "text", "id": "member_label", "label": "Label for members' prices ([tier] = their tier tag)", "default": "[tier] price" },
+    { "type": "text", "id": "hide_selector", "label": "Hide the theme's own price while a sale applies (CSS selector, optional)", "info": "For example .price or .product__price. Leave empty to keep it." },
+    { "type": "color", "id": "accent", "label": "Sale colour", "default": "#C8102E" }
+  ]
+}
+{% endschema %}

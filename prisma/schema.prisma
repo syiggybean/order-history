@@ -1986,6 +1986,8 @@ model Sale {
   audience     String    @default("everyone")
   // Loyalty tier ids ([..]); their tags are worked out when it syncs
   tiers        String?
+  // Amount off per audience: [{ col: "everyone" | tier id, value }]
+  rates        String?
   // percentage | fixed
   valueType    String    @default("percentage")
   value        Float     @default(0)
@@ -2005,7 +2007,9 @@ model Sale {
   tabEnabled   Boolean   @default(false)
   tabLabel     String?
   tabUrl       String?
-  // In Shopify
+  // In Shopify: { [group key]: { id, tag, items } }, one discount per audience
+  // and amount (discountId: the first, for older code)
+  discounts    String?
   discountId   String?
   syncedTags   String?
   phase        String?

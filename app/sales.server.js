@@ -36,6 +36,7 @@ export const KINDS = { items: "% or $ off items", order: "Order discount", early
 const EA_NS = "oh_sales";
 const EA_KEY = "early_access";
 const TABS_KEY = "tabs";
+const OFFERS_KEY = "offers";
 const STORE_TZ = "America/Los_Angeles";
 
 const json = (s, fallback) => {
@@ -67,12 +68,23 @@ export function earlyPhaseOf(s, now = Date.now()) {
   return "open";
 }
 
-// The tags (= tier_tag metafield values) of the sale's tiers
+// Amount off per audience column: [{ col: "everyone" | tier id, value }].
+// Older sales had one amount for everyone or for their tiers.
+export function ratesOf(sale) {
+  if (sale.kind === "earlyAccess") return [];
+  const r = json(sale.rates, null);
+  if (Array.isArray(r) && r.length) return r;
+  if (sale.audience === "tiers") return json(sale.tiers, []).map((col) => ({ col, value: sale.value }));
+  return [{ col: "everyone", value: sale.value }];
+}
+
+// The tier tags the sale is for (members recognised by these). Empty when it's
+// only for everyone.
 function tagsFor(sale, program) {
-  if (sale.audience !== "tiers") return [];
-  const ids = json(sale.tiers, []);
+  const ids = sale.kind === "earlyAccess" ? (sale.audience === "tiers" ? json(sale.tiers, []) : []) : ratesOf(sale).map((r) => r.col);
   return program.tiers.filter((t) => ids.includes(t.id)).map((t) => tierTagOf(program, t));
 }
+const forEveryone = (sale) => sale.kind !== "earlyAccess" && ratesOf(sale).some((r) => r.col === "everyone");
 
 const view = (s, program) => {
   const ids = json(s.tiers, []);
@@ -84,6 +96,7 @@ const view = (s, program) => {
     audience: s.audience,
     tiers: ids,
     tierNames: program.tiers.filter((t) => ids.includes(t.id)).map((t) => t.name),
+    rates: ratesOf(s),
     valueType: s.valueType,
     value: s.value,
     scope: s.scope,
@@ -102,6 +115,7 @@ const view = (s, program) => {
     tabLabel: s.tabLabel,
     tabUrl: s.tabUrl,
     discountId: s.discountId,
+    discountCount: Object.keys(json(s.discounts, {})).length || (s.discountId ? 1 : 0),
     syncError: s.syncError,
     syncedAt: s.syncedAt?.toISOString() ?? null,
     createdBy: s.createdBy,
@@ -120,11 +134,23 @@ export async function listSales(shop) {
 // Saving
 // ---------------------------------------------------------------------------
 
+const money2 = (v) => Math.round(Number(v) * 100) / 100;
 const pickList = (v) =>
   (Array.isArray(v) ? v : json(v, []))
     .filter((x) => x && /^gid:\/\/shopify\/(Product|Collection)\/\d+$/.test(String(x.id)))
-    .slice(0, 100)
-    .map((x) => ({ id: String(x.id), title: clean(x.title, 200) ?? "" }));
+    .slice(0, 250)
+    .map((x) => ({
+      id: String(x.id),
+      title: clean(x.title, 200) ?? "",
+      image: /^https:\/\//.test(String(x.image ?? "")) ? String(x.image).slice(0, 500) : null,
+      price: Number.isFinite(Number(x.price)) && x.price !== null && x.price !== "" ? money2(x.price) : null,
+      // Per audience column; missing = the column's amount
+      values: Object.fromEntries(
+        Object.entries(x.values && typeof x.values === "object" ? x.values : {})
+          .filter(([, v]) => v !== "" && v != null && Number.isFinite(Number(v)))
+          .map(([k, v]) => [String(k).slice(0, 40), money2(v)]),
+      ),
+    }));
 
 export async function saveSale(shop, admin, input, user) {
   const name = clean(input.name, 120);
@@ -134,11 +160,25 @@ export async function saveSale(shop, admin, input, user) {
   const endsAt = fromStoreInput(input.ends);
   if (!startsAt || !endsAt) throw new SaleError(input.kind === "earlyAccess" ? "Set when members can buy, and when everyone can." : "Set when the sale starts and ends.");
   if (endsAt <= startsAt) throw new SaleError(input.kind === "earlyAccess" ? "Everyone has to be able to buy after members can." : "The sale has to end after it starts.");
-  const audience = input.audience === "tiers" ? "tiers" : "everyone";
   const program = await getProgram(shop);
-  const tiers = (Array.isArray(input.tiers) ? input.tiers : json(input.tiers, [])).filter((id) => program.tiers.some((t) => t.id === id));
-  if (audience === "tiers" && !tiers.length) throw new SaleError("Choose which loyalty tiers get it.");
-  if (input.kind === "earlyAccess" && audience !== "tiers") throw new SaleError("Early access is for chosen loyalty tiers.");
+  const tierIds = new Set(program.tiers.map((t) => t.id));
+  let audience;
+  let tiers;
+  let rates = [];
+  if (input.kind === "earlyAccess") {
+    audience = "tiers";
+    tiers = (Array.isArray(input.tiers) ? input.tiers : json(input.tiers, [])).filter((id) => tierIds.has(id));
+    if (!tiers.length) throw new SaleError("Choose which loyalty tiers get early access.");
+  } else {
+    // Who gets what: everyone and/or chosen tiers, each with its own amount
+    const seen = new Set();
+    rates = (Array.isArray(input.rates) ? input.rates : json(input.rates, []))
+      .filter((r) => r && (r.col === "everyone" || tierIds.has(r.col)) && !seen.has(r.col) && seen.add(r.col))
+      .map((r) => ({ col: r.col, value: r.value === "" || r.value == null ? 0 : money2(r.value) }));
+    if (!rates.length) throw new SaleError("Choose who gets it: everyone, or which loyalty tiers.");
+    audience = rates.some((r) => r.col === "everyone") ? "everyone" : "tiers";
+    tiers = rates.filter((r) => r.col !== "everyone").map((r) => r.col);
+  }
   const scope = ["all", "collections", "products"].includes(input.scope) ? input.scope : "all";
   const collections = pickList(input.collections).filter((x) => x.id.includes("/Collection/"));
   const products = pickList(input.products).filter((x) => x.id.includes("/Product/"));
@@ -149,7 +189,8 @@ export async function saveSale(shop, admin, input, user) {
     name,
     kind: input.kind,
     audience,
-    tiers: JSON.stringify(audience === "tiers" ? tiers : []),
+    tiers: JSON.stringify(tiers),
+    rates: JSON.stringify(rates),
     scope: input.kind === "order" ? "all" : scope,
     collections: JSON.stringify(input.kind !== "order" && scope === "collections" ? collections : []),
     products: JSON.stringify(input.kind !== "order" && scope === "products" ? products : []),
@@ -167,22 +208,29 @@ export async function saveSale(shop, admin, input, user) {
     Object.assign(data, { valueType: "percentage", value: 0, minSubtotal: null, combine: false, lockBefore: !(input.lockBefore === false || input.lockBefore === "false") });
   } else {
     const valueType = input.valueType === "fixed" ? "fixed" : "percentage";
-    const value = Math.round(Number(input.value) * 100) / 100;
-    if (!(value > 0)) throw new SaleError("Set how much off.");
-    if (valueType === "percentage" && value > 100) throw new SaleError("A percentage can't be over 100.");
-    const min = input.minSubtotal === "" || input.minSubtotal == null ? null : Math.round(Number(input.minSubtotal) * 100) / 100;
+    const check = (v, what) => {
+      if (v < 0) throw new SaleError(`${what} can't be below 0.`);
+      if (valueType === "percentage" && v > 100) throw new SaleError(`${what}: a percentage can't be over 100.`);
+    };
+    const colName = (col) => (col === "everyone" ? "Everyone" : program.tiers.find((t) => t.id === col)?.name ?? "A tier");
+    for (const r of rates) check(r.value, colName(r.col));
+    if (data.scope === "products") {
+      for (const p of products) for (const [col, v] of Object.entries(p.values)) if (rates.some((r) => r.col === col)) check(v, `${p.title} (${colName(col)})`);
+      if (!products.some((p) => rates.some((r) => (p.values[r.col] ?? r.value) > 0))) throw new SaleError("Set how much off: no product has an amount above 0.");
+    } else if (!rates.some((r) => r.value > 0)) throw new SaleError("Set how much off.");
+    const min = input.minSubtotal === "" || input.minSubtotal == null ? null : money2(input.minSubtotal);
     if (min !== null && !(min > 0)) throw new SaleError("The minimum order has to be more than $0, or left empty.");
-    Object.assign(data, { valueType, value, minSubtotal: input.kind === "order" ? min : null });
+    Object.assign(data, { valueType, value: Math.max(0, ...rates.map((r) => r.value)), minSubtotal: input.kind === "order" ? min : null });
   }
   let sale;
   let was = null;
   if (input.id) {
     was = await db.sale.findFirst({ where: { shop, id: Number(input.id) } });
     if (!was) throw new SaleError("That sale isn't there anymore.");
-    // A discount can't change kind in Shopify: start a fresh one
-    if (was.kind !== data.kind && was.discountId) {
-      await deleteDiscount(admin, was.discountId);
-      data.discountId = null;
+    // A discount can't change kind in Shopify: start fresh ones
+    if (was.kind !== data.kind) {
+      for (const id of discountIdsOf(was)) await deleteDiscount(admin, id);
+      Object.assign(data, { discountId: null, discounts: null });
     }
     sale = await db.sale.update({ where: { id: was.id }, data });
   } else {
@@ -198,7 +246,7 @@ export async function saveSale(shop, admin, input, user) {
 export async function deleteSale(shop, admin, id) {
   const s = await db.sale.findFirst({ where: { shop, id: Number(id) } });
   if (!s) throw new SaleError("That sale isn't there anymore.");
-  if (s.discountId) await deleteDiscount(admin, s.discountId);
+  for (const did of discountIdsOf(s)) await deleteDiscount(admin, did);
   await db.sale.delete({ where: { id: s.id } });
   if (s.kind === "earlyAccess") await syncEarlyAccess(shop, admin, { also: s });
   await syncTabs(shop, admin);
@@ -267,26 +315,60 @@ async function segmentFor(admin, tag) {
   return id;
 }
 
-// The sale as a Shopify automatic discount (Shopify's own kind, so it works
-// on any plan)
-export function discountInput(sale, segmentIds, { previousSegmentIds = [], update = false } = {}) {
-  const fixed = sale.valueType === "fixed";
-  const value = fixed
-    ? { discountAmount: { amount: String(sale.value), appliesOnEachItem: sale.kind === "items" } }
-    : { percentage: Math.min(sale.value, 100) / 100 };
+// The Shopify discounts a sale is made of: one per audience column and amount
+// (Shopify's own automatic discounts have one amount and one audience each).
+// A sale with Silver 15% and Gold 25%, or with products at different amounts,
+// is several discounts that start and end together.
+export function groupsOf(sale, program) {
+  const groups = [];
+  const products = json(sale.products, []);
+  const shape = sale.kind === "order" || sale.scope === "all" ? "all" : sale.scope;
+  for (const r of ratesOf(sale)) {
+    const tier = r.col === "everyone" ? null : program.tiers.find((t) => t.id === r.col);
+    if (r.col !== "everyone" && !tier) continue; // tier removed in Loyalty
+    const base = { col: r.col, tag: tier ? tierTagOf(program, tier) : null, tierName: tier?.name ?? null, shape };
+    if (shape === "products") {
+      const byValue = new Map();
+      for (const p of products) {
+        const v = p.values?.[r.col] ?? r.value;
+        if (!(v > 0)) continue;
+        if (!byValue.has(v)) byValue.set(v, []);
+        byValue.get(v).push(p.id);
+      }
+      for (const [value, items] of byValue) groups.push({ ...base, key: `${r.col}:${value}:products`, value, items });
+    } else if (r.value > 0) {
+      groups.push({ ...base, key: `${r.col}:${r.value}:${shape}`, value: r.value, items: shape === "collections" ? json(sale.collections, []).map((c) => c.id) : [] });
+    }
+  }
+  return groups;
+}
+
+export const discountIdsOf = (sale) => [...new Set([...Object.values(json(sale.discounts, {})).map((d) => d.id), ...(sale.discountId ? [sale.discountId] : [])])];
+
+export function discountInput(sale, g, segmentIds, { was = null, removeSegments = [], several = false } = {}) {
+  const value =
+    sale.valueType === "fixed"
+      ? { discountAmount: { amount: String(g.value), appliesOnEachItem: sale.kind === "items" && g.shape !== "all" } }
+      : { percentage: Math.min(g.value, 100) / 100 };
+  const removeItems = (was?.items ?? []).filter((id) => !g.items.includes(id));
+  const addItems = was ? g.items.filter((id) => !(was.items ?? []).includes(id)) : g.items;
   const items =
-    sale.kind === "order" || sale.scope === "all"
+    g.shape === "all"
       ? { all: true }
-      : sale.scope === "collections"
-        ? { collections: { add: json(sale.collections, []).map((c) => c.id) } }
-        : { products: { productsToAdd: json(sale.products, []).map((p) => p.id) } };
-  const remove = previousSegmentIds.filter((id) => !segmentIds.includes(id));
+      : g.shape === "collections"
+        ? { collections: { add: addItems, ...(removeItems.length ? { remove: removeItems } : {}) } }
+        : { products: { productsToAdd: addItems, ...(removeItems.length ? { productsToRemove: removeItems } : {}) } };
   return {
-    title: sale.name,
+    title: g.tierName ? `${sale.name} (${g.tierName} members)` : sale.name,
     startsAt: sale.startsAt.toISOString(),
     endsAt: sale.endsAt.toISOString(),
-    combinesWith: sale.combine ? { productDiscounts: true, orderDiscounts: true, shippingDiscounts: true } : { productDiscounts: false, orderDiscounts: false, shippingDiscounts: true },
-    context: sale.audience === "tiers" ? { customerSegments: { add: segmentIds, ...(update && remove.length ? { remove } : {}) } } : { all: "ALL" },
+    // The sale's own discounts always work together (one per item at most:
+    // Shopify gives each item the best); "can be used with other discounts"
+    // opens it to the rest
+    combinesWith: sale.combine
+      ? { productDiscounts: true, orderDiscounts: true, shippingDiscounts: true }
+      : { productDiscounts: sale.kind === "items" && several, orderDiscounts: false, shippingDiscounts: true },
+    context: g.tag ? { customerSegments: { add: segmentIds, ...(removeSegments.length ? { remove: removeSegments } : {}) } } : { all: "ALL" },
     customerGets: { value, items },
     minimumRequirement: sale.kind === "order" && sale.minSubtotal ? { subtotal: { greaterThanOrEqualToSubtotal: String(sale.minSubtotal) } } : null,
   };
@@ -300,30 +382,61 @@ export async function syncSale(shop, admin, sale, program = null) {
       await syncEarlyAccess(shop, admin, { force: true });
     } else if (!sale.active || statusOf(sale) === "ended") {
       // Off or over: nothing in Shopify
-      if (sale.discountId) await deleteDiscount(admin, sale.discountId);
-      await db.sale.update({ where: { id: sale.id }, data: { discountId: null } });
+      for (const id of discountIdsOf(sale)) await deleteDiscount(admin, id);
+      await db.sale.update({ where: { id: sale.id }, data: { discountId: null, discounts: null } });
     } else {
-      const segmentIds = [];
-      for (const tag of tags) segmentIds.push(await segmentFor(admin, tag));
-      const before = [];
-      for (const tag of json(sale.syncedTags, [])) if (!tags.includes(tag)) before.push(await segmentFor(admin, tag));
-      let discountId = sale.discountId;
-      if (discountId) {
-        const r = await gql(admin, UPDATE, { id: discountId, d: discountInput(sale, segmentIds, { previousSegmentIds: before, update: true }) });
-        const e = r?.discountAutomaticBasicUpdate?.userErrors ?? [];
-        // Deleted in Shopify meanwhile (or made the old way): make it again
-        if (e.some((x) => /not found|does not exist|invalid id/i.test(x.message))) {
-          await deleteDiscount(admin, discountId);
-          discountId = null;
-        } else errs(r?.discountAutomaticBasicUpdate);
+      const groups = groupsOf(sale, program);
+      if (!groups.length) throw new SaleError("Nothing in this sale has an amount off.");
+      const had = json(sale.discounts, {});
+      // A discount from before sales had several: reuse it for the first group
+      if (sale.discountId && !Object.values(had).some((d) => d.id === sale.discountId) && !had[groups[0].key])
+        had[groups[0].key] = { id: sale.discountId, tag: json(sale.syncedTags, [])[0] ?? null, items: null };
+      const now = {};
+      const segCache = new Map();
+      const seg = async (tag) => {
+        if (!segCache.has(tag)) segCache.set(tag, await segmentFor(admin, tag));
+        return segCache.get(tag);
+      };
+      // An amount that changed keeps its discount: reuse one of the same
+      // audience that's no longer needed
+      const newKeys = new Set(groups.map((g) => g.key));
+      const spare = Object.entries(had).filter(([k]) => !newKeys.has(k));
+      const prevFor = (g) => {
+        if (had[g.key]) return had[g.key];
+        const i = spare.findIndex(([k]) => k.startsWith(`${g.col}:`) && k.endsWith(`:${g.shape}`));
+        if (i < 0) return null;
+        const [[k, d]] = spare.splice(i, 1);
+        delete had[k];
+        return d;
+      };
+      for (const g of groups) {
+        const segmentIds = g.tag ? [await seg(g.tag)] : [];
+        const prev = prevFor(g);
+        let id = prev?.id ?? null;
+        if (id) {
+          // Tier renamed in Loyalty: swap the segment; items: add and take away
+          const removeSegments = prev.tag && prev.tag !== g.tag ? [await seg(prev.tag)] : [];
+          const r = await gql(admin, UPDATE, { id, d: discountInput(sale, g, segmentIds, { was: prev.items ? prev : null, removeSegments, several: groups.length > 1 }) });
+          const e = r?.discountAutomaticBasicUpdate?.userErrors ?? [];
+          if (e.length) {
+            // Deleted in Shopify, made the old way, or can't be changed that way: make it again
+            await deleteDiscount(admin, id);
+            id = null;
+          }
+        }
+        if (!id) {
+          const r = await gql(admin, CREATE, { d: discountInput(sale, g, segmentIds, { several: groups.length > 1 }) });
+          errs(r?.discountAutomaticBasicCreate);
+          id = r?.discountAutomaticBasicCreate?.automaticDiscountNode?.id;
+          if (!id) throw new SaleError("Shopify didn't make the discount.");
+        }
+        now[g.key] = { id, tag: g.tag, items: g.items };
+        // Saved as it goes, so a failure part way doesn't leave strays
+        await db.sale.update({ where: { id: sale.id }, data: { discounts: JSON.stringify({ ...had, ...now }), discountId: null } });
       }
-      if (!discountId) {
-        const r = await gql(admin, CREATE, { d: discountInput(sale, segmentIds) });
-        errs(r?.discountAutomaticBasicCreate);
-        discountId = r?.discountAutomaticBasicCreate?.automaticDiscountNode?.id;
-        if (!discountId) throw new SaleError("Shopify didn't make the discount.");
-      }
-      await db.sale.update({ where: { id: sale.id }, data: { discountId } });
+      // Amounts or audiences no longer in the sale
+      for (const [key, d] of Object.entries(had)) if (!now[key] && !Object.values(now).some((x) => x.id === d.id)) await deleteDiscount(admin, d.id);
+      await db.sale.update({ where: { id: sale.id }, data: { discounts: JSON.stringify(now), discountId: Object.values(now)[0]?.id ?? null } });
     }
     await db.sale.update({ where: { id: sale.id }, data: { syncedTags: JSON.stringify(tags), syncError: null, syncedAt: new Date() } });
   } catch (e) {
@@ -420,12 +533,66 @@ export async function syncTabs(shop, admin) {
     starts: Math.floor(s.startsAt.getTime() / 1000),
     ends: Math.floor(s.endsAt.getTime() / 1000),
     // Empty: everyone
-    tags: tagsFor(s, program),
+    tags: forEveryone(s) ? [] : tagsFor(s, program),
   }));
+  const offers = await offersFor(shop, program);
   const ownerId = (await gql(admin, SHOP_ID, {}))?.shop?.id;
   if (!ownerId) return;
-  if (tabs.length) errs((await gql(admin, MF_SET, { metafields: [{ ownerId, namespace: EA_NS, key: TABS_KEY, type: "json", value: JSON.stringify(tabs) }] }))?.metafieldsSet);
-  else await gql(admin, MF_DELETE, { metafields: [{ ownerId, namespace: EA_NS, key: TABS_KEY }] }).catch(() => {});
+  const set = [];
+  const del = [];
+  (tabs.length ? set : del).push({ key: TABS_KEY, value: tabs });
+  (offers.length ? set : del).push({ key: OFFERS_KEY, value: offers });
+  if (set.length) errs((await gql(admin, MF_SET, { metafields: set.map((m) => ({ ownerId, namespace: EA_NS, key: m.key, type: "json", value: JSON.stringify(m.value) })) }))?.metafieldsSet);
+  if (del.length) await gql(admin, MF_DELETE, { metafields: del.map((m) => ({ ownerId, namespace: EA_NS, key: m.key })) }).catch(() => {});
+}
+
+// Item sales for the product page's "Sale price" block (shop metafield
+// oh_sales.offers): the theme shows each shopper the best price they get, with
+// the original crossed out and a countdown to the end.
+//   { n: name, s/e: start/end (unix seconds), t: "p" % | "f" $ off each,
+//     scope: "all" | "c" (collections: c = numeric ids) | "p" (products),
+//     r: [["*" (everyone) | tier tag, amount], …], p: { productId: [same] } }
+export async function offersFor(shop, program) {
+  const rows = await db.sale.findMany({ where: { shop, kind: "items", active: true, endsAt: { gt: new Date() } }, orderBy: { startsAt: "asc" } });
+  const num = (gid) => Number(String(gid).split("/").pop());
+  const out = [];
+  for (const s of rows) {
+    const keyOf = new Map();
+    for (const r of ratesOf(s)) {
+      if (r.col === "everyone") keyOf.set(r.col, "*");
+      else {
+        const tier = program.tiers.find((t) => t.id === r.col);
+        if (tier) keyOf.set(r.col, tierTagOf(program, tier));
+      }
+    }
+    const ratesMap = (values) => {
+      const m = [];
+      for (const r of ratesOf(s)) {
+        const v = values ? (values[r.col] ?? r.value) : r.value;
+        if (keyOf.has(r.col) && v > 0) m.push([keyOf.get(r.col), v]);
+      }
+      return m;
+    };
+    const o = { n: s.name, s: Math.floor(s.startsAt.getTime() / 1000), e: Math.floor(s.endsAt.getTime() / 1000), t: s.valueType === "fixed" ? "f" : "p" };
+    if (s.scope === "products") {
+      o.scope = "p";
+      o.p = {};
+      for (const p of json(s.products, [])) {
+        const m = ratesMap(p.values ?? {});
+        if (m.length) o.p[String(num(p.id))] = m;
+      }
+      if (!Object.keys(o.p).length) continue;
+    } else {
+      o.r = ratesMap(null);
+      if (!o.r.length) continue;
+      if (s.scope === "collections") {
+        o.scope = "c";
+        o.c = json(s.collections, []).map((c) => num(c.id));
+      } else o.scope = "all";
+    }
+    out.push(o);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,15 +601,26 @@ export async function syncTabs(shop, admin) {
 
 const FIND = `#graphql
   query SaleFind($q: String!) {
-    products(first: 8, query: $q) { nodes { id title } }
-    collections(first: 8, query: $q) { nodes { id title } }
+    products(first: 10, query: $q) {
+      nodes { id title featuredImage { url(transform: { maxWidth: 160 }) } priceRangeV2 { minVariantPrice { amount } maxVariantPrice { amount } } }
+    }
+    collections(first: 8, query: $q) { nodes { id title image { url(transform: { maxWidth: 160 }) } } }
   }`;
 
 export async function findTargets(admin, q) {
   const t = String(q ?? "").trim().slice(0, 80).replace(/["\\]/g, " ");
   if (t.length < 2) return { products: [], collections: [] };
   const d = await gql(admin, FIND, { q: `title:*${t}*` });
-  return { products: d?.products?.nodes ?? [], collections: d?.collections?.nodes ?? [] };
+  return {
+    products: (d?.products?.nodes ?? []).map((p) => ({
+      id: p.id,
+      title: p.title,
+      image: p.featuredImage?.url ?? null,
+      price: p.priceRangeV2?.minVariantPrice?.amount != null ? Number(p.priceRangeV2.minVariantPrice.amount) : null,
+      priceVaries: p.priceRangeV2 ? p.priceRangeV2.minVariantPrice.amount !== p.priceRangeV2.maxVariantPrice.amount : false,
+    })),
+    collections: (d?.collections?.nodes ?? []).map((c) => ({ id: c.id, title: c.title, image: c.image?.url ?? null })),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -458,10 +636,11 @@ export async function tick(shop, admin) {
   for (const s of renamed) await db.sale.update({ where: { id: s.id }, data: { syncedTags: JSON.stringify(tagsFor(s, program)) } });
   const sales = await db.sale.findMany({ where: { shop, kind: { in: ["items", "order"] }, active: true, endsAt: { gt: new Date() } } });
   for (const s of sales) {
-    if (JSON.stringify(tagsFor(s, program)) !== (s.syncedTags ?? "[]") || !s.discountId) await syncSale(shop, admin, s, program).catch((e) => console.error(`[sales] ${shop} ${s.name}:`, errorMessage(e)));
+    const missing = !s.discountId && (!s.syncError || !s.syncedAt || Date.now() - s.syncedAt.getTime() > 15 * 60_000);
+    if (JSON.stringify(tagsFor(s, program)) !== (s.syncedTags ?? "[]") || missing) await syncSale(shop, admin, s, program).catch((e) => console.error(`[sales] ${shop} ${s.name}:`, errorMessage(e)));
   }
-  // Ended sales' tabs drop off
-  const lastTab = await db.sale.findFirst({ where: { shop, tabEnabled: true, endsAt: { lte: new Date(), gt: new Date(Date.now() - 2 * 60_000) } } });
+  // Ended sales' tabs and product-page prices drop off
+  const lastTab = await db.sale.findFirst({ where: { shop, OR: [{ tabEnabled: true }, { kind: "items" }], endsAt: { lte: new Date(), gt: new Date(Date.now() - 2 * 60_000) } } });
   if (lastTab) await syncTabs(shop, admin).catch(() => {});
 }
 
