@@ -1663,6 +1663,14 @@ model Freebie {
   minSubtotal   Float?
   // firstOrders: how many orders have had one (a cancelled order frees its place)
   ordersGranted Int       @default(0)
+  // A product from the store as the gift (one variant): each gift takes one
+  // from its Shopify stock ("available"), and stock above mirrors Shopify's.
+  // Name, photo, SKU and barcode come from it.
+  variantId       String?
+  inventoryItemId String?
+  sourceProductId String?
+  sourceTitle     String?
+  sourceImageUrl  String?
   createdBy   String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @default(now()) @updatedAt
@@ -1695,6 +1703,9 @@ model FreebieGrant {
   customerId String?
   productId  String
   quantity   Int
+  // Taken from Shopify stock at this location (a store product as the gift);
+  // null: from the freebie's own count
+  locationId String?
   returnedAt DateTime?
   createdAt  DateTime  @default(now())
 

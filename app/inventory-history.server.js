@@ -193,7 +193,24 @@ export async function itemNames(shop, itemIds) {
   );
 }
 
-const NO_UNDOS = { byKey: new Map(), byId: new Map(), reships: new Map() };
+const NO_UNDOS = { byKey: new Map(), byId: new Map(), reships: new Map(), gifts: new Map() };
+
+// Free gifts (Freebies that are a store product): adjustment → which order, which gift
+const GIFT_PREFIX = "gid://order-history/FreebieGrant/";
+async function loadGifts(shop, rowLists) {
+  const ids = [
+    ...new Set(
+      rowLists
+        .flat()
+        .map((r) => (r.referenceUri?.startsWith(GIFT_PREFIX) ? Number(r.referenceUri.slice(GIFT_PREFIX.length)) : null))
+        .filter((n) => Number.isInteger(n)),
+    ),
+  ];
+  if (!ids.length) return new Map();
+  const grants = await db.freebieGrant.findMany({ where: { shop, id: { in: ids } } });
+  const freebies = grants.length ? await db.freebie.findMany({ where: { id: { in: [...new Set(grants.map((g) => g.freebieId))] } } }) : [];
+  return new Map(grants.map((g) => [g.id, { orderName: g.orderName, orderId: g.orderId, title: freebies.find((f) => f.id === g.freebieId)?.title ?? "Free gift" }]));
+}
 
 // Reship orders (made in MonkeyBean): order number → why, from which order, by whom
 async function loadReships(shop, rowLists) {
@@ -222,6 +239,8 @@ function buildChange(key, rows, names, undos = NO_UNDOS) {
     ref.referenceType === "Order" ? ref.referenceId ?? ref.referenceUri?.match(/(\d+)$/)?.[1] ?? null : null;
   const n = names.get(first.inventoryItemId);
   const reship = orderId ? undos.reships?.get(String(orderId)) : null;
+  const giftRow = rows.find((r) => r.referenceUri?.startsWith(GIFT_PREFIX));
+  const gift = giftRow ? undos.gifts?.get(Number(giftRow.referenceUri.slice(GIFT_PREFIX.length))) ?? { orderName: null, title: "Free gift" } : null;
 
   return {
     key,
@@ -249,6 +268,18 @@ function buildChange(key, rows, names, undos = NO_UNDOS) {
           who: `${reship.createdBy ?? "Staff member"} · Reship`,
           reasonLabel: `Reship ${reship.orderName} of ${reship.originalName}: ${reship.reason}${reship.note ? ` (${reship.note})` : ""}`,
           reship: { orderName: reship.orderName, originalName: reship.originalName, reason: reship.reason, note: reship.note, by: reship.createdBy },
+        }
+      : {}),
+    // A free gift (Freebies) taken for an order, or put back when it was cancelled
+    ...(gift
+      ? {
+          who: "MonkeyBean · Freebies",
+          reasonLabel:
+            (parts.find((p) => p.state === "available")?.change ?? 0) > 0
+              ? `Free gift back in stock: ${gift.orderName ?? "an order"} was cancelled`
+              : `Free gift with ${gift.orderName ?? "an order"}${gift.title ? ` (${gift.title})` : ""}`,
+          undoable: false,
+          ...(gift.orderId ? { order: { id: gift.orderId.split("/").pop() } } : {}),
         }
       : {}),
   };
@@ -454,6 +485,7 @@ export async function listChanges(shop, filter = {}, { page = 1, pageSize = 10 }
   const names = await itemNames(shop, rows.map((r) => r.inventoryItemId));
   const undos = await loadUndos(shop, [...byKey.keys()], [...byKey.values()]);
   undos.reships = await loadReships(shop, [...byKey.values()]);
+  undos.gifts = await loadGifts(shop, [...byKey.values()]);
   let changes = entries
     .map((e) => {
       if (e.c) return catalogChange(e.c);
@@ -484,6 +516,7 @@ export async function getChange(shop, key) {
   const names = await itemNames(shop, [inventoryItemId]);
   const undos = await loadUndos(shop, [key], [rows]);
   undos.reships = await loadReships(shop, [rows]);
+  undos.gifts = await loadGifts(shop, [rows]);
   return buildChange(key, rows, names, undos);
 }
 

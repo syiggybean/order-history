@@ -6,7 +6,7 @@ import { Flyout, useFlyoutClose } from "../components/Flyout";
 import { can, denied, getStaff, loadWithAccess } from "../permissions.server";
 import { errorMessage } from "../preorders.server";
 import { searchProducts } from "../preorder-windows.server";
-import { FreebieError, attachProducts, deleteFreebie, detachProduct, listFreebies, saveFreebie, setImage } from "../freebies.server";
+import { FreebieError, attachProducts, deleteFreebie, detachProduct, listFreebies, saveFreebie, searchGiftVariants, setImage } from "../freebies.server";
 
 // Freebies: free gifts attached to products. Shown on the product page while
 // there's stock; one per unit bought; packed with the order.
@@ -25,6 +25,8 @@ export const action = async ({ request }) => {
   const shop = session.shop;
   try {
     if (intent === "search") return { intent, products: (await searchProducts(shop, admin, form.get("q"))).slice(0, 15) };
+    // A product from the store to give away
+    if (intent === "findGift") return { intent, variants: await searchGiftVariants(admin, form.get("q")) };
     if (!can(user, "freebies", "manage")) return denied("freebies", "manage");
     const id = Number(form.get("id")) || null;
     if (intent === "save") {
@@ -44,6 +46,7 @@ export const action = async ({ request }) => {
           ends: form.get("ends"),
           maxOrders: form.get("maxOrders"),
           minSubtotal: form.get("minSubtotal"),
+          variantId: form.has("variantId") ? String(form.get("variantId")) : undefined,
         },
         user,
       );
@@ -51,7 +54,12 @@ export const action = async ({ request }) => {
     }
     if (intent === "create") {
       // A new freebie, straight onto the product it's for
-      const f = await saveFreebie(shop, admin, { title: form.get("title"), description: form.get("description"), stock: form.get("stock"), active: true }, user);
+      const f = await saveFreebie(
+        shop,
+        admin,
+        { title: form.get("title"), description: form.get("description"), stock: form.get("stock") || "0", active: true, variantId: form.get("variantId") || undefined },
+        user,
+      );
       await attachProducts(shop, admin, f.id, [String(form.get("productId") ?? "")]);
       return { intent, ok: true, id: f.id };
     }
@@ -300,6 +308,75 @@ export default function Freebies() {
   );
 }
 
+// A product from the store as the gift: search, then pick a variant
+function GiftPicker({ onPick, disabled }) {
+  const find = useFetcher();
+  const [q, setQ] = useState("");
+  const timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  if (disabled) return null;
+  const list = find.data?.intent === "findGift" && q.trim().length >= 2 ? find.data.variants ?? [] : [];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <input
+        type="search"
+        value={q}
+        onChange={(e) => {
+          const t = e.target.value;
+          setQ(t);
+          clearTimeout(timer.current);
+          if (t.trim().length >= 2) timer.current = setTimeout(() => find.submit({ intent: "findGift", q: t }, { method: "post" }), 250);
+        }}
+        placeholder="Find a product by title or SKU"
+        aria-label="Find a product to give away"
+        style={{ ...input, width: "100%" }}
+      />
+      {find.state !== "idle" && <span style={small}>Searching…</span>}
+      {find.data?.error && <span style={{ color: "#b42318", fontSize: "13px" }}>{find.data.error}</span>}
+      {q.trim().length >= 2 && find.state === "idle" && find.data?.intent === "findGift" && list.length === 0 && <span style={small}>No products found.</span>}
+      {list.map((v) => (
+        <div key={v.variantId} style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+          <Photo src={v.imageUrl} size={36} />
+          <span style={{ flex: 1, minWidth: 0, fontSize: "13px" }}>
+            {v.title}
+            <span style={{ ...small, display: "block" }}>
+              {v.sku ? `${v.sku} · ` : ""}
+              {v.tracked ? `${v.available} in stock` : "Stock not tracked in Shopify"}
+            </span>
+          </span>
+          {v.tracked ? (
+            <button type="button" style={{ ...linkBtn, fontSize: "13px", fontWeight: 600 }} onClick={() => (onPick(v), setQ(""))}>
+              Use
+            </button>
+          ) : (
+            <span style={small}>Can't use</span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// The gift is a store product: what that means, and a way to undo it
+function GiftSource({ title, imageUrl, stock, onClear, disabled }) {
+  return (
+    <div style={{ display: "flex", gap: "10px", alignItems: "center", border: "1px solid #e3e3e3", borderRadius: "10px", padding: "8px 10px", background: "#fafafa" }}>
+      <Photo src={imageUrl} size={44} />
+      <span style={{ flex: 1, minWidth: 0, fontSize: "13px" }}>
+        <strong>{title}</strong>
+        <span style={{ ...small, display: "block" }}>
+          {stock != null ? `${stock} in stock in Shopify. ` : ""}Each gift takes one from its Shopify stock; a cancelled order puts it back. Both show in Inventory history.
+        </span>
+      </span>
+      {!disabled && (
+        <button type="button" style={{ ...linkBtn, color: "#b42318", fontSize: "13px" }} onClick={onClear}>
+          Don't use
+        </button>
+      )}
+    </div>
+  );
+}
+
 // Add a freebie to one product: one already made, or a new one
 function AddFreebie({ product, freebies, onCreated }) {
   const close = useFlyoutClose();
@@ -308,6 +385,7 @@ function AddFreebie({ product, freebies, onCreated }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [stock, setStock] = useState("");
+  const [gift, setGift] = useState(null); // a store product as the gift
   const [find, setFind] = useState("");
   const others = freebies.filter((f) => !f.products.some((p) => p.productId === product.productId));
   const shown = others.filter((f) => !find.trim() || f.title.toLowerCase().includes(find.trim().toLowerCase()));
@@ -331,25 +409,38 @@ function AddFreebie({ product, freebies, onCreated }) {
 
         <div style={section}>
           <p style={sectionTitle}>A new freebie</p>
+          <span style={{ fontSize: "13px" }}>The gift: a product from your store (its stock is used), or something of its own (you set how many).</span>
+          {gift ? (
+            <GiftSource title={gift.title} imageUrl={gift.imageUrl} stock={gift.available} onClear={() => setGift(null)} />
+          ) : (
+            <GiftPicker onPick={(v) => (setGift(v), !title && setTitle(v.title))} />
+          )}
           <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
             Name
-            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Exclusive acrylic stand" style={input} />
+            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder={gift ? gift.title : "e.g. Exclusive acrylic stand"} style={input} />
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
             Description (shown on the product page)
             <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} style={{ ...input, resize: "vertical" }} />
           </label>
-          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
-            How many to give away
-            <input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} style={{ ...input, width: "130px" }} />
-          </label>
+          {!gift && (
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+              How many to give away
+              <input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} style={{ ...input, width: "130px" }} />
+            </label>
+          )}
           <span>
             <s-button
               variant="primary"
-              onClick={() => create.submit({ intent: "create", productId: product.productId, title, description, stock: stock || "0" }, { method: "post" })}
+              onClick={() =>
+                create.submit(
+                  { intent: "create", productId: product.productId, title, description, stock: stock || "0", ...(gift ? { variantId: gift.variantId } : {}) },
+                  { method: "post" },
+                )
+              }
               {...(create.state !== "idle" ? { loading: true } : {})}
             >
-              Create and add, then add a photo
+              {gift ? "Create and add" : "Create and add, then add a photo"}
             </s-button>
           </span>
         </div>
@@ -407,6 +498,8 @@ function Editor({ f, canManage, onCreated }) {
   const [sku, setSku] = useState(f.sku ?? "");
   const [barcode, setBarcode] = useState(f.barcode ?? "");
   const [active, setActive] = useState(f.active ?? true);
+  // A store product as the gift: { variantId, title, imageUrl, available? } or null
+  const [gift, setGift] = useState(f.source ? { variantId: f.source.variantId, title: f.source.title, imageUrl: f.source.imageUrl, available: f.stock } : null);
   // Who gets it: with chosen products, the first N orders, or orders over $X
   const [kind, setKind] = useState(f.kind ?? "product");
   const [starts, setStarts] = useState(f.startsInput ?? "");
@@ -451,7 +544,22 @@ function Editor({ f, canManage, onCreated }) {
   };
   const submit = () =>
     save.submit(
-      { intent: "save", ...(f.id ? { id: String(f.id) } : {}), title, description, stock, sku, barcode, active: String(active), kind, starts, ends, maxOrders, minSubtotal },
+      {
+        intent: "save",
+        ...(f.id ? { id: String(f.id) } : {}),
+        title,
+        description,
+        stock: gift ? "0" : stock,
+        sku,
+        barcode,
+        active: String(active),
+        kind,
+        starts,
+        ends,
+        maxOrders,
+        minSubtotal,
+        variantId: gift?.variantId ?? "",
+      },
       { method: "post" },
     );
   const error = save.data?.error ?? image.data?.error ?? link.data?.error ?? remove.data?.error ?? search.data?.error;
@@ -466,7 +574,7 @@ function Editor({ f, canManage, onCreated }) {
               <Photo src={preview ?? f.imageUrl} size={88} alt={f.title} />
               {canManage && (
                 <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
-                  <span>{f.imageUrl ? "Replace the photo" : "Add a photo"}</span>
+                  <span>{f.source && f.imageUrl === f.source.imageUrl ? "Use a different photo (optional)" : f.imageUrl ? "Replace the photo" : "Add a photo"}</span>
                   <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" onChange={(e) => upload(e.target.files?.[0])} />
                   <span style={small}>{image.state !== "idle" ? "Uploading…" : "JPEG, PNG, WebP or GIF, up to 4 MB. Shoppers can tap it to see it big."}</span>
                 </label>
@@ -476,19 +584,35 @@ function Editor({ f, canManage, onCreated }) {
         )}
 
         <div style={section}>
+          <p style={sectionTitle}>The gift</p>
+          {gift ? (
+            <GiftSource title={gift.title} imageUrl={gift.imageUrl} stock={gift.available} onClear={() => (setGift(null), setStock("0"))} disabled={!canManage} />
+          ) : (
+            <>
+              <span style={small}>Something of its own (set how many below), or use a product from your store and its stock:</span>
+              <GiftPicker onPick={(v) => (setGift(v), !title && setTitle(v.title))} disabled={!canManage} />
+            </>
+          )}
+        </div>
+
+        <div style={section}>
           <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
             Name
-            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Exclusive acrylic stand" style={input} disabled={!canManage} />
+            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder={gift ? gift.title : "e.g. Exclusive acrylic stand"} style={input} disabled={!canManage} />
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
             Description (shown on the product page)
             <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={3} style={{ ...input, resize: "vertical" }} disabled={!canManage} />
           </label>
           <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
-            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
-              Left to give away
-              <input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} style={{ ...input, width: "130px" }} disabled={!canManage} />
-            </label>
+            {gift ? (
+              <div style={{ fontSize: "13px", alignSelf: "flex-end", paddingBottom: "8px" }}>Stock: Shopify's{gift.available != null ? ` (${gift.available} now)` : ""}</div>
+            ) : (
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "13px" }}>
+                Left to give away
+                <input type="number" min="0" step="1" value={stock} onChange={(e) => setStock(e.target.value)} style={{ ...input, width: "130px" }} disabled={!canManage} />
+              </label>
+            )}
             {!isNew && <div style={{ ...small, alignSelf: "flex-end", paddingBottom: "8px" }}>{f.given.toLocaleString()} given so far</div>}
           </div>
           <label style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "13px" }}>
@@ -547,6 +671,12 @@ function Editor({ f, canManage, onCreated }) {
           )}
         </div>
 
+        {gift ? (
+          <div style={section}>
+            <p style={sectionTitle}>For packing</p>
+            <span style={small}>Scanned with the product's own SKU and barcode from Shopify.</span>
+          </div>
+        ) : (
         <div style={section}>
           <p style={sectionTitle}>For packing (optional)</p>
           <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
@@ -561,6 +691,7 @@ function Editor({ f, canManage, onCreated }) {
           </div>
           <span style={small}>With a barcode or SKU it's scanned like any item. Without one, packers tap “Put one in the box”.</span>
         </div>
+        )}
 
         {!isNew && !perOrder && (
           <div style={section}>
@@ -650,7 +781,7 @@ function Editor({ f, canManage, onCreated }) {
           </s-button>
           {canManage && (
             <s-button variant="primary" onClick={submit} {...(save.state !== "idle" ? { loading: true } : {})}>
-              {isNew ? (perOrder ? "Create, then add a photo" : "Create, then add a photo and products") : "Save"}
+              {isNew ? (gift ? (perOrder ? "Create" : "Create, then add products") : perOrder ? "Create, then add a photo" : "Create, then add a photo and products") : "Save"}
             </s-button>
           )}
         </div>

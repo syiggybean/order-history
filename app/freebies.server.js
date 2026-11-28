@@ -23,6 +23,13 @@ import { dayInStore, errorMessage, gql } from "./preorders.server";
 // One gift per order per offer; every offer an order qualifies for applies, so
 // they stack with each other and with product freebies. It goes in the box with
 // the in-stock item.
+//
+// The gift itself is either the freebie's own count ("left to give away"), or a
+// product from the store (one variant): then each gift takes one from that
+// variant's available Shopify stock (the main location, or wherever there is
+// some), a cancelled order puts it back, and both show in the inventory
+// history as the order's free gift. Name, photo, SKU and barcode come from the
+// product, so it's scanned at packing like any item.
 // ---------------------------------------------------------------------------
 
 import { fromStoreInput, toStoreInput } from "./preorder-windows.server";
@@ -37,7 +44,10 @@ const MAX_IMAGE = 4 * 1024 * 1024;
 const IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 
 const appUrl = () => (process.env.SHOPIFY_APP_URL ?? "").replace(/\/$/, "");
-export const imageUrlOf = (f) => (f?.imageId ? `${appUrl()}/freebie-image/${f.imageId}` : null);
+// An uploaded photo, else the store product's own
+export const imageUrlOf = (f) => (f?.imageId ? `${appUrl()}/freebie-image/${f.imageId}` : f?.sourceImageUrl ?? null);
+// Inventory adjustments for gifts point back here (inventory history)
+export const FREEBIE_URI_PREFIX = "gid://order-history/FreebieGrant/";
 
 const METAFIELDS_SET = `#graphql
   mutation ($metafields: [MetafieldsSetInput!]!) {
@@ -83,6 +93,8 @@ const view = (f, products = [], recent = []) => ({
   minSubtotal: f.minSubtotal ?? null,
   ordersGranted: f.ordersGranted ?? 0,
   phase: phaseOf(f),
+  // The store product it is, if any (stock is then Shopify's)
+  source: f.variantId ? { variantId: f.variantId, productId: f.sourceProductId, title: f.sourceTitle, imageUrl: f.sourceImageUrl } : null,
   showing: ORDER_KINDS.includes(f.kind) ? f.active && f.stock > 0 && phaseOf(f) === "live" && !(f.kind === "firstOrders" && f.ordersGranted >= (f.maxOrders ?? 0)) : f.active && f.stock > 0 && products.length > 0,
   createdBy: f.createdBy,
   updatedAt: f.updatedAt.toISOString(),
@@ -120,19 +132,206 @@ export function phaseOf(f, now = Date.now()) {
   return "live";
 }
 
-export async function saveFreebie(shop, admin, { id = null, title, description, sku, barcode, stock, active, kind = undefined, starts, ends, maxOrders, minSubtotal }, user) {
-  const t = clean(title, 200);
+// ---------------------------------------------------------------------------
+// A product from the store as the gift
+// ---------------------------------------------------------------------------
+
+const VARIANT = `#graphql
+  query FreebieVariant($id: ID!) {
+    productVariant(id: $id) {
+      id title sku barcode
+      image { url(transform: { maxWidth: 400 }) }
+      product { id title status featuredMedia { preview { image { url(transform: { maxWidth: 400 }) } } } }
+      inventoryItem { id tracked }
+    }
+  }`;
+const LEVELS = `#graphql
+  query FreebieLevels($id: ID!) {
+    inventoryItem(id: $id) {
+      tracked
+      inventoryLevels(first: 25) { nodes { location { id } quantities(names: ["available"]) { name quantity } } }
+    }
+    location { id }
+  }`;
+const ADJUST = `#graphql
+  mutation FreebieStock($input: InventoryAdjustQuantitiesInput!, $key: String!) {
+    inventoryAdjustQuantities(input: $input) @idempotent(key: $key) {
+      inventoryAdjustmentGroup { id }
+      userErrors { field message code }
+    }
+  }`;
+const FIND_VARIANTS = `#graphql
+  query FreebieFindVariants($q: String!) {
+    products(first: 8, query: $q) {
+      nodes {
+        id title status
+        featuredMedia { preview { image { url(transform: { maxWidth: 120 }) } } }
+        variants(first: 20) { nodes { id title sku barcode inventoryQuantity image { url(transform: { maxWidth: 120 }) } inventoryItem { tracked } } }
+      }
+    }
+  }`;
+
+const variantName = (productTitle, variantTitle) => (variantTitle && variantTitle !== "Default Title" ? `${productTitle} – ${variantTitle}` : productTitle);
+
+// What linking to this variant sets on the freebie
+async function variantSource(admin, variantId) {
+  if (!/^gid:\/\/shopify\/ProductVariant\/\d+$/.test(variantId)) throw new FreebieError("Pick a product from the list.");
+  const v = (await gql(admin, VARIANT, { id: variantId }))?.productVariant;
+  if (!v) throw new FreebieError("That product isn't in Shopify anymore.");
+  if (v.product.status === "ARCHIVED") throw new FreebieError(`${v.product.title} is archived. Unarchive it in Shopify, or pick another product.`);
+  if (!v.inventoryItem?.tracked) throw new FreebieError(`Shopify doesn't track stock for ${variantName(v.product.title, v.title)}. Turn on "Track quantity" for it in Shopify first.`);
+  const levels = await readLevels(admin, v.inventoryItem.id);
+  return {
+    variantId: v.id,
+    inventoryItemId: v.inventoryItem.id,
+    sourceProductId: v.product.id,
+    sourceTitle: variantName(v.product.title, v.title),
+    sourceImageUrl: v.image?.url ?? v.product.featuredMedia?.preview?.image?.url ?? null,
+    sku: clean(v.sku, 100),
+    barcode: clean(v.barcode, 100),
+    stock: Math.max(0, levels.total),
+  };
+}
+
+// Available stock by location, and the store's main location
+async function readLevels(admin, inventoryItemId) {
+  const d = await gql(admin, LEVELS, { id: inventoryItemId });
+  const levels = (d?.inventoryItem?.inventoryLevels?.nodes ?? []).map((l) => ({ locationId: l.location.id, available: l.quantities.find((q) => q.name === "available")?.quantity ?? 0 }));
+  return { levels, primary: d?.location?.id ?? null, total: levels.reduce((n, l) => n + Math.max(0, l.available), 0) };
+}
+
+// The store's products and their variants, for picking a gift (not archived ones)
+export async function searchGiftVariants(admin, q) {
+  const t = String(q ?? "").trim().slice(0, 80).replace(/["\\()]/g, " ");
+  if (t.length < 2) return [];
+  const d = await gql(admin, FIND_VARIANTS, { q: `(title:*${t}* OR sku:*${t}*) -status:archived` });
+  const out = [];
+  for (const p of d?.products?.nodes ?? []) {
+    if (p.status === "ARCHIVED") continue;
+    for (const v of p.variants?.nodes ?? []) {
+      out.push({
+        variantId: v.id,
+        productId: p.id,
+        title: variantName(p.title, v.title),
+        sku: v.sku || null,
+        imageUrl: v.image?.url ?? p.featuredMedia?.preview?.image?.url ?? null,
+        available: v.inventoryQuantity ?? 0,
+        tracked: Boolean(v.inventoryItem?.tracked),
+      });
+    }
+  }
+  return out.slice(0, 30);
+}
+
+// One adjustment of available stock, retried if the count moved meanwhile
+async function adjustAvailable(admin, { inventoryItemId, locationId, delta, reason, grantId, key }) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { levels } = await readLevels(admin, inventoryItemId);
+    const from = levels.find((l) => l.locationId === locationId)?.available;
+    if (from === undefined) return { error: "That location doesn't stock it anymore." };
+    if (delta < 0 && from + delta < 0) return { error: "Not enough stock.", short: true };
+    const d = await gql(admin, ADJUST, {
+      key: `${key}-${attempt}`,
+      input: { name: "available", reason, referenceDocumentUri: `${FREEBIE_URI_PREFIX}${grantId}`, changes: [{ delta, inventoryItemId, locationId, changeFromQuantity: from }] },
+    });
+    const err = d?.inventoryAdjustQuantities?.userErrors?.[0];
+    if (!err) return { ok: true };
+    if (!(err.code === "CHANGE_FROM_QUANTITY_STALE" || /stale|changed/i.test(err.message))) return { error: err.message };
+  }
+  return { error: "The stock kept changing. Try again." };
+}
+
+// Takes up to n of a store product as gifts and records them. Returns how many.
+async function giveFromShopify(admin, f, n, grant) {
+  if (!f.active || !admin) return 0;
+  const { levels, primary, total } = await readLevels(admin, f.inventoryItemId);
+  const main = levels.find((l) => l.locationId === primary && l.available > 0);
+  const at = main ?? [...levels].sort((a, b) => b.available - a.available).find((l) => l.available > 0);
+  const want = at ? Math.min(n, at.available) : 0;
+  if (!want) {
+    if (f.stock !== Math.max(0, total)) await db.freebie.update({ where: { id: f.id }, data: { stock: Math.max(0, total) } });
+    return 0;
+  }
+  // The record first: a second delivery of the same order stops here
+  let row;
+  try {
+    row = await db.freebieGrant.create({ data: { ...grant, quantity: want, locationId: at.locationId } });
+  } catch (e) {
+    if (/unique/i.test(errorMessage(e))) return 0;
+    throw e;
+  }
+  const r = await adjustAvailable(admin, { inventoryItemId: f.inventoryItemId, locationId: at.locationId, delta: -want, reason: "promotion", grantId: row.id, key: `freebie-take-${row.id}` });
+  if (!r.ok) {
+    console.error(`[freebies] ${f.title} for ${grant.orderName}: stock not taken: ${r.error}`);
+    await db.freebieGrant.delete({ where: { id: row.id } });
+    return 0;
+  }
+  const fresh = await db.freebie.findUnique({ where: { id: f.id } });
+  await db.freebie.update({ where: { id: f.id }, data: { stock: Math.max(0, total - want), given: (fresh?.given ?? 0) + want } });
+  return want;
+}
+
+// The gift for one order: from the freebie's count or from Shopify stock.
+// Returns how many were given (0: none left, or already given).
+async function give(admin, f, n, grant) {
+  if (f.inventoryItemId) return giveFromShopify(admin, f, n, grant);
+  const got = await takeStock(f.id, n);
+  if (!got) return 0;
+  try {
+    await db.freebieGrant.create({ data: { ...grant, quantity: got } });
+    return got;
+  } catch (e) {
+    // Another delivery of the same webhook got there first: put the units back
+    await giveBack(f.id, got);
+    if (!/unique/i.test(errorMessage(e))) throw e;
+    return 0;
+  }
+}
+
+// A store product's stock moved (inventory webhook): keep its freebies' count,
+// and the product pages, in step
+export async function freebieStockMoved(shop, inventoryItemId) {
+  const item = /^\d+$/.test(String(inventoryItemId ?? "")) ? `gid://shopify/InventoryItem/${inventoryItemId}` : String(inventoryItemId ?? "");
+  if (!item) return;
+  const linked = await db.freebie.findMany({ where: { shop, inventoryItemId: item } });
+  if (!linked.length) return;
+  const { admin } = await unauthenticated.admin(shop);
+  const { total } = await readLevels(admin, item);
+  for (const f of linked) {
+    if (f.stock === total) continue;
+    await db.freebie.update({ where: { id: f.id }, data: { stock: Math.max(0, total) } });
+    // Ran out, or back: on or off the product pages
+    if ((f.stock > 0) !== (total > 0)) await syncOffersFor(shop, admin, { freebieId: f.id }).catch((e) => console.error(`[freebies] offers ${f.id}:`, errorMessage(e)));
+  }
+}
+
+export async function saveFreebie(shop, admin, { id = null, title, description, sku, barcode, stock, active, kind = undefined, starts, ends, maxOrders, minSubtotal, variantId = undefined }, user) {
+  const was = id ? await db.freebie.findFirst({ where: { shop, id: Number(id) } }) : null;
+  if (id && !was) throw new FreebieError("That freebie isn't there anymore.");
+  // A store product as the gift: "" unlinks it, undefined leaves it as it is
+  const linkTo = variantId === undefined ? (was?.variantId ?? null) : String(variantId).trim() || null;
+  const source = linkTo ? await variantSource(admin, linkTo) : null;
+  const t = clean(title, 200) ?? source?.sourceTitle ?? null;
   if (!t) throw new FreebieError("Give the freebie a name.");
   const left = Number(stock);
-  if (!Number.isInteger(left) || left < 0) throw new FreebieError("Stock has to be a whole number, 0 or more.");
+  if (!source && (!Number.isInteger(left) || left < 0)) throw new FreebieError("Stock has to be a whole number, 0 or more.");
   const data = {
     title: t,
     description: clean(description),
     sku: clean(sku, 100),
     barcode: clean(barcode, 100),
-    stock: left,
+    stock: source ? source.stock : left,
     active: active !== false,
+    variantId: null,
+    inventoryItemId: null,
+    sourceProductId: null,
+    sourceTitle: null,
+    sourceImageUrl: null,
   };
+  if (source) {
+    const { stock: _s, ...rest } = source;
+    Object.assign(data, rest);
+  }
   // Who gets it
   if (kind !== undefined) {
     if (!KINDS.includes(kind)) throw new FreebieError("Choose who gets the freebie.");
@@ -160,9 +359,7 @@ export async function saveFreebie(shop, admin, { id = null, title, description, 
     }
   }
   let f;
-  if (id) {
-    const was = await db.freebie.findFirst({ where: { shop, id: Number(id) } });
-    if (!was) throw new FreebieError("That freebie isn't there anymore.");
+  if (was) {
     f = await db.freebie.update({ where: { id: was.id }, data });
   } else {
     f = await db.freebie.create({ data: { shop, ...data, ordersGranted: 0, createdBy: user?.name ?? null } });
@@ -292,20 +489,13 @@ export async function grantFreebies(shop, admin, payload) {
   const emptied = new Set();
   for (const l of links) {
     if (already.some((g) => g.freebieId === l.freebieId && g.productId === l.productId)) continue;
-    const n = await takeStock(l.freebieId, bought[l.productId]);
-    if (!n) continue;
-    try {
-      await db.freebieGrant.create({
-        data: { shop, freebieId: l.freebieId, orderId, orderName: payload.name ?? null, customerId: payload.customer?.admin_graphql_api_id ?? null, productId: l.productId, quantity: n },
-      });
-      given.push({ freebieId: l.freebieId, productId: l.productId, quantity: n });
-    } catch (e) {
-      // Another delivery of the same webhook got there first: put the units back
-      await giveBack(l.freebieId, n);
-      if (!/unique/i.test(errorMessage(e))) throw e;
-    }
     const f = await db.freebie.findUnique({ where: { id: l.freebieId } });
-    if (f && f.stock <= 0) emptied.add(f.id);
+    if (!f || !f.active) continue;
+    const grant = { shop, freebieId: l.freebieId, orderId, orderName: payload.name ?? null, customerId: payload.customer?.admin_graphql_api_id ?? null, productId: l.productId };
+    const n = await give(admin, f, bought[l.productId], grant);
+    if (n) given.push({ freebieId: l.freebieId, productId: l.productId, quantity: n });
+    const after = await db.freebie.findUnique({ where: { id: l.freebieId } });
+    if (after && after.stock <= 0) emptied.add(after.id);
   }
   // Ran out: off the product pages
   for (const id of emptied) await syncOffersFor(shop, admin, { freebieId: id }).catch((e) => console.error(`[freebies] offers ${id}:`, errorMessage(e)));
@@ -345,21 +535,13 @@ async function grantOrderOffers(shop, admin, payload, orderId, already) {
   for (const f of offers) {
     if (f.kind === "minSpend" && !(subtotal >= (f.minSubtotal ?? Infinity))) continue;
     if (f.kind === "firstOrders" && !(await claimPlace(f.id))) continue;
-    const n = await takeStock(f.id, 1);
+    const grant = { shop, freebieId: f.id, orderId, orderName: payload.name ?? null, customerId: payload.customer?.admin_graphql_api_id ?? null, productId: inStock[0] };
+    const n = await give(admin, f, 1, grant);
     if (!n) {
       if (f.kind === "firstOrders") await releasePlace(f.id);
       continue;
     }
-    try {
-      await db.freebieGrant.create({
-        data: { shop, freebieId: f.id, orderId, orderName: payload.name ?? null, customerId: payload.customer?.admin_graphql_api_id ?? null, productId: inStock[0], quantity: 1 },
-      });
-      given.push({ freebieId: f.id, productId: inStock[0], quantity: 1 });
-    } catch (e) {
-      await giveBack(f.id, 1);
-      if (f.kind === "firstOrders") await releasePlace(f.id);
-      if (!/unique/i.test(errorMessage(e))) throw e;
-    }
+    given.push({ freebieId: f.id, productId: inStock[0], quantity: 1 });
     const after = await db.freebie.findUnique({ where: { id: f.id } });
     if (after && after.stock <= 0) emptied.add(f.id);
   }
@@ -402,7 +584,25 @@ export async function returnFreebies(shop, admin, orderId) {
   for (const g of grants) {
     const r = await db.freebieGrant.updateMany({ where: { id: g.id, returnedAt: null }, data: { returnedAt: new Date() } });
     if (!r.count) continue;
-    await giveBack(g.freebieId, g.quantity);
+    if (g.locationId) {
+      // A store product: back into its Shopify stock where it came from
+      const f0 = await db.freebie.findUnique({ where: { id: g.freebieId } });
+      if (!admin) admin = await unauthenticated.admin(shop).then((x) => x.admin).catch(() => null);
+      const item = f0?.inventoryItemId;
+      const res = item && admin ? await adjustAvailable(admin, { inventoryItemId: item, locationId: g.locationId, delta: g.quantity, reason: "restock", grantId: g.id, key: `freebie-back-${g.id}` }) : { error: "no product" };
+      if (!res.ok) {
+        console.error(`[freebies] ${g.orderName}: gift not put back in stock: ${res.error}`);
+        // Try again on the next cancellation update rather than lose it
+        await db.freebieGrant.update({ where: { id: g.id }, data: { returnedAt: null } });
+        continue;
+      }
+      if (f0) {
+        const { total } = await readLevels(admin, item);
+        await db.freebie.update({ where: { id: f0.id }, data: { stock: Math.max(0, total), given: Math.max(0, (f0.given ?? 0) - g.quantity) } });
+      }
+    } else {
+      await giveBack(g.freebieId, g.quantity);
+    }
     // First N orders: a cancelled order frees its place for the next order
     const f = await db.freebie.findUnique({ where: { id: g.freebieId } });
     if (f?.kind === "firstOrders") await releasePlace(f.id);

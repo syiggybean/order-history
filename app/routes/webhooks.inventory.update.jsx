@@ -4,6 +4,7 @@ import { requestLiveSync } from "../inventory-sync.server";
 import { stockChanged } from "../preorder-windows.server";
 import { stockMoved } from "../shipping.server";
 import { wishStockMoved } from "../wishlist.server";
+import { freebieStockMoved } from "../freebies.server";
 
 // Shopify calls this the moment an inventory level changes.
 // The change is written to the log before replying, so it's never lost;
@@ -26,5 +27,7 @@ export const action = async ({ request }) => {
   stockMoved(shop);
   // Wishlists: back-in-stock emails
   wishStockMoved(shop, payload?.inventory_item_id);
+  // Freebies that are a store product: their count follows Shopify's
+  freebieStockMoved(shop, payload?.inventory_item_id).catch((e) => console.error("[freebies] stock:", e?.message ?? e));
   return new Response();
 };
