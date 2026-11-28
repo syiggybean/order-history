@@ -113,7 +113,8 @@ export default function Freebies() {
   useEffect(() => () => clearTimeout(timer.current), []);
   if (data.noAccess) return <NoAccess />;
   const { freebies, canManage } = data;
-  const open = freebies.find((f) => f.id === openId);
+  // "new": a freebie for orders (first orders, or orders over an amount)
+  const open = openId === "new" ? { kind: "minSpend" } : freebies.find((f) => f.id === openId);
 
   // Products that have freebies now, and what each has
   const byProduct = new Map();
@@ -134,16 +135,17 @@ export default function Freebies() {
     if (text.trim().length < 2) return;
     timer.current = setTimeout(() => search.submit({ intent: "search", q: text }, { method: "post" }), 250);
   };
-  const unattached = freebies.filter((f) => !f.products.length);
+  const orderOffers = freebies.filter((f) => f.kind && f.kind !== "product");
+  const unattached = freebies.filter((f) => (!f.kind || f.kind === "product") && !f.products.length);
 
   return (
     <s-page heading="Freebies" inlineSize="large">
       {open && (
         <Flyout
-          key={open.id}
+          key={open.id ?? "new"}
           onClose={() => setOpenId(null)}
-          label={`Freebie: ${open.title}`}
-          title={canManage ? "Edit freebie" : "Freebie"}
+          label={open.id ? `Freebie: ${open.title}` : "New freebie for orders"}
+          title={!open.id ? "New freebie for orders" : canManage ? "Edit freebie" : "Freebie"}
           width={480}
           bodyStyle={{ padding: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}
         >
@@ -175,6 +177,15 @@ export default function Freebies() {
           has stock, the product page shows it (with the “Freebie” block in the theme). Every unit bought gets one while stock lasts, packed with the
           order, and the customer sees it on their order in their account.
         </s-paragraph>
+        <s-paragraph>
+          Freebies for orders don't need a product: one with each of the first orders during an offer, or with orders over an amount. Orders need
+          an in-stock item to get one.
+        </s-paragraph>
+        {canManage && (
+          <div style={{ marginTop: "8px" }}>
+            <s-button onClick={() => setOpenId("new")}>New freebie for orders</s-button>
+          </div>
+        )}
         <div style={{ marginTop: "12px" }}>
           <input
             type="search"
@@ -242,6 +253,30 @@ export default function Freebies() {
           </div>
         )}
       </s-section>
+
+      {orderOffers.length > 0 && (
+        <s-section heading={`Freebies for orders (${orderOffers.length})`}>
+          <div style={{ border: "1px solid #e3e3e3", borderRadius: "10px", overflow: "hidden" }}>
+            {orderOffers.map((f, i) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => setOpenId(f.id)}
+                style={{ ...linkBtn, color: "#303030", display: "flex", gap: "12px", alignItems: "center", width: "100%", textAlign: "left", padding: "10px 12px", borderTop: i ? "1px solid #ebebeb" : 0, flexWrap: "wrap" }}
+              >
+                <Photo src={f.imageUrl} size={40} />
+                <span style={{ flex: "1 1 240px", minWidth: 0 }}>
+                  <strong style={{ fontSize: "14px" }}>{f.title}</strong>
+                  <span style={{ ...small, display: "block" }}>
+                    {f.kind === "minSpend" ? `Orders over $${Number(f.minSubtotal ?? 0).toFixed(2).replace(/\.00$/, "")}` : `First ${f.maxOrders} orders (${f.ordersGranted ?? 0} given)`} · {f.stock} left
+                  </span>
+                </span>
+                <Status f={f} />
+              </button>
+            ))}
+          </div>
+        </s-section>
+      )}
 
       {unattached.length > 0 && (
         <s-section heading={`Freebies not on a product (${unattached.length})`}>
